@@ -484,6 +484,9 @@ impl Optimizer {
 
             // 3-byte operand
             Opcode::CallMethod => 4,
+
+            // 5-byte operand (effect_type_index u16 + operation_index u16 + arg_count u8)
+            Opcode::Perform => 6,
         }
     }
 

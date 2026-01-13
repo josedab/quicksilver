@@ -276,6 +276,12 @@ pub enum Opcode {
     ExportAll = 0xFC,
     /// Dynamic import - import(source) returns Promise<Module>
     DynamicImport = 0xFD,
+
+    // ========== Algebraic Effects ==========
+    /// Perform an effect operation
+    /// Operands: effect_type_index (u16), operation_index (u16), arg_count (u8)
+    /// Stack: [args...] -> [result]
+    Perform = 0xFE,
 }
 
 impl Opcode {
@@ -395,6 +401,7 @@ impl Opcode {
             0xFB => Some(Opcode::ExportValue),
             0xFC => Some(Opcode::ExportAll),
             0xFD => Some(Opcode::DynamicImport),
+            0xFE => Some(Opcode::Perform),
 
             _ => None,
         }
@@ -510,6 +517,9 @@ impl Opcode {
 
             // 1-byte operand (u8) for SuperCall
             Opcode::SuperCall => 2,
+
+            // 5-byte operand (u16 + u16 + u8) for Perform
+            Opcode::Perform => 6,
         }
     }
 }
