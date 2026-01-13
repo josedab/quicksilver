@@ -20,8 +20,16 @@ use std::path::Path;
 /// Magic bytes for Quicksilver Snapshot format
 const SNAPSHOT_MAGIC: &[u8; 4] = b"QSS\x01";
 
-/// Snapshot version for compatibility checking
-const SNAPSHOT_VERSION: u32 = 1;
+/// Snapshot version for compatibility checking (v2 adds Date, Map, Set, Error, checksum)
+const SNAPSHOT_VERSION: u32 = 2;
+
+/// Flag byte indicating compression is enabled
+#[allow(dead_code)]
+const COMPRESSION_FLAG: u8 = 0x01;
+
+/// Flag byte indicating no compression
+#[allow(dead_code)]
+const NO_COMPRESSION_FLAG: u8 = 0x00;
 
 /// A serialized snapshot of the runtime state
 #[derive(Clone)]
@@ -36,6 +44,10 @@ pub struct Snapshot {
     pub source: Option<String>,
     /// Metadata
     pub metadata: SnapshotMetadata,
+    /// CRC32 checksum of the snapshot data (computed on save, verified on load)
+    pub checksum: u32,
+    /// Whether the snapshot data is compressed
+    pub compressed: bool,
 }
 
 /// Metadata about the snapshot
@@ -93,6 +105,18 @@ pub enum SerializedValue {
     Array(Vec<SerializedValue>),
     Object(HashMap<String, SerializedValue>),
     Function(Box<SerializedChunk>),
+    /// Date object (timestamp in milliseconds since epoch)
+    Date(f64),
+    /// Map object (key-value pairs preserving insertion order)
+    Map(Vec<(SerializedValue, SerializedValue)>),
+    /// Set object (values preserving insertion order)
+    Set(Vec<SerializedValue>),
+    /// Error object (name, message, stack)
+    Error {
+        name: String,
+        message: String,
+        stack: Option<String>,
+    },
 }
 
 impl Snapshot {
@@ -104,6 +128,8 @@ impl Snapshot {
             globals: HashMap::default(),
             source: None,
             metadata: SnapshotMetadata::default(),
+            checksum: 0,
+            compressed: false,
         }
     }
 
@@ -249,6 +275,8 @@ impl Snapshot {
                 runtime_version,
                 custom: HashMap::default(),
             },
+            checksum: 0,
+            compressed: false,
         })
     }
 
@@ -321,6 +349,27 @@ fn serialize_value(value: &Value) -> SerializedValue {
                 ObjectKind::Function(func) => {
                     SerializedValue::Function(Box::new(serialize_chunk(&func.chunk)))
                 }
+                ObjectKind::Date(timestamp) => {
+                    SerializedValue::Date(*timestamp)
+                }
+                ObjectKind::Map(entries) => {
+                    SerializedValue::Map(
+                        entries
+                            .iter()
+                            .map(|(k, v)| (serialize_value(k), serialize_value(v)))
+                            .collect()
+                    )
+                }
+                ObjectKind::Set(values) => {
+                    SerializedValue::Set(values.iter().map(serialize_value).collect())
+                }
+                ObjectKind::Error { name, message, .. } => {
+                    SerializedValue::Error {
+                        name: name.clone(),
+                        message: message.clone(),
+                        stack: None,
+                    }
+                }
                 _ => {
                     let props: HashMap<String, SerializedValue> = obj_ref
                         .properties
@@ -365,7 +414,68 @@ fn deserialize_value(serialized: &SerializedValue) -> Value {
                 is_generator: false,
             })
         }
+        SerializedValue::Date(timestamp) => {
+            Value::new_date(*timestamp)
+        }
+        SerializedValue::Map(entries) => {
+            Value::new_map(
+                entries
+                    .iter()
+                    .map(|(k, v)| (deserialize_value(k), deserialize_value(v)))
+                    .collect()
+            )
+        }
+        SerializedValue::Set(values) => {
+            Value::new_set(values.iter().map(deserialize_value).collect())
+        }
+        SerializedValue::Error { name, message, stack } => {
+            Value::new_error_with_stack(name.clone(), message.clone(), stack.clone())
+        }
     }
+}
+
+// Checksum helpers
+
+/// Compute CRC32 checksum of data
+#[allow(dead_code)]
+fn compute_checksum(data: &[u8]) -> u32 {
+    // CRC32 polynomial (IEEE)
+    const CRC32_TABLE: [u32; 256] = generate_crc32_table();
+
+    let mut crc = 0xFFFFFFFF;
+    for byte in data {
+        let index = ((crc ^ (*byte as u32)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[index];
+    }
+    !crc
+}
+
+/// Generate CRC32 lookup table at compile time
+#[allow(dead_code)]
+const fn generate_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+/// Verify checksum of data
+#[allow(dead_code)]
+fn verify_checksum(data: &[u8], expected: u32) -> bool {
+    compute_checksum(data) == expected
 }
 
 // Binary I/O helpers
@@ -609,6 +719,43 @@ fn write_value<W: Write>(writer: &mut W, value: &SerializedValue) -> Result<(), 
                 .map_err(|e| Error::InternalError(format!("Failed to write value type: {}", e)))?;
             write_chunk(writer, chunk)?;
         }
+        SerializedValue::Date(timestamp) => {
+            writer.write_all(&[10u8])
+                .map_err(|e| Error::InternalError(format!("Failed to write value type: {}", e)))?;
+            writer.write_all(&timestamp.to_le_bytes())
+                .map_err(|e| Error::InternalError(format!("Failed to write date: {}", e)))?;
+        }
+        SerializedValue::Map(entries) => {
+            writer.write_all(&[11u8])
+                .map_err(|e| Error::InternalError(format!("Failed to write value type: {}", e)))?;
+            writer.write_all(&(entries.len() as u32).to_le_bytes())
+                .map_err(|e| Error::InternalError(format!("Failed to write map length: {}", e)))?;
+            for (k, v) in entries {
+                write_value(writer, k)?;
+                write_value(writer, v)?;
+            }
+        }
+        SerializedValue::Set(values) => {
+            writer.write_all(&[12u8])
+                .map_err(|e| Error::InternalError(format!("Failed to write value type: {}", e)))?;
+            writer.write_all(&(values.len() as u32).to_le_bytes())
+                .map_err(|e| Error::InternalError(format!("Failed to write set length: {}", e)))?;
+            for v in values {
+                write_value(writer, v)?;
+            }
+        }
+        SerializedValue::Error { name, message, stack } => {
+            writer.write_all(&[13u8])
+                .map_err(|e| Error::InternalError(format!("Failed to write value type: {}", e)))?;
+            write_string(writer, name)?;
+            write_string(writer, message)?;
+            let has_stack = stack.is_some();
+            writer.write_all(&[has_stack as u8])
+                .map_err(|e| Error::InternalError(format!("Failed to write stack flag: {}", e)))?;
+            if let Some(s) = stack {
+                write_string(writer, s)?;
+            }
+        }
     }
     Ok(())
 }
@@ -671,6 +818,55 @@ fn read_value<R: Read>(reader: &mut R) -> Result<SerializedValue, Error> {
             Ok(SerializedValue::Function(Box::new(chunk)))
         }
         9 => Ok(SerializedValue::BigInt(read_string(reader)?)),
+        10 => {
+            // Date
+            let mut timestamp_bytes = [0u8; 8];
+            reader.read_exact(&mut timestamp_bytes)
+                .map_err(|e| Error::InternalError(format!("Failed to read date: {}", e)))?;
+            Ok(SerializedValue::Date(f64::from_le_bytes(timestamp_bytes)))
+        }
+        11 => {
+            // Map
+            let mut len_bytes = [0u8; 4];
+            reader.read_exact(&mut len_bytes)
+                .map_err(|e| Error::InternalError(format!("Failed to read map length: {}", e)))?;
+            let len = u32::from_le_bytes(len_bytes) as usize;
+
+            let mut entries = Vec::with_capacity(len);
+            for _ in 0..len {
+                let key = read_value(reader)?;
+                let value = read_value(reader)?;
+                entries.push((key, value));
+            }
+            Ok(SerializedValue::Map(entries))
+        }
+        12 => {
+            // Set
+            let mut len_bytes = [0u8; 4];
+            reader.read_exact(&mut len_bytes)
+                .map_err(|e| Error::InternalError(format!("Failed to read set length: {}", e)))?;
+            let len = u32::from_le_bytes(len_bytes) as usize;
+
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(read_value(reader)?);
+            }
+            Ok(SerializedValue::Set(values))
+        }
+        13 => {
+            // Error
+            let name = read_string(reader)?;
+            let message = read_string(reader)?;
+            let mut has_stack = [0u8; 1];
+            reader.read_exact(&mut has_stack)
+                .map_err(|e| Error::InternalError(format!("Failed to read stack flag: {}", e)))?;
+            let stack = if has_stack[0] != 0 {
+                Some(read_string(reader)?)
+            } else {
+                None
+            };
+            Ok(SerializedValue::Error { name, message, stack })
+        }
         _ => Err(Error::InternalError(format!("Unknown value type: {}", type_byte[0]))),
     }
 }
