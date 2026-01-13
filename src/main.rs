@@ -387,28 +387,170 @@ fn run_file(path: &PathBuf, profile: bool, script_args: &[String]) {
 }
 
 fn run_watch(path: &PathBuf, profile: bool, script_args: &[String]) {
-    use quicksilver::hmr::FileWatcher;
+    use quicksilver::hmr::HmrRuntime;
     use std::time::Duration;
 
+    println!("🔥 Hot Module Reloading enabled");
     println!("👀 Watching {} for changes...", path.display());
     println!("   Press Ctrl+C to stop\n");
 
-    let watcher = FileWatcher::default();
     let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
-    watcher.watch(&canonical_path);
 
-    // Run once initially
-    run_file(path, profile, script_args);
+    // Create HMR runtime and register the module
+    let hmr = HmrRuntime::new();
+    let module_id = hmr.register_module(&canonical_path);
+
+    // Track module state for HMR
+    let mut module_version = 1u64;
+    let mut preserved_globals: std::collections::HashMap<String, quicksilver::Value> =
+        std::collections::HashMap::new();
+
+    // Run initially
+    println!("📦 Loading module v{}...", module_version);
+    run_file_with_hmr(path, profile, script_args, &module_id, &mut preserved_globals, true);
 
     // Watch for changes
     loop {
         std::thread::sleep(Duration::from_millis(500));
 
-        let changes = watcher.poll();
+        let changes = hmr.check_for_updates();
         if !changes.is_empty() {
-            println!("\n🔄 File changed, re-running...\n");
-            run_file(path, profile, script_args);
+            module_version += 1;
+            println!("\n🔄 Hot update detected (v{})...", module_version);
+
+            // Apply pending updates
+            let results = hmr.apply_pending_updates();
+            for result in &results {
+                if result.success {
+                    println!("   ✓ Module {} updated successfully ({:?})",
+                        result.module_id, result.duration);
+                    if !result.affected_modules.is_empty() {
+                        println!("   ↳ Affected modules: {:?}",
+                            result.affected_modules.iter().map(|m| m.to_string()).collect::<Vec<_>>());
+                    }
+                } else if let Some(ref err) = result.error {
+                    println!("   ✗ Update failed: {}", err);
+                    println!("   ↳ Performing full reload...");
+                }
+            }
+
+            // Re-run with state preservation attempt
+            run_file_with_hmr(path, profile, script_args, &module_id, &mut preserved_globals, false);
         }
+    }
+}
+
+fn run_file_with_hmr(
+    path: &PathBuf,
+    profile: bool,
+    script_args: &[String],
+    _module_id: &quicksilver::hmr::ModuleId,
+    preserved_globals: &mut std::collections::HashMap<String, quicksilver::Value>,
+    is_initial: bool,
+) {
+    let source = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error reading file: {}", e);
+            return;
+        }
+    };
+
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+    let mut runtime = Runtime::new();
+
+    // Set up HMR API (module.hot object)
+    setup_module_hot(&mut runtime, path);
+
+    // Restore preserved globals if this is a hot reload
+    if !is_initial && !preserved_globals.is_empty() {
+        for (name, value) in preserved_globals.iter() {
+            runtime.set_global(name, value.clone());
+        }
+        println!("   ↳ Restored {} preserved globals", preserved_globals.len());
+    }
+
+    // Set up script arguments
+    set_script_args(&mut runtime, path, script_args);
+
+    let start = if profile { Some(Instant::now()) } else { None };
+
+    match runtime.eval_file(&canonical_path, &source) {
+        Ok(_) => {
+            if let Some(start) = start {
+                let elapsed = start.elapsed();
+                eprintln!();
+                eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                eprintln!("📊 Execution Profile");
+                eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+                eprintln!("  Total time: {:?}", elapsed);
+                eprintln!("  File: {}", path.display());
+                eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+            }
+
+            // Try to preserve globals marked for HMR
+            // Look for __hmr_preserve__ array in globals
+            if let Some(quicksilver::Value::Object(obj)) = runtime.get_global("__hmr_preserve__") {
+                let borrowed = obj.borrow();
+                if let quicksilver::ObjectKind::Array(items) = &borrowed.kind {
+                    preserved_globals.clear();
+                    for item in items {
+                        if let quicksilver::Value::String(name) = item {
+                            if let Some(value) = runtime.get_global(name) {
+                                preserved_globals.insert(name.clone(), value);
+                            }
+                        }
+                    }
+                    if !preserved_globals.is_empty() {
+                        println!("   ↳ Marked {} globals for preservation", preserved_globals.len());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("❌ {}", e);
+        }
+    }
+}
+
+fn setup_module_hot(runtime: &mut Runtime, path: &PathBuf) {
+    let module_path = path.display().to_string();
+
+    // Set up HMR API via JavaScript
+    // Note: Methods don't set this.* due to RefCell borrow issues with method calls
+    // State is tracked externally through the HmrRuntime
+    let setup_code = format!(r#"
+        var __hmr_preserve__ = [];
+
+        var module = {{
+            id: '{}',
+            hot: {{
+                data: null,
+                accept: function() {{
+                    // HMR accepts this module for hot updates
+                }},
+                decline: function() {{
+                    // HMR declines updates for this module
+                }},
+                dispose: function(cb) {{
+                    // Dispose handler (placeholder)
+                }},
+                invalidate: function() {{
+                    // Force reload
+                }},
+                status: function() {{
+                    return 'idle';
+                }}
+            }}
+        }};
+
+        function hmrPreserve(name) {{
+            __hmr_preserve__.push(name);
+        }}
+    "#, module_path.replace('"', "\\\""));
+
+    if let Err(e) = runtime.eval(&setup_code) {
+        eprintln!("HMR setup error: {}", e);
     }
 }
 
@@ -492,7 +634,6 @@ fn show_bytecode(input: &str) {
 
 fn run_debug(path: &PathBuf) {
     use quicksilver::debugger::TimeTravelDebugger;
-    use rustc_hash::FxHashMap as HashMap;
 
     let source = match fs::read_to_string(path) {
         Ok(s) => s,
@@ -502,53 +643,41 @@ fn run_debug(path: &PathBuf) {
         }
     };
 
-    // Create debugger
-    let mut debugger = TimeTravelDebugger::new();
-    debugger.load_source(path.to_str().unwrap_or("unknown"), &source);
+    // Create runtime
+    let mut runtime = quicksilver::Runtime::new();
 
-    // Compile the code
-    let chunk = match quicksilver::bytecode::compile(&source) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Compilation error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Simulate recording execution steps based on bytecode
-    // In a full implementation, the VM would call debugger.record_step() during execution
-    let mut line = 1u32;
-
-    // Record initial state
-    let locals: HashMap<String, quicksilver::Value> = HashMap::default();
-    debugger.record_step(None, 0, 1, &[], &locals, "Program start");
-
-    // Simulate some execution steps based on bytecode lines
-    for i in 0..chunk.code.len().min(100) {
-        if let Some(l) = chunk.lines.get(i) {
-            if *l != line {
-                line = *l;
-                debugger.record_step(
-                    None, // Opcode (would be filled in by actual VM execution)
-                    i,
-                    line,
-                    &[],
-                    &locals,
-                    &format!("Executing line {}", line),
-                );
-            }
-        }
-    }
-
-    // Add final step
-    debugger.record_step(None, chunk.code.len(), line, &[], &locals, "Program end");
+    // Create and attach debugger
+    let debugger = TimeTravelDebugger::new();
+    runtime.attach_debugger(debugger);
+    runtime.set_source(path.to_str().unwrap_or("unknown"), &source);
 
     println!("🕐 Quicksilver Time-Travel Debugger");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("File: {}", path.display());
-    println!("Recorded {} execution steps", debugger.history_len());
+    println!("Running with debugger attached...");
     println!();
 
-    // Run interactive debugger
-    debugger.run_interactive();
+    // Execute the code - the VM will record all execution steps
+    match runtime.eval(&source) {
+        Ok(value) => {
+            println!();
+            println!("Program completed with result: {}", value.to_js_string());
+        }
+        Err(e) => {
+            println!();
+            println!("Program error: {}", e);
+        }
+    }
+
+    // Get debugger back and show stats
+    if let Some(debugger_ref) = runtime.get_debugger() {
+        let debugger = debugger_ref.borrow();
+        println!();
+        println!("Recorded {} execution steps", debugger.history_len());
+        println!();
+        drop(debugger);
+
+        // Run interactive debugger for replay
+        runtime.run_debugger_interactive();
+    }
 }

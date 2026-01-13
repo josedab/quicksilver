@@ -41,7 +41,7 @@ src/
 │   ├── value.rs      # JavaScript value types (Value, Object, ObjectKind)
 │   └── builtins.rs   # Built-in objects (console, Math, JSON, Date, Map, Set)
 ├── gc/
-│   └── mod.rs        # Garbage collection (stub/placeholder)
+│   └── mod.rs        # Mark-and-sweep garbage collection
 ├── snapshot/
 │   └── mod.rs        # Snapshot serialization for instant cold starts
 ├── security/
@@ -182,23 +182,28 @@ cargo run -- test_feature.js
 - Built-ins: `console`, `Math`, `JSON`, `Date`, `Map`, `Set`, `Array`, `Object`
 
 ### Advanced Features (Next-Gen Modules)
+
+#### Fully Functional
+- **Garbage Collection**: Mark-and-sweep GC with configurable thresholds
 - **Snapshot Isolation**: Instant cold starts via bytecode serialization
 - **Capability Security**: Fine-grained permission control with Sandbox
-- **Structured Concurrency**: Go-style channels, spawn, select
-- **Observability**: Built-in tracing, metrics (Counter, Gauge, Histogram)
-- **AI-Native Runtime**: JSDoc → LLM tool schema generation
-- **WebAssembly**: WASM module parsing and integration
-- **Effect System**: Algebraic effects for composable side effects
-- **Distributed Runtime**: Cluster, node management, actor model
-- **Time-Travel Debugger**: Record/replay debugging sessions
-- **Hot Module Reloading**: Update code without losing state
+- **Structured Concurrency**: Go-style channels with sender/receiver
+- **Observability**: OpenTelemetry-compatible tracing, metrics (Counter, Gauge, Histogram)
+- **AI-Native Runtime**: JSDoc → LLM tool schema generation (OpenAI/Anthropic formats)
+- **WebAssembly**: Complete WASM module parsing (Type, Import, Function, Table, Memory, Export, Code sections)
+
+#### Framework Implemented (Not Yet VM-Integrated)
+- **Effect System**: Algebraic effects infrastructure (needs `perform` statement in VM)
+- **Distributed Runtime**: Cluster primitives and actor model (needs network layer)
+- **Time-Travel Debugger**: Record/replay framework (needs VM integration)
+- **Hot Module Reloading**: Module tracking and updates (needs VM integration)
 
 ### Not Yet Implemented
-- Generators (yield)
-- Proxies
-- WeakMap/WeakSet
-- Full RegExp support
-- ES Modules (import/export)
+- Generators (`yield`) - tokens exist, no semantics
+- ES Modules (`import`/`export`) - tokens exist, no module system
+- Full `async`/`await` - parser only, no event loop
+- `Proxy` traps - constructor only
+- True weak references for `WeakMap`/`WeakSet`
 
 ## Debugging Tips
 

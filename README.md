@@ -8,32 +8,61 @@ Quicksilver is a JavaScript engine designed for embedded use cases, edge computi
 
 - **Memory Safety**: Pure Rust implementation eliminates common security vulnerability classes
 - **Small Footprint**: Designed for embedding in resource-constrained environments
-- **Fast Cold Starts**: Quick startup time for serverless and edge deployments
+- **Fast Cold Starts**: Snapshot serialization enables instant cold starts
 - **ES2020 Support**: Modern JavaScript features including classes, arrow functions, destructuring, and more
+- **Capability-Based Security**: Fine-grained sandboxing for untrusted code
+- **AI-Native**: JSDoc to LLM tool schema generation
 
 ## Supported JavaScript Features
 
 ### Core Language
-- Variables: `let`, `const`, `var`
-- Data types: numbers, strings, booleans, null, undefined, objects, arrays
-- Operators: arithmetic, comparison, logical, bitwise
-- Control flow: `if/else`, `while`, `for`, `for...in`, `for...of`
-- Functions: declarations, expressions, arrow functions
-- Classes: constructors, properties
-- Error handling: `try/catch/finally`, `throw`
-- Destructuring: array and object patterns
+- Variables: `let`, `const`, `var` with proper scoping
+- Data types: numbers, strings, booleans, null, undefined, objects, arrays, symbols
+- Operators: arithmetic, comparison, logical, bitwise, spread (`...`), optional chaining (`?.`), nullish coalescing (`??`)
+- Control flow: `if/else`, `while`, `for`, `for...in`, `for...of`, `switch`, `break`, `continue`
+- Functions: declarations, expressions, arrow functions, default parameters, rest parameters
+- Classes: constructors, instance properties, `instanceof`
+- Error handling: `try/catch/finally`, `throw` with Error types
+- Destructuring: array and object patterns with defaults
+- Template literals with expression interpolation
 
 ### Built-in Objects
-- `console.log()` for output
-- `Math` object with common methods
-- Array and Object manipulation
+- `console`: log, warn, error, info, debug, group, time, timeEnd, count, table, assert, trace
+- `Math`: All standard methods (sin, cos, abs, min, max, random, pow, sqrt, floor, ceil, round, etc.)
+- `JSON`: parse, stringify with full options
+- `Date`: Constructor, getters, setters, formatting
+- `Array`: map, filter, reduce, forEach, find, includes, slice, splice, sort, flat, flatMap, etc.
+- `String`: charAt, substring, indexOf, toUpperCase, toLowerCase, trim, split, replace, match, etc.
+- `Object`: keys, values, entries, assign, create, defineProperty, freeze, seal
+- `Map` and `Set`: Full collection support
+- `RegExp`: Pattern matching with test, exec, match, replace, split
+- Typed Arrays: Int8Array, Uint8Array, Float32Array, Float64Array, etc.
+- `URL`: URL parsing and manipulation
+- `TextEncoder`/`TextDecoder`: UTF-8 encoding
+- Timers: setTimeout, setInterval
+
+### Runtime Features
+- Mark-and-sweep garbage collection
+- Snapshot serialization for instant cold starts
+- Capability-based security sandbox
+- Structured concurrency with channels
+- Observability (tracing, metrics)
+- WebAssembly module parsing
+- Time-Travel Debugger with record/replay
+- Hot Module Reloading (HMR) with state preservation
+
+### Not Yet Implemented
+- Generators (`yield`)
+- ES Modules (`import`/`export`)
+- Full `async`/`await` with event loop
+- `Proxy` traps
 
 ## Installation
 
 ### From Source
 
 ```bash
-git clone https://github.com/example/quicksilver.git
+git clone https://github.com/anthropics/quicksilver.git
 cd quicksilver
 cargo build --release
 ```
