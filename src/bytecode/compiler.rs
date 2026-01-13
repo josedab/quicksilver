@@ -161,6 +161,27 @@ impl Compiler {
         self.emit_byte(bytes[1]);
     }
 
+    /// Emit the opcode for a compound assignment operator (+=, -=, etc.)
+    /// Does nothing for simple assignment (=)
+    fn emit_compound_operator(&mut self, op: &AssignmentOperator) {
+        match op {
+            AssignmentOperator::Assign => {}
+            AssignmentOperator::AddAssign => self.emit(Opcode::Add),
+            AssignmentOperator::SubAssign => self.emit(Opcode::Sub),
+            AssignmentOperator::MulAssign => self.emit(Opcode::Mul),
+            AssignmentOperator::DivAssign => self.emit(Opcode::Div),
+            AssignmentOperator::ModAssign => self.emit(Opcode::Mod),
+            AssignmentOperator::PowAssign => self.emit(Opcode::Pow),
+            AssignmentOperator::ShlAssign => self.emit(Opcode::Shl),
+            AssignmentOperator::ShrAssign => self.emit(Opcode::Shr),
+            AssignmentOperator::UShrAssign => self.emit(Opcode::UShr),
+            AssignmentOperator::BitwiseAndAssign => self.emit(Opcode::BitwiseAnd),
+            AssignmentOperator::BitwiseOrAssign => self.emit(Opcode::BitwiseOr),
+            AssignmentOperator::BitwiseXorAssign => self.emit(Opcode::BitwiseXor),
+            _ => {}
+        }
+    }
+
     fn emit_constant(&mut self, value: Value) {
         let index = self.chunk.add_constant(value);
         self.emit(Opcode::Constant);
@@ -294,10 +315,8 @@ impl Compiler {
                 }
             }
             Pattern::Array(arr) => {
-                for elem in &arr.elements {
-                    if let Some(p) = elem {
-                        self.collect_vars_from_pattern(p, var_names);
-                    }
+                for p in arr.elements.iter().flatten() {
+                    self.collect_vars_from_pattern(p, var_names);
                 }
             }
             Pattern::Object(obj) => {
@@ -799,11 +818,129 @@ impl Compiler {
             }
             Pattern::Assignment(assign_pat) => {
                 // Pattern with default value: a = defaultValue
-                // TODO: Check if value is undefined and use default
+                // Check if value is undefined and use default
+                self.emit(Opcode::Dup); // Keep value on stack for check
+                self.emit(Opcode::Undefined);
+                self.emit(Opcode::StrictEq);
+                let use_value_jump = self.emit_jump(Opcode::JumpIfFalse);
+
+                // Value is undefined, use default
+                self.emit(Opcode::Pop); // Pop the undefined value
+                self.compile_expr(&assign_pat.right)?;
+                let end_jump = self.emit_jump(Opcode::Jump);
+
+                // Value is not undefined, use it
+                self.patch_jump(use_value_jump);
+                self.emit(Opcode::Pop); // Pop the comparison result
+
+                self.patch_jump(end_jump);
                 self.compile_pattern_binding(&assign_pat.left)?;
             }
             _ => {
                 // Rest patterns, etc. - pop value
+                self.emit(Opcode::Pop);
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile pattern assignment - assigns to existing variables (not declarations)
+    fn compile_pattern_assignment(&mut self, pattern: &Pattern) -> Result<()> {
+        match pattern {
+            Pattern::Identifier(id) => {
+                // Assign to existing variable
+                if let Some(slot) = self.resolve_local(&id.name) {
+                    self.emit(Opcode::SetLocal);
+                    self.emit_byte(slot);
+                } else {
+                    let name_idx = self.chunk.add_constant(Value::String(id.name.clone()));
+                    self.emit(Opcode::SetGlobal);
+                    self.emit_u16(name_idx);
+                }
+                // Pop the value since SetLocal/SetGlobal peek rather than pop
+                self.emit(Opcode::Pop);
+            }
+            Pattern::Array(arr_pat) => {
+                // Array destructuring assignment: [a, b] = arr
+                for (idx, elem) in arr_pat.elements.iter().enumerate() {
+                    if let Some(inner_pattern) = elem {
+                        self.emit(Opcode::Dup); // Keep array on stack
+                        let idx_const = self.chunk.add_constant(Value::Number(idx as f64));
+                        self.emit(Opcode::Constant);
+                        self.emit_u16(idx_const);
+                        self.emit(Opcode::GetElement);
+                        self.compile_pattern_assignment(inner_pattern)?;
+                    }
+                }
+                self.emit(Opcode::Pop); // Pop the array
+            }
+            Pattern::Object(obj_pat) => {
+                // Object destructuring assignment: {a, b} = obj
+                for prop in &obj_pat.properties {
+                    if let ObjectPatternProperty::Property { key, value, .. } = prop {
+                        self.emit(Opcode::Dup); // Keep object on stack
+                        let prop_name = match key {
+                            PropertyKey::Identifier(id) => id.name.clone(),
+                            PropertyKey::String(s) => s.clone(),
+                            PropertyKey::Number(n) => n.to_string(),
+                            PropertyKey::Computed(_) => continue, // Skip computed for now
+                            PropertyKey::PrivateName(name) => name.clone(),
+                        };
+                        let name_idx = self.chunk.add_constant(Value::String(prop_name));
+                        self.emit(Opcode::GetProperty);
+                        self.emit_u16(name_idx);
+                        self.compile_pattern_assignment(value)?;
+                    }
+                }
+                self.emit(Opcode::Pop); // Pop the object
+            }
+            Pattern::Assignment(assign_pat) => {
+                // Default value in destructuring: a = defaultValue
+                // If value is undefined, use default
+                self.emit(Opcode::Dup);
+                self.emit(Opcode::Undefined);
+                self.emit(Opcode::StrictEq);
+                let use_value_jump = self.emit_jump(Opcode::JumpIfFalse);
+
+                // Value is undefined, use default
+                self.emit(Opcode::Pop);
+                self.compile_expr(&assign_pat.right)?;
+                let end_jump = self.emit_jump(Opcode::Jump);
+
+                // Value is not undefined, use it
+                self.patch_jump(use_value_jump);
+                self.emit(Opcode::Pop);
+
+                self.patch_jump(end_jump);
+                self.compile_pattern_assignment(&assign_pat.left)?;
+            }
+            Pattern::Member(member) => {
+                // Assignment to member expression: obj.prop = value or obj[key] = value
+                self.compile_expr(&member.object)?;
+                match &member.property {
+                    MemberProperty::Identifier(id) => {
+                        let name_idx = self.chunk.add_constant(Value::String(id.name.clone()));
+                        self.emit(Opcode::Swap); // [obj, value] -> [value, obj]
+                        self.emit(Opcode::Swap); // [value, obj] -> [obj, value]
+                        self.emit(Opcode::SetProperty);
+                        self.emit_u16(name_idx);
+                    }
+                    MemberProperty::Expression(key_expr) => {
+                        self.compile_expr(key_expr)?;
+                        self.emit(Opcode::Swap); // [obj, key, value] -> [obj, value, key]
+                        self.emit(Opcode::SetElement);
+                    }
+                    MemberProperty::PrivateName(name) => {
+                        let name_idx = self.chunk.add_constant(Value::String(name.clone()));
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::SetPrivateField);
+                        self.emit_u16(name_idx);
+                    }
+                }
+            }
+            Pattern::Rest(_) => {
+                // Rest patterns in assignment - not yet supported
                 self.emit(Opcode::Pop);
             }
         }
@@ -1640,8 +1777,23 @@ impl Compiler {
                 self.emit(Opcode::DynamicImport);
                 Ok(())
             }
+            Expression::Perform(perform_expr) => {
+                // Compile arguments
+                for arg in &perform_expr.arguments {
+                    self.compile_expr(arg)?;
+                }
+                // Emit perform opcode with effect type, operation, and arg count
+                let effect_type_index = self.chunk.add_constant(Value::String(perform_expr.effect_type.clone()));
+                let operation_index = self.chunk.add_constant(Value::String(perform_expr.operation.clone()));
+                self.emit(Opcode::Perform);
+                self.emit_u16(effect_type_index as u16);
+                self.emit_u16(operation_index as u16);
+                self.emit_byte(perform_expr.arguments.len() as u8);
+                Ok(())
+            }
             _ => {
-                // TODO: Implement remaining expressions
+                // Fallback for unimplemented expression types (e.g., MetaProperty, JSX)
+                // These are parsed but not yet supported in bytecode generation
                 self.emit(Opcode::Undefined);
                 Ok(())
             }
@@ -2092,8 +2244,16 @@ impl Compiler {
                         self.emit(Opcode::Swap);
                         self.emit(Opcode::SetElement);
                     } else {
-                        // Postfix - for now just evaluate without proper store
-                        // TODO: Implement proper postfix for indexed access
+                        // Postfix: obj[key]++ returns original, stores incremented
+                        // Approach: evaluate twice for correctness (key may have side effects)
+                        // 1. Get original value to return
+                        self.compile_expr(&member.object)?;
+                        self.compile_expr(key_expr)?;
+                        self.emit(Opcode::GetElement);
+
+                        // 2. Store incremented value back
+                        self.compile_expr(&member.object)?;
+                        self.compile_expr(key_expr)?;
                         self.compile_expr(&member.object)?;
                         self.compile_expr(key_expr)?;
                         self.emit(Opcode::GetElement);
@@ -2101,6 +2261,8 @@ impl Compiler {
                             UpdateOperator::Increment => self.emit(Opcode::Increment),
                             UpdateOperator::Decrement => self.emit(Opcode::Decrement),
                         }
+                        self.emit(Opcode::SetElement);
+                        self.emit(Opcode::Pop); // Pop SetElement result, leaving original
                     }
                 }
                 MemberProperty::PrivateName(name) => {
@@ -2216,22 +2378,7 @@ impl Compiler {
                     self.compile_expr(&assignment.right)?;
 
                     // Apply compound operator
-                    match assignment.operator {
-                        AssignmentOperator::Assign => {}
-                        AssignmentOperator::AddAssign => self.emit(Opcode::Add),
-                        AssignmentOperator::SubAssign => self.emit(Opcode::Sub),
-                        AssignmentOperator::MulAssign => self.emit(Opcode::Mul),
-                        AssignmentOperator::DivAssign => self.emit(Opcode::Div),
-                        AssignmentOperator::ModAssign => self.emit(Opcode::Mod),
-                        AssignmentOperator::PowAssign => self.emit(Opcode::Pow),
-                        AssignmentOperator::ShlAssign => self.emit(Opcode::Shl),
-                        AssignmentOperator::ShrAssign => self.emit(Opcode::Shr),
-                        AssignmentOperator::UShrAssign => self.emit(Opcode::UShr),
-                        AssignmentOperator::BitwiseAndAssign => self.emit(Opcode::BitwiseAnd),
-                        AssignmentOperator::BitwiseOrAssign => self.emit(Opcode::BitwiseOr),
-                        AssignmentOperator::BitwiseXorAssign => self.emit(Opcode::BitwiseXor),
-                        _ => {}
-                    }
+                    self.emit_compound_operator(&assignment.operator);
 
                     // Store
                     self.emit(Opcode::Dup); // Keep value on stack as result
@@ -2265,39 +2412,34 @@ impl Compiler {
 
                             if is_compound {
                                 // Apply compound operator
-                                match assignment.operator {
-                                    AssignmentOperator::AddAssign => self.emit(Opcode::Add),
-                                    AssignmentOperator::SubAssign => self.emit(Opcode::Sub),
-                                    AssignmentOperator::MulAssign => self.emit(Opcode::Mul),
-                                    AssignmentOperator::DivAssign => self.emit(Opcode::Div),
-                                    AssignmentOperator::ModAssign => self.emit(Opcode::Mod),
-                                    AssignmentOperator::PowAssign => self.emit(Opcode::Pow),
-                                    AssignmentOperator::ShlAssign => self.emit(Opcode::Shl),
-                                    AssignmentOperator::ShrAssign => self.emit(Opcode::Shr),
-                                    AssignmentOperator::UShrAssign => self.emit(Opcode::UShr),
-                                    AssignmentOperator::BitwiseAndAssign => self.emit(Opcode::BitwiseAnd),
-                                    AssignmentOperator::BitwiseOrAssign => self.emit(Opcode::BitwiseOr),
-                                    AssignmentOperator::BitwiseXorAssign => self.emit(Opcode::BitwiseXor),
-                                    _ => {}
-                                }
+                                self.emit_compound_operator(&assignment.operator);
                             }
 
                             self.emit(Opcode::SetProperty);
                             self.emit_u16(name_idx);
                         }
                         MemberProperty::Expression(key_expr) => {
-                            self.compile_expr(key_expr)?;
-
                             if is_compound {
-                                // For compound: need to get current value
-                                // Stack: [obj, key] -> [obj, key, obj, key] -> [obj, key, value]
-                                // This is tricky - we need to duplicate both obj and key
-                                // For now, just compile RHS for non-compound case
-                                // TODO: Implement compound assignment for computed properties
-                            }
+                                // For compound assignment (obj[key] += value):
+                                // Stack starts with [obj] from line 2275
+                                self.emit(Opcode::Dup); // [obj, obj]
+                                self.compile_expr(key_expr)?; // [obj, obj, key]
+                                self.emit(Opcode::GetElement); // [obj, currentValue]
 
-                            self.compile_expr(&assignment.right)?;
-                            self.emit(Opcode::SetElement);
+                                // Compile RHS and apply operator
+                                self.compile_expr(&assignment.right)?; // [obj, currentValue, rhs]
+                                self.emit_compound_operator(&assignment.operator); // [obj, newValue]
+
+                                // Store back: SetElement expects [obj, key, value]
+                                self.compile_expr(key_expr)?; // [obj, newValue, key]
+                                self.emit(Opcode::Swap); // [obj, key, newValue]
+                                self.emit(Opcode::SetElement); // [newValue]
+                            } else {
+                                // Simple assignment: obj[key] = value
+                                self.compile_expr(key_expr)?;
+                                self.compile_expr(&assignment.right)?;
+                                self.emit(Opcode::SetElement);
+                            }
                         }
                         MemberProperty::PrivateName(name) => {
                             let name_idx = self.chunk.add_constant(Value::String(name.clone()));
@@ -2313,21 +2455,7 @@ impl Compiler {
 
                             if is_compound {
                                 // Apply compound operator
-                                match assignment.operator {
-                                    AssignmentOperator::AddAssign => self.emit(Opcode::Add),
-                                    AssignmentOperator::SubAssign => self.emit(Opcode::Sub),
-                                    AssignmentOperator::MulAssign => self.emit(Opcode::Mul),
-                                    AssignmentOperator::DivAssign => self.emit(Opcode::Div),
-                                    AssignmentOperator::ModAssign => self.emit(Opcode::Mod),
-                                    AssignmentOperator::PowAssign => self.emit(Opcode::Pow),
-                                    AssignmentOperator::ShlAssign => self.emit(Opcode::Shl),
-                                    AssignmentOperator::ShrAssign => self.emit(Opcode::Shr),
-                                    AssignmentOperator::UShrAssign => self.emit(Opcode::UShr),
-                                    AssignmentOperator::BitwiseAndAssign => self.emit(Opcode::BitwiseAnd),
-                                    AssignmentOperator::BitwiseOrAssign => self.emit(Opcode::BitwiseOr),
-                                    AssignmentOperator::BitwiseXorAssign => self.emit(Opcode::BitwiseXor),
-                                    _ => {}
-                                }
+                                self.emit_compound_operator(&assignment.operator);
                             }
 
                             self.emit(Opcode::SetPrivateField);
@@ -2338,9 +2466,12 @@ impl Compiler {
                     self.compile_expr(&assignment.right)?;
                 }
             }
-            AssignmentTarget::Pattern(_) => {
-                // TODO: Destructuring assignment
+            AssignmentTarget::Pattern(pat) => {
+                // Destructuring assignment: [a, b] = arr, {x, y} = obj
+                // Compile the RHS, then assign to each variable in the pattern
                 self.compile_expr(&assignment.right)?;
+                self.emit(Opcode::Dup); // Keep value on stack as result of assignment
+                self.compile_pattern_assignment(pat)?;
             }
         }
         Ok(())
@@ -2457,10 +2588,8 @@ impl Compiler {
                 }
             }
             crate::ast::Pattern::Array(arr) => {
-                for elem in &arr.elements {
-                    if let Some(elem) = elem {
-                        self.extract_pattern_names(elem, names);
-                    }
+                for elem in arr.elements.iter().flatten() {
+                    self.extract_pattern_names(elem, names);
                 }
             }
             crate::ast::Pattern::Assignment(assignment) => {

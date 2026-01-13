@@ -323,6 +323,33 @@ impl Chunk {
                     ("???".to_string(), 0)
                 }
             }
+
+            // 5-byte operand (effect_type_index u16 + operation_index u16 + arg_count u8)
+            Opcode::Perform => {
+                if offset + 4 < self.code.len() {
+                    let effect_idx =
+                        u16::from_le_bytes([self.code[offset], self.code[offset + 1]]);
+                    let op_idx =
+                        u16::from_le_bytes([self.code[offset + 2], self.code[offset + 3]]);
+                    let arg_count = self.code[offset + 4];
+                    let effect_name = self
+                        .constants
+                        .get(effect_idx as usize)
+                        .map(|v| format!("{}", v))
+                        .unwrap_or_else(|| "?".to_string());
+                    let op_name = self
+                        .constants
+                        .get(op_idx as usize)
+                        .map(|v| format!("{}", v))
+                        .unwrap_or_else(|| "?".to_string());
+                    (
+                        format!("{}.{} args={}", effect_name, op_name, arg_count),
+                        5,
+                    )
+                } else {
+                    ("???".to_string(), 0)
+                }
+            }
         }
     }
 }
