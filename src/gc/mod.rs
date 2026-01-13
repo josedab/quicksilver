@@ -13,6 +13,7 @@
 //! collects unreachable ones based on allocation thresholds.
 
 use crate::runtime::Value;
+use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::{Rc, Weak};
@@ -84,6 +85,9 @@ pub struct Gc {
     allocations_since_gc: usize,
     /// Is collection currently running?
     collecting: bool,
+    /// Fast O(1) lookup from object pointer to heap entry ID
+    /// This eliminates the O(n) scan in mark_value
+    ptr_to_id: HashMap<usize, usize>,
 }
 
 impl Gc {
@@ -101,6 +105,7 @@ impl Gc {
             next_id: 0,
             allocations_since_gc: 0,
             collecting: false,
+            ptr_to_id: HashMap::default(),
         }
     }
 
@@ -115,6 +120,10 @@ impl Gc {
         self.next_id += 1;
         self.stats.total_allocations += 1;
         self.allocations_since_gc += 1;
+
+        // Store pointer for O(1) lookup
+        let ptr = Rc::as_ptr(&object) as *const () as usize;
+        self.ptr_to_id.insert(ptr, id);
 
         self.heap.push(HeapEntry {
             object: Rc::downgrade(&object) as Weak<RefCell<dyn std::any::Any>>,
@@ -178,6 +187,8 @@ impl Gc {
 
         // Phase 3: Sweep phase - remove dead objects
         let before_count = self.heap.len();
+        let verbose = self.config.verbose;
+        let ptr_to_id = &mut self.ptr_to_id;
         self.heap.retain(|entry| {
             // Keep if marked OR if there are still strong references
             if entry.marked {
@@ -187,8 +198,12 @@ impl Gc {
             if entry.object.strong_count() > 0 {
                 return true;
             }
-            // Object is dead - allow it to be collected
-            if self.config.verbose {
+            // Object is dead - remove from ptr_to_id map and allow collection
+            if let Some(strong) = entry.object.upgrade() {
+                let ptr = Rc::as_ptr(&strong) as *const () as usize;
+                ptr_to_id.remove(&ptr);
+            }
+            if verbose {
                 eprintln!("[GC] Freeing object {}", entry.id);
             }
             false
@@ -214,65 +229,60 @@ impl Gc {
     }
 
     /// Mark a value and recursively mark all values it references
+    /// Uses O(1) HashMap lookup instead of O(n) linear scan
     fn mark_value(&self, value: &Value, marked: &mut HashSet<usize>) {
         match value {
             Value::Object(obj) => {
-                // Find this object in our heap and mark it
+                // O(1) lookup using ptr_to_id HashMap
                 let obj_ptr = Rc::as_ptr(obj) as *const () as usize;
-                for entry in &self.heap {
-                    if let Some(strong) = entry.object.upgrade() {
-                        let entry_ptr = Rc::as_ptr(&strong) as *const () as usize;
-                        if entry_ptr == obj_ptr {
-                            if marked.insert(entry.id) {
-                                // Object wasn't marked before, trace its properties
-                                let obj_ref = obj.borrow();
-                                for (_key, prop_value) in obj_ref.properties.iter() {
-                                    self.mark_value(prop_value, marked);
-                                }
+                if let Some(&id) = self.ptr_to_id.get(&obj_ptr) {
+                    if marked.insert(id) {
+                        // Object wasn't marked before, trace its properties
+                        let obj_ref = obj.borrow();
+                        for (_key, prop_value) in obj_ref.properties.iter() {
+                            self.mark_value(prop_value, marked);
+                        }
 
-                                // Trace based on object kind
-                                if let Some(proto) = obj_ref.prototype.as_ref() {
-                                    self.mark_value(&Value::Object(proto.clone()), marked);
-                                }
+                        // Trace based on object kind
+                        if let Some(proto) = obj_ref.prototype.as_ref() {
+                            self.mark_value(&Value::Object(proto.clone()), marked);
+                        }
 
-                                // Trace array elements if array
-                                if let crate::runtime::ObjectKind::Array(elements) = &obj_ref.kind {
-                                    for elem in elements {
-                                        self.mark_value(elem, marked);
-                                    }
-                                }
-
-                                // Trace function upvalues if function
-                                if let crate::runtime::ObjectKind::Function(func) = &obj_ref.kind {
-                                    for upvalue in &func.upvalues {
-                                        let val = upvalue.borrow().clone();
-                                        self.mark_value(&val, marked);
-                                    }
-                                }
-
-                                // Trace map entries
-                                if let crate::runtime::ObjectKind::Map(entries) = &obj_ref.kind {
-                                    for (k, v) in entries {
-                                        self.mark_value(k, marked);
-                                        self.mark_value(v, marked);
-                                    }
-                                }
-
-                                // Trace set entries
-                                if let crate::runtime::ObjectKind::Set(entries) = &obj_ref.kind {
-                                    for v in entries {
-                                        self.mark_value(v, marked);
-                                    }
-                                }
-
-                                // Trace promise value
-                                if let crate::runtime::ObjectKind::Promise { value: pval, .. } = &obj_ref.kind {
-                                    if let Some(v) = pval {
-                                        self.mark_value(v, marked);
-                                    }
-                                }
+                        // Trace array elements if array
+                        if let crate::runtime::ObjectKind::Array(elements) = &obj_ref.kind {
+                            for elem in elements {
+                                self.mark_value(elem, marked);
                             }
-                            break;
+                        }
+
+                        // Trace function upvalues if function
+                        if let crate::runtime::ObjectKind::Function(func) = &obj_ref.kind {
+                            for upvalue in &func.upvalues {
+                                let val = upvalue.borrow().clone();
+                                self.mark_value(&val, marked);
+                            }
+                        }
+
+                        // Trace map entries
+                        if let crate::runtime::ObjectKind::Map(entries) = &obj_ref.kind {
+                            for (k, v) in entries {
+                                self.mark_value(k, marked);
+                                self.mark_value(v, marked);
+                            }
+                        }
+
+                        // Trace set entries
+                        if let crate::runtime::ObjectKind::Set(entries) = &obj_ref.kind {
+                            for v in entries {
+                                self.mark_value(v, marked);
+                            }
+                        }
+
+                        // Trace promise value
+                        if let crate::runtime::ObjectKind::Promise { value: pval, .. } = &obj_ref.kind {
+                            if let Some(v) = pval {
+                                self.mark_value(v, marked);
+                            }
                         }
                     }
                 }
@@ -291,9 +301,21 @@ impl Gc {
     /// Force cleanup of all dead weak references
     pub fn cleanup_dead_refs(&mut self) {
         let before = self.heap.len();
-        self.heap.retain(|entry| entry.object.strong_count() > 0);
+        let verbose = self.config.verbose;
+        let ptr_to_id = &mut self.ptr_to_id;
+        self.heap.retain(|entry| {
+            if entry.object.strong_count() > 0 {
+                return true;
+            }
+            // Remove dead entry from ptr_to_id map
+            if let Some(strong) = entry.object.upgrade() {
+                let ptr = Rc::as_ptr(&strong) as *const () as usize;
+                ptr_to_id.remove(&ptr);
+            }
+            false
+        });
         let removed = before - self.heap.len();
-        if removed > 0 && self.config.verbose {
+        if removed > 0 && verbose {
             eprintln!("[GC] Cleaned up {} dead references", removed);
         }
     }
@@ -390,13 +412,13 @@ mod tests {
             kind: ObjectKind::Ordinary,
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }));
         let obj2 = Rc::new(RefCell::new(Object {
             kind: ObjectKind::Ordinary,
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }));
 
         gc.register(obj1.clone());

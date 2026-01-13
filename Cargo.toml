@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 description = "A memory-safe JavaScript runtime written in Rust"
 license = "MIT"
-repository = "https://github.com/example/quicksilver"
+repository = "https://github.com/anthropics/quicksilver"
+homepage = "https://github.com/anthropics/quicksilver"
+documentation = "https://docs.rs/quicksilver"
+readme = "README.md"
+authors = ["Quicksilver Contributors"]
 keywords = ["javascript", "runtime", "interpreter", "ecmascript"]
 categories = ["compilers", "wasm"]
 
