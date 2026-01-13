@@ -508,3 +508,99 @@ impl Error {
 
 /// Result type alias for Quicksilver
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Standardized error message templates
+///
+/// These constants provide consistent error messages following JavaScript conventions.
+/// Use the helper functions below to generate formatted error messages.
+pub mod messages {
+    // Type errors
+    pub const NOT_A_FUNCTION: &str = "is not a function";
+    pub const NOT_AN_OBJECT: &str = "is not an object";
+    pub const NOT_A_CONSTRUCTOR: &str = "is not a constructor";
+    pub const NOT_ITERABLE: &str = "is not iterable";
+    pub const NOT_A_SYMBOL: &str = "is not a symbol";
+    pub const NOT_A_NUMBER: &str = "is not a number";
+    pub const NOT_A_STRING: &str = "is not a string";
+    pub const NOT_AN_ARRAY: &str = "is not an array";
+
+    pub const CANNOT_READ_PROPERTY: &str = "Cannot read property";
+    pub const CANNOT_SET_PROPERTY: &str = "Cannot set property";
+    pub const CANNOT_CONVERT_TO: &str = "Cannot convert";
+    pub const CANNOT_CALL_METHOD: &str = "Cannot call method";
+
+    pub const INVALID_ARGUMENT: &str = "Invalid argument";
+    pub const INVALID_ARRAY_LENGTH: &str = "Invalid array length";
+    pub const INVALID_REGEX: &str = "Invalid regular expression";
+
+    // Reference errors
+    pub const IS_NOT_DEFINED: &str = "is not defined";
+    pub const CANNOT_ACCESS_BEFORE_INIT: &str = "Cannot access before initialization";
+
+    // Range errors
+    pub const OUT_OF_RANGE: &str = "out of range";
+    pub const PRECISION_OUT_OF_RANGE: &str = "precision out of range";
+    pub const RADIX_OUT_OF_RANGE: &str = "radix must be between 2 and 36";
+    pub const MAXIMUM_CALL_STACK: &str = "Maximum call stack size exceeded";
+
+    // Syntax errors
+    pub const UNEXPECTED_TOKEN: &str = "Unexpected token";
+    pub const UNEXPECTED_END: &str = "Unexpected end of input";
+    pub const UNTERMINATED_STRING: &str = "Unterminated string literal";
+    pub const INVALID_LEFT_HAND_SIDE: &str = "Invalid left-hand side in assignment";
+
+    /// Format a "X is not a function" error message
+    pub fn not_a_function(name: &str) -> String {
+        format!("'{}' {}", name, NOT_A_FUNCTION)
+    }
+
+    /// Format a "X is not an object" error message
+    pub fn not_an_object(name: &str) -> String {
+        format!("'{}' {}", name, NOT_AN_OBJECT)
+    }
+
+    /// Format a "X is not a constructor" error message
+    pub fn not_a_constructor(name: &str) -> String {
+        format!("'{}' {}", name, NOT_A_CONSTRUCTOR)
+    }
+
+    /// Format a "X is not iterable" error message
+    pub fn not_iterable(name: &str) -> String {
+        format!("'{}' {}", name, NOT_ITERABLE)
+    }
+
+    /// Format a "Cannot read property 'X' of Y" error message
+    pub fn cannot_read_property(prop: &str, of: &str) -> String {
+        format!("{} '{}' of {}", CANNOT_READ_PROPERTY, prop, of)
+    }
+
+    /// Format a "Cannot set property 'X' of Y" error message
+    pub fn cannot_set_property(prop: &str, of: &str) -> String {
+        format!("{} '{}' of {}", CANNOT_SET_PROPERTY, prop, of)
+    }
+
+    /// Format a "Cannot convert X to Y" error message
+    pub fn cannot_convert(from: &str, to: &str) -> String {
+        format!("{} {} to {}", CANNOT_CONVERT_TO, from, to)
+    }
+
+    /// Format a "X is not defined" error message
+    pub fn not_defined(name: &str) -> String {
+        format!("'{}' {}", name, IS_NOT_DEFINED)
+    }
+
+    /// Format a "X.Y is not a function" error message for method calls
+    pub fn method_not_a_function(obj: &str, method: &str) -> String {
+        format!("'{}.{}' {}", obj, method, NOT_A_FUNCTION)
+    }
+
+    /// Format a "X requires Y" error message
+    pub fn requires(what: &str, requirement: &str) -> String {
+        format!("{} requires {}", what, requirement)
+    }
+
+    /// Format a "X must be Y" error message
+    pub fn must_be(what: &str, requirement: &str) -> String {
+        format!("{} must be {}", what, requirement)
+    }
+}
