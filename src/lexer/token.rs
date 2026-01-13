@@ -228,6 +228,9 @@ pub enum Keyword {
     Of,
     Set,
     Target,
+
+    // Algebraic effects keyword
+    Perform,
 }
 
 impl Keyword {
@@ -295,6 +298,7 @@ impl Keyword {
             Keyword::Of => "of",
             Keyword::Set => "set",
             Keyword::Target => "target",
+            Keyword::Perform => "perform",
         }
     }
 }

@@ -89,6 +89,9 @@ pub enum Expression {
     /// import(source)
     Import(Box<ImportExpression>),
 
+    /// Perform effect operation: perform EffectType.operation(args)
+    Perform(Box<PerformExpression>),
+
     /// Parenthesized expression (for preserving parens)
     Parenthesized(Box<Expression>),
 }
@@ -125,6 +128,7 @@ impl Expression {
             Expression::Await(a) => a.span,
             Expression::MetaProperty(m) => m.span,
             Expression::Import(i) => i.span,
+            Expression::Perform(p) => p.span,
             Expression::Parenthesized(e) => e.span(),
         }
     }
@@ -536,6 +540,19 @@ pub struct MetaProperty {
 pub struct ImportExpression {
     /// Source module
     pub source: Expression,
+    /// Span in source
+    pub span: Span,
+}
+
+/// Perform expression perform Effect.operation(args)
+#[derive(Debug, Clone)]
+pub struct PerformExpression {
+    /// Effect type name (e.g., "Log")
+    pub effect_type: String,
+    /// Operation name (e.g., "log")
+    pub operation: String,
+    /// Arguments to the operation
+    pub arguments: Vec<Expression>,
     /// Span in source
     pub span: Span,
 }

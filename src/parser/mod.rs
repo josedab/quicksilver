@@ -459,7 +459,22 @@ impl<'src> Parser<'src> {
                 break;
             }
 
-            elements.push(Some(self.parse_binding_pattern()?));
+            let elem_start = self.location();
+            let pattern = self.parse_binding_pattern()?;
+
+            // Check for default value
+            let pattern = if self.consume(TokenKind::Equals) {
+                let default_value = self.parse_assignment_expression()?;
+                Pattern::Assignment(Box::new(AssignmentPattern {
+                    left: pattern,
+                    right: default_value,
+                    span: Span::new(elem_start, self.location()),
+                }))
+            } else {
+                pattern
+            };
+
+            elements.push(Some(pattern));
 
             if !self.consume(TokenKind::Comma) {
                 self.expect(TokenKind::RightBracket)?;
@@ -542,7 +557,20 @@ impl<'src> Parser<'src> {
             });
         }
 
+        let value_start = self.location();
         let value = self.parse_binding_pattern()?;
+
+        // Check for default value in non-shorthand properties like {x: a = default}
+        let value = if self.consume(TokenKind::Equals) {
+            let default_value = self.parse_assignment_expression()?;
+            Pattern::Assignment(Box::new(AssignmentPattern {
+                left: value,
+                right: default_value,
+                span: Span::new(value_start, self.location()),
+            }))
+        } else {
+            value
+        };
 
         Ok(ObjectPatternProperty::Property {
             key,
@@ -551,6 +579,92 @@ impl<'src> Parser<'src> {
             computed,
             span: Span::new(start, self.location()),
         })
+    }
+
+    /// Convert an expression to a pattern for destructuring assignment.
+    /// This is needed for `[a, b] = arr` and `{x, y} = obj` style assignments.
+    fn expression_to_pattern(&self, expr: Expression) -> Option<Pattern> {
+        match expr {
+            Expression::Identifier(id) => Some(Pattern::Identifier(id)),
+            Expression::Array(arr) => {
+                let mut elements = Vec::new();
+                for elem in arr.elements {
+                    match elem {
+                        Some(e) => {
+                            // Check if it's a spread expression
+                            if let Expression::Spread(spread) = e {
+                                let arg = self.expression_to_pattern(spread.argument)?;
+                                elements.push(Some(Pattern::Rest(Box::new(RestPattern {
+                                    argument: arg,
+                                    span: spread.span,
+                                }))));
+                            } else {
+                                elements.push(Some(self.expression_to_pattern(e)?));
+                            }
+                        }
+                        None => {
+                            elements.push(None);
+                        }
+                    }
+                }
+                Some(Pattern::Array(ArrayPattern {
+                    elements,
+                    rest: None,
+                    span: arr.span,
+                }))
+            }
+            Expression::Object(obj) => {
+                let mut properties = Vec::new();
+                for prop in obj.properties {
+                    match prop {
+                        ObjectProperty::Property { key, value, shorthand, computed, span, .. } => {
+                            let value_pattern = self.expression_to_pattern(value)?;
+                            properties.push(ObjectPatternProperty::Property {
+                                key,
+                                value: value_pattern,
+                                shorthand,
+                                computed,
+                                span,
+                            });
+                        }
+                        ObjectProperty::Spread { argument, span } => {
+                            let arg = self.expression_to_pattern(argument)?;
+                            properties.push(ObjectPatternProperty::Rest {
+                                argument: arg,
+                                span,
+                            });
+                        }
+                        ObjectProperty::Method(_) => {
+                            return None; // Can't have methods in destructuring pattern
+                        }
+                    }
+                }
+                Some(Pattern::Object(ObjectPattern {
+                    properties,
+                    span: obj.span,
+                }))
+            }
+            Expression::Member(member) => {
+                Some(Pattern::Member(member))
+            }
+            Expression::Assignment(assign) => {
+                // Handle default value: a = defaultValue
+                if let AssignmentTarget::Simple(left_expr) = assign.left {
+                    let left_pattern = self.expression_to_pattern(left_expr)?;
+                    Some(Pattern::Assignment(Box::new(AssignmentPattern {
+                        left: left_pattern,
+                        right: assign.right,
+                        span: assign.span,
+                    })))
+                } else {
+                    None
+                }
+            }
+            Expression::Parenthesized(inner) => {
+                self.expression_to_pattern(*inner)
+            }
+            _ => None,
+        }
     }
 
     fn parse_property_key(&mut self) -> Result<PropertyKey> {
@@ -1285,6 +1399,13 @@ impl<'src> Parser<'src> {
 
             let target = if left.is_valid_assignment_target() {
                 AssignmentTarget::Simple(left)
+            } else if matches!(&left, Expression::Array(_) | Expression::Object(_)) {
+                // Try to convert array/object expression to destructuring pattern
+                if let Some(pattern) = self.expression_to_pattern(left) {
+                    AssignmentTarget::Pattern(pattern)
+                } else {
+                    return Err(self.error("Invalid left-hand side in assignment", start));
+                }
             } else {
                 return Err(self.error("Invalid left-hand side in assignment", start));
             };
@@ -1324,7 +1445,14 @@ impl<'src> Parser<'src> {
             }
         } else if self.peek() == TokenKind::LeftParen {
             self.advance();
-            let params = self.parse_function_params()?;
+            // Try to parse as function params - if it fails, this might be a parenthesized expression
+            let params = match self.parse_function_params() {
+                Ok(p) => p,
+                Err(_) => {
+                    self.pos = start_pos;
+                    return Ok(None);
+                }
+            };
             if self.expect(TokenKind::RightParen).is_err() || self.peek() != TokenKind::Arrow {
                 self.pos = start_pos;
                 return Ok(None);
@@ -1626,6 +1754,32 @@ impl<'src> Parser<'src> {
             return Ok(Expression::Yield(Box::new(YieldExpression {
                 argument,
                 delegate,
+                span: Span::new(start, self.location()),
+            })));
+        }
+
+        // Perform expression: perform Effect.operation(args)
+        if self.peek() == TokenKind::Keyword(Keyword::Perform) {
+            self.advance();
+
+            // Parse effect type (identifier)
+            let effect_type_id = self.parse_identifier()?;
+
+            // Expect dot
+            self.expect(TokenKind::Dot)?;
+
+            // Parse operation name
+            let operation_id = self.parse_identifier()?;
+
+            // Parse arguments (required parentheses)
+            self.expect(TokenKind::LeftParen)?;
+            let arguments = self.parse_arguments()?;
+            self.expect(TokenKind::RightParen)?;
+
+            return Ok(Expression::Perform(Box::new(PerformExpression {
+                effect_type: effect_type_id.name,
+                operation: operation_id.name,
+                arguments,
                 span: Span::new(start, self.location()),
             })));
         }

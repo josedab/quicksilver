@@ -213,6 +213,7 @@ impl<'src> Lexer<'src> {
             "of" => TokenKind::Keyword(Keyword::Of),
             "set" => TokenKind::Keyword(Keyword::Set),
             "target" => TokenKind::Keyword(Keyword::Target),
+            "perform" => TokenKind::Keyword(Keyword::Perform),
             // Identifier
             _ => TokenKind::Identifier,
         };
