@@ -450,6 +450,246 @@ impl Default for Actor {
     }
 }
 
+// ==================== VM Integration ====================
+
+use crate::runtime::Value;
+use std::sync::RwLock;
+
+/// Distributed runtime that integrates with the VM
+pub struct DistributedRuntime {
+    /// The cluster this runtime is connected to
+    cluster: Arc<Cluster>,
+    /// Local actors by ID
+    actors: RwLock<HashMap<u64, Arc<Actor>>>,
+    /// Pending task futures
+    pending_tasks: Mutex<HashMap<TaskId, TaskFuture>>,
+}
+
+/// Future representing a pending distributed task
+#[derive(Debug)]
+pub struct TaskFuture {
+    pub task_id: TaskId,
+    pub submitted_at: Instant,
+    pub timeout: Option<Duration>,
+}
+
+impl DistributedRuntime {
+    /// Create a new distributed runtime
+    pub fn new() -> Self {
+        Self {
+            cluster: Arc::new(Cluster::new(ClusterConfig::default())),
+            actors: RwLock::new(HashMap::default()),
+            pending_tasks: Mutex::new(HashMap::default()),
+        }
+    }
+
+    /// Connect to an existing cluster
+    pub fn connect(address: &str) -> Result<Self, ClusterError> {
+        let cluster = Cluster::connect(address)?;
+        Ok(Self {
+            cluster,
+            actors: RwLock::new(HashMap::default()),
+            pending_tasks: Mutex::new(HashMap::default()),
+        })
+    }
+
+    /// Create with custom config
+    pub fn with_config(config: ClusterConfig) -> Self {
+        Self {
+            cluster: Arc::new(Cluster::new(config)),
+            actors: RwLock::new(HashMap::default()),
+            pending_tasks: Mutex::new(HashMap::default()),
+        }
+    }
+
+    /// Get the cluster
+    pub fn cluster(&self) -> Arc<Cluster> {
+        Arc::clone(&self.cluster)
+    }
+
+    /// Submit a task from JavaScript code
+    pub fn submit_task(&self, bytecode: Vec<u8>, args: Value) -> Result<TaskId, ClusterError> {
+        // Serialize the arguments
+        let args_bytes = self.serialize_value(&args)?;
+
+        let task = Task::new(bytecode, args_bytes)
+            .with_timeout(self.cluster.config().default_timeout);
+
+        let task_id = self.cluster.submit(task);
+
+        // Track the pending task
+        self.pending_tasks.lock().unwrap().insert(
+            task_id,
+            TaskFuture {
+                task_id,
+                submitted_at: Instant::now(),
+                timeout: Some(self.cluster.config().default_timeout),
+            },
+        );
+
+        Ok(task_id)
+    }
+
+    /// Check if a task is complete
+    pub fn is_task_complete(&self, task_id: TaskId) -> bool {
+        matches!(
+            self.cluster.task_status(task_id),
+            Some(TaskStatus::Completed(_)) | Some(TaskStatus::Failed(_)) | Some(TaskStatus::Cancelled)
+        )
+    }
+
+    /// Get task result as a Value
+    pub fn get_task_result(&self, task_id: TaskId) -> Result<Option<Value>, ClusterError> {
+        match self.cluster.task_status(task_id) {
+            Some(TaskStatus::Completed(bytes)) => {
+                let value = self.deserialize_value(&bytes)?;
+                Ok(Some(value))
+            }
+            Some(TaskStatus::Failed(error)) => Err(ClusterError::TaskFailed(error)),
+            Some(TaskStatus::Cancelled) => Err(ClusterError::TaskFailed("Task was cancelled".to_string())),
+            _ => Ok(None), // Still pending
+        }
+    }
+
+    /// Cancel a task
+    pub fn cancel_task(&self, task_id: TaskId) -> bool {
+        self.pending_tasks.lock().unwrap().remove(&task_id);
+        self.cluster.cancel(task_id)
+    }
+
+    /// Create a new actor
+    pub fn spawn_actor(&self) -> u64 {
+        let actor = Arc::new(Actor::new());
+        let id = actor.id().0;
+        self.actors.write().unwrap().insert(id, actor);
+        id
+    }
+
+    /// Send a message to an actor
+    pub fn send_to_actor(&self, actor_id: u64, value: Value) -> Result<(), ClusterError> {
+        let actors = self.actors.read().unwrap();
+        if let Some(actor) = actors.get(&actor_id) {
+            // Convert Value to a Message (simplified: just wrap in TaskResult)
+            let bytes = self.serialize_value(&value)?;
+            actor.send(Message::TaskResult {
+                task_id: TaskId::new(),
+                result: bytes,
+            });
+            Ok(())
+        } else {
+            Err(ClusterError::NodeNotFound(NodeId(actor_id)))
+        }
+    }
+
+    /// Receive a message from an actor's mailbox
+    pub fn receive_from_actor(&self, actor_id: u64) -> Result<Option<Value>, ClusterError> {
+        let actors = self.actors.read().unwrap();
+        if let Some(actor) = actors.get(&actor_id) {
+            if let Some(msg) = actor.receive() {
+                match msg {
+                    Message::TaskResult { result, .. } => {
+                        let value = self.deserialize_value(&result)?;
+                        Ok(Some(value))
+                    }
+                    _ => Ok(None),
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Err(ClusterError::NodeNotFound(NodeId(actor_id)))
+        }
+    }
+
+    /// Get cluster info as a JavaScript value
+    pub fn get_cluster_info(&self) -> Value {
+        let nodes = self.cluster.nodes();
+        let mut props = HashMap::default();
+
+        props.insert("name".to_string(), Value::String(self.cluster.config().name.clone()));
+        props.insert("nodeCount".to_string(), Value::Number(nodes.len() as f64));
+
+        let node_array: Vec<Value> = nodes
+            .iter()
+            .map(|n| {
+                let mut node_props = HashMap::default();
+                node_props.insert("id".to_string(), Value::Number(n.id.0 as f64));
+                node_props.insert("address".to_string(), Value::String(n.address.clone()));
+                node_props.insert("status".to_string(), Value::String(format!("{:?}", n.status)));
+                node_props.insert("cpuCores".to_string(), Value::Number(n.cpu_cores as f64));
+                node_props.insert("memoryMb".to_string(), Value::Number(n.memory_mb as f64));
+                node_props.insert("currentTasks".to_string(), Value::Number(n.current_tasks as f64));
+                Value::new_object_with_properties(node_props)
+            })
+            .collect();
+
+        props.insert("nodes".to_string(), Value::new_array(node_array));
+
+        Value::new_object_with_properties(props)
+    }
+
+    /// Simplified value serialization (converts to JSON-like bytes)
+    fn serialize_value(&self, value: &Value) -> Result<Vec<u8>, ClusterError> {
+        // Simple serialization: convert to string and encode
+        let s = value.to_js_string();
+        Ok(s.into_bytes())
+    }
+
+    /// Simplified value deserialization
+    fn deserialize_value(&self, bytes: &[u8]) -> Result<Value, ClusterError> {
+        // Simple deserialization: decode as string
+        let s = String::from_utf8(bytes.to_vec())
+            .map_err(|e| ClusterError::Serialization(e.to_string()))?;
+        Ok(Value::String(s))
+    }
+
+    /// Tick pending tasks (check for timeouts)
+    pub fn tick(&self) {
+        let now = Instant::now();
+        let mut pending = self.pending_tasks.lock().unwrap();
+        let mut timed_out = Vec::new();
+
+        for (task_id, future) in pending.iter() {
+            if let Some(timeout) = future.timeout {
+                if now.duration_since(future.submitted_at) > timeout {
+                    timed_out.push(*task_id);
+                }
+            }
+        }
+
+        for task_id in timed_out {
+            pending.remove(&task_id);
+            self.cluster.cancel(task_id);
+        }
+    }
+
+    /// Get pending task count
+    pub fn pending_task_count(&self) -> usize {
+        self.pending_tasks.lock().unwrap().len()
+    }
+
+    /// Get actor count
+    pub fn actor_count(&self) -> usize {
+        self.actors.read().unwrap().len()
+    }
+}
+
+impl Default for DistributedRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for DistributedRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DistributedRuntime")
+            .field("cluster", &self.cluster)
+            .field("actor_count", &self.actors.read().unwrap().len())
+            .field("pending_tasks", &self.pending_tasks.lock().unwrap().len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +748,39 @@ mod tests {
 
         let msg = actor.receive();
         assert!(matches!(msg, Some(Message::Heartbeat { .. })));
+    }
+
+    #[test]
+    fn test_distributed_runtime() {
+        let runtime = DistributedRuntime::new();
+
+        // Should start with no pending tasks and no actors
+        assert_eq!(runtime.pending_task_count(), 0);
+        assert_eq!(runtime.actor_count(), 0);
+
+        // Spawn an actor
+        let actor_id = runtime.spawn_actor();
+        assert_eq!(runtime.actor_count(), 1);
+
+        // Send a message to the actor
+        let result = runtime.send_to_actor(actor_id, Value::String("hello".to_string()));
+        assert!(result.is_ok());
+
+        // Receive the message
+        let msg = runtime.receive_from_actor(actor_id).unwrap();
+        assert!(msg.is_some());
+    }
+
+    #[test]
+    fn test_distributed_runtime_cluster_info() {
+        let runtime = DistributedRuntime::new();
+        let info = runtime.get_cluster_info();
+
+        // Should be an object with cluster info
+        if let Value::Object(obj) = info {
+            let borrowed = obj.borrow();
+            assert!(borrowed.properties.contains_key("name"));
+            assert!(borrowed.properties.contains_key("nodeCount"));
+        }
     }
 }
