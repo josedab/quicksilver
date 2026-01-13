@@ -3,6 +3,15 @@
 //! This module implements the bytecode interpreter that executes
 //! compiled JavaScript code.
 
+mod cache;
+mod types;
+
+// Re-export public types from submodules
+pub use cache::IC_SIZE;
+pub use types::{CallFrame, ExceptionHandler, Microtask, ResourceLimits, Timer};
+
+use cache::{compute_shape_id_raw, hash_property_name, InlineCacheEntry};
+
 use super::value::{Function, GeneratorState, NativeFn, Object, ObjectKind, PromiseState, Value};
 use crate::bytecode::{compile, Chunk, Opcode};
 use crate::debugger::TimeTravelDebugger;
@@ -20,264 +29,6 @@ const MAX_CALL_DEPTH: usize = 1024;
 
 /// Maximum stack size
 const MAX_STACK_SIZE: usize = 65536;
-
-/// Inline cache size for property access
-pub const IC_SIZE: usize = 256;
-
-/// Maximum number of shapes per polymorphic IC slot
-/// Increased from 4 to 12 for better polymorphic performance
-const PIC_MAX_SHAPES: usize = 12;
-
-/// A single shape-to-offset mapping in the polymorphic cache
-#[derive(Clone, Default)]
-struct ShapeEntry {
-    /// Shape ID of the object (hash of property keys order)
-    shape_id: u64,
-    /// Offset where property was found
-    offset: usize,
-    /// Hit count for this shape
-    hits: u32,
-}
-
-/// Entry in the polymorphic inline cache for property access
-#[derive(Clone)]
-struct InlineCacheEntry {
-    /// Hash of the property name being cached
-    name_hash: u64,
-    /// Multiple shape entries for polymorphic dispatch
-    shapes: [ShapeEntry; PIC_MAX_SHAPES],
-    /// Number of active shape entries
-    shape_count: u8,
-    /// Whether this cache site is megamorphic (too many shapes)
-    is_megamorphic: bool,
-    /// Total hit count
-    total_hits: u32,
-}
-
-impl Default for InlineCacheEntry {
-    fn default() -> Self {
-        Self {
-            name_hash: 0,
-            shapes: Default::default(),
-            shape_count: 0,
-            is_megamorphic: false,
-            total_hits: 0,
-        }
-    }
-}
-
-impl InlineCacheEntry {
-    /// Look up property offset for a given shape
-    #[inline]
-    fn lookup(&self, shape_id: u64) -> Option<usize> {
-        if self.is_megamorphic {
-            return None;
-        }
-        for i in 0..(self.shape_count as usize) {
-            if self.shapes[i].shape_id == shape_id {
-                return Some(self.shapes[i].offset);
-            }
-        }
-        None
-    }
-
-    /// Add or update a shape entry
-    #[inline]
-    fn update(&mut self, shape_id: u64, offset: usize) {
-        // Check if shape already exists
-        for i in 0..(self.shape_count as usize) {
-            if self.shapes[i].shape_id == shape_id {
-                self.shapes[i].hits = self.shapes[i].hits.saturating_add(1);
-                return;
-            }
-        }
-
-        // Add new shape if we have room
-        if (self.shape_count as usize) < PIC_MAX_SHAPES {
-            let idx = self.shape_count as usize;
-            self.shapes[idx] = ShapeEntry {
-                shape_id,
-                offset,
-                hits: 1,
-            };
-            self.shape_count += 1;
-        } else {
-            // Too many shapes - mark as megamorphic
-            self.is_megamorphic = true;
-        }
-        self.total_hits = self.total_hits.saturating_add(1);
-    }
-}
-
-/// Simple hash function for property names
-#[inline]
-fn hash_property_name(name: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for byte in name.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    hash
-}
-
-/// Compute a shape ID for an object based on its property keys
-/// This allows polymorphic IC to distinguish objects with different structures
-#[inline]
-fn compute_shape_id(properties: &HashMap<String, Value>) -> u64 {
-    // Simple shape ID based on number of properties and hash of keys
-    let mut hash: u64 = properties.len() as u64;
-    for key in properties.keys() {
-        hash = hash.wrapping_mul(31).wrapping_add(hash_property_name(key));
-    }
-    hash
-}
-
-/// A call frame on the call stack
-#[derive(Clone)]
-pub struct CallFrame {
-    /// Function being executed
-    pub function: Option<Rc<RefCell<Function>>>,
-    /// Instruction pointer
-    pub ip: usize,
-    /// Base pointer (start of local variables on stack)
-    pub bp: usize,
-    /// The bytecode chunk
-    pub chunk: Chunk,
-    /// Is this a constructor call?
-    pub is_constructor: bool,
-    /// The 'this' value for constructor calls (the new instance)
-    pub constructor_this: Option<Value>,
-}
-
-impl CallFrame {
-    /// Create a new call frame for a chunk
-    pub fn new(chunk: Chunk) -> Self {
-        Self {
-            function: None,
-            ip: 0,
-            bp: 0,
-            chunk,
-            is_constructor: false,
-            constructor_this: None,
-        }
-    }
-
-    /// Create a new call frame for a function
-    pub fn for_function(function: Rc<RefCell<Function>>, bp: usize) -> Self {
-        let chunk = function.borrow().chunk.clone();
-        Self {
-            function: Some(function),
-            ip: 0,
-            bp,
-            chunk,
-            is_constructor: false,
-            constructor_this: None,
-        }
-    }
-
-    /// Create a new call frame for a constructor call
-    pub fn for_constructor(function: Rc<RefCell<Function>>, bp: usize, this_value: Value) -> Self {
-        let chunk = function.borrow().chunk.clone();
-        Self {
-            function: Some(function),
-            ip: 0,
-            bp,
-            chunk,
-            is_constructor: true,
-            constructor_this: Some(this_value),
-        }
-    }
-}
-
-/// Exception handler for try/catch
-#[derive(Clone)]
-struct ExceptionHandler {
-    /// Instruction pointer to jump to (catch block)
-    catch_ip: usize,
-    /// Frame index when handler was registered
-    frame_index: usize,
-    /// Stack size when handler was registered
-    stack_size: usize,
-}
-
-/// A microtask to be executed
-#[derive(Clone)]
-pub struct Microtask {
-    /// The callback function to execute
-    pub callback: Value,
-    /// Argument to pass to the callback
-    pub argument: Value,
-}
-
-/// A scheduled timer (setTimeout or setInterval)
-#[derive(Clone)]
-pub struct Timer {
-    /// Unique timer ID
-    pub id: u64,
-    /// The callback function to execute
-    pub callback: Value,
-    /// Arguments to pass to the callback
-    pub args: Vec<Value>,
-    /// Delay in milliseconds
-    pub delay: u64,
-    /// When the timer should fire (Instant as ms since start)
-    pub fire_at: u64,
-    /// Is this a repeating timer (setInterval)?
-    pub repeating: bool,
-    /// Is this timer cancelled?
-    pub cancelled: bool,
-}
-
-/// Resource limits configuration for the VM
-#[derive(Debug, Clone, Default)]
-pub struct ResourceLimits {
-    /// Maximum execution time in milliseconds
-    pub time_limit_ms: Option<u64>,
-    /// Maximum number of bytecode operations
-    pub operation_limit: Option<u64>,
-    /// Maximum memory usage in bytes (approximate)
-    pub memory_limit: Option<usize>,
-    /// Maximum call stack depth
-    pub stack_depth_limit: Option<usize>,
-    /// How often to check limits (every N operations)
-    pub check_interval: u64,
-}
-
-impl ResourceLimits {
-    /// Create new resource limits with default check interval
-    pub fn new() -> Self {
-        Self {
-            time_limit_ms: None,
-            operation_limit: None,
-            memory_limit: None,
-            stack_depth_limit: None,
-            check_interval: 1000, // Check every 1000 operations
-        }
-    }
-
-    /// Set time limit in milliseconds
-    pub fn with_time_limit(mut self, ms: u64) -> Self {
-        self.time_limit_ms = Some(ms);
-        self
-    }
-
-    /// Set operation limit
-    pub fn with_operation_limit(mut self, ops: u64) -> Self {
-        self.operation_limit = Some(ops);
-        self
-    }
-
-    /// Set memory limit in bytes
-    pub fn with_memory_limit(mut self, bytes: usize) -> Self {
-        self.memory_limit = Some(bytes);
-        self
-    }
-
-    /// Set stack depth limit
-    pub fn with_stack_depth_limit(mut self, depth: usize) -> Self {
-        self.stack_depth_limit = Some(depth);
-        self
-    }
-}
 
 /// The Quicksilver virtual machine
 pub struct VM {
@@ -604,7 +355,7 @@ impl VM {
                     },
                     properties: HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 })))
             }
             Err(e) => {
@@ -619,7 +370,7 @@ impl VM {
                     },
                     properties: HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 })))
             }
         }
@@ -763,7 +514,7 @@ impl VM {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         };
         self.globals.insert(
             name.to_string(),
@@ -2081,24 +1832,7 @@ impl VM {
 
                 Some(Opcode::Super) => {
                     // Push the superclass of the current class context
-                    let super_value = if let Some(class) = self.current_class.clone() {
-                        if let Value::Object(obj) = &class {
-                            let obj_ref = obj.borrow();
-                            if let ObjectKind::Class { super_class, .. } = &obj_ref.kind {
-                                if let Some(sc) = super_class {
-                                    sc.as_ref().clone()
-                                } else {
-                                    Value::Undefined
-                                }
-                            } else {
-                                Value::Undefined
-                            }
-                        } else {
-                            Value::Undefined
-                        }
-                    } else {
-                        Value::Undefined
-                    };
+                    let super_value = self.get_super_class().unwrap_or(Value::Undefined);
                     self.push(super_value)?;
                 }
 
@@ -2167,32 +1901,15 @@ impl VM {
 
                     // Get super constructor from current class
                     let mut result = Value::Undefined;
-                    if let Some(ref class) = self.current_class.clone() {
-                        if let Value::Object(obj) = class {
-                            let obj_ref = obj.borrow();
-                            if let ObjectKind::Class { super_class, .. } = &obj_ref.kind {
-                                if let Some(sc) = super_class {
-                                    if let Value::Object(super_obj) = sc.as_ref() {
-                                        let super_ref = super_obj.borrow();
-                                        if let ObjectKind::Class { constructor, .. } =
-                                            &super_ref.kind
-                                        {
-                                            if let Some(ctor) = constructor {
-                                                // Create a Value from the constructor function
-                                                let ctor_value = Value::new_function(ctor.as_ref().clone());
-                                                drop(super_ref);
-                                                drop(obj_ref);
-
-                                                // Call the constructor with current 'this'
-                                                let this = self.this_value.clone();
-                                                result = self.call_function_with_this(
-                                                    &ctor_value,
-                                                    &args,
-                                                    this,
-                                                )?;
-                                            }
-                                        }
-                                    }
+                    if let Some(super_class) = self.get_super_class() {
+                        if let Value::Object(super_obj) = &super_class {
+                            let super_ref = super_obj.borrow();
+                            if let ObjectKind::Class { constructor, .. } = &super_ref.kind {
+                                if let Some(ctor) = constructor {
+                                    let ctor_value = Value::new_function(ctor.as_ref().clone());
+                                    drop(super_ref);
+                                    let this = self.this_value.clone();
+                                    result = self.call_function_with_this(&ctor_value, &args, this)?;
                                 }
                             }
                         }
@@ -2206,30 +1923,11 @@ impl VM {
                     let name_index = self.read_u16()?;
                     let name = self.get_constant_string(name_index)?;
 
-                    let result = if let Some(class) = self.current_class.clone() {
-                        if let Value::Object(obj) = &class {
-                            let obj_ref = obj.borrow();
-                            if let ObjectKind::Class { super_class, .. } = &obj_ref.kind {
-                                if let Some(sc) = super_class {
-                                    if let Value::Object(super_obj) = sc.as_ref() {
-                                        let super_ref = super_obj.borrow();
-                                        if let ObjectKind::Class { prototype, .. } =
-                                            &super_ref.kind
-                                        {
-                                            if let Some(value) = prototype.get(&name) {
-                                                value.clone()
-                                            } else {
-                                                Value::Undefined
-                                            }
-                                        } else {
-                                            Value::Undefined
-                                        }
-                                    } else {
-                                        Value::Undefined
-                                    }
-                                } else {
-                                    Value::Undefined
-                                }
+                    let result = if let Some(super_class) = self.get_super_class() {
+                        if let Value::Object(super_obj) = &super_class {
+                            let super_ref = super_obj.borrow();
+                            if let ObjectKind::Class { prototype, .. } = &super_ref.kind {
+                                prototype.get(&name).cloned().unwrap_or(Value::Undefined)
                             } else {
                                 Value::Undefined
                             }
@@ -2258,7 +1956,7 @@ impl VM {
                                         },
                                         properties: HashMap::default(),
                                         private_fields: HashMap::default(),
-                                        prototype: None,
+                                        prototype: None, cached_shape_id: None,
                                     })))
                                 }
                                 ObjectKind::Iterator { .. } => {
@@ -2279,7 +1977,7 @@ impl VM {
                                 kind: ObjectKind::Iterator { values, index: 0 },
                                 properties: HashMap::default(),
                                 private_fields: HashMap::default(),
-                                prototype: None,
+                                prototype: None, cached_shape_id: None,
                             })))
                         }
                         _ => Value::Undefined,
@@ -2439,7 +2137,8 @@ impl VM {
 
                 Some(Opcode::LoadReg) | Some(Opcode::StoreReg) => {
                     let _reg = self.read_u8()?;
-                    // Registers not implemented yet
+                    // Register opcodes reserved for future register-based VM optimization.
+                    // Currently, the compiler uses stack-based operations only.
                 }
 
                 Some(Opcode::GetUpvalue)
@@ -2483,6 +2182,49 @@ impl VM {
                     // Create a promise that resolves to the module namespace
                     let promise = self.create_dynamic_import_promise(&specifier);
                     self.push(promise)?;
+                }
+
+                Some(Opcode::Perform) => {
+                    // Perform an algebraic effect operation
+                    let effect_type_index = self.read_u16()?;
+                    let operation_index = self.read_u16()?;
+                    let arg_count = self.read_u8()? as usize;
+
+                    let effect_type = self.get_constant_string(effect_type_index)?;
+                    let operation = self.get_constant_string(operation_index)?;
+
+                    // Collect arguments from stack
+                    let mut args = Vec::with_capacity(arg_count);
+                    for _ in 0..arg_count {
+                        args.push(self.stack.pop().unwrap_or(Value::Undefined));
+                    }
+                    args.reverse();
+
+                    // Create an Effect object that represents this effect operation
+                    let effect_obj = Object {
+                        kind: ObjectKind::Effect {
+                            effect_type: effect_type.clone(),
+                            operation: operation.clone(),
+                            args: args.clone(),
+                        },
+                        properties: HashMap::default(),
+                        private_fields: HashMap::default(),
+                        prototype: None,
+                        cached_shape_id: None,
+                    };
+                    let effect_value = Value::Object(Rc::new(RefCell::new(effect_obj)));
+
+                    // Look for an effect handler in the current scope
+                    // For now, check if there's a registered handler for this effect type
+                    let handler_name = format!("__effect_handler_{}_{}", effect_type, operation);
+                    if let Some(handler) = self.get_global(&handler_name) {
+                        // Call the handler with the arguments
+                        let result = self.call_function_with_this(&handler, &args, Value::Undefined)?;
+                        self.push(result)?;
+                    } else {
+                        // No handler found - push the effect object (for potential handling upstream)
+                        self.push(effect_value)?;
+                    }
                 }
 
                 None => {
@@ -2917,7 +2659,7 @@ impl VM {
                                     },
                                     properties: HashMap::default(),
                                     private_fields: HashMap::default(),
-                                    prototype: None,
+                                    prototype: None, cached_shape_id: None,
                                 };
                                 Ok(Value::Object(Rc::new(RefCell::new(bound_func))))
                             }
@@ -3018,7 +2760,7 @@ impl VM {
                                     },
                                     properties: HashMap::default(),
                                     private_fields: HashMap::default(),
-                                    prototype: None,
+                                    prototype: None, cached_shape_id: None,
                                 };
                                 Ok(Value::Object(Rc::new(RefCell::new(bound_func))))
                             }
@@ -3095,7 +2837,7 @@ impl VM {
                                     },
                                     properties: HashMap::default(),
                                     private_fields: HashMap::default(),
-                                    prototype: None,
+                                    prototype: None, cached_shape_id: None,
                                 };
                                 Ok(Value::Object(Rc::new(RefCell::new(bound_func))))
                             }
@@ -3181,6 +2923,7 @@ impl VM {
                                             properties: HashMap::default(),
                                             private_fields: HashMap::default(),
                                             prototype: Some(constructor_obj.clone()),
+                                            cached_shape_id: None,
                                         })))
                                     } else {
                                         return Err(Error::type_error("Reflect.construct requires a constructor"));
@@ -3487,12 +3230,13 @@ impl VM {
             }
             "map" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 let mut results = Vec::with_capacity(arr.len());
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     results.push(result);
                 }
@@ -3500,12 +3244,13 @@ impl VM {
             }
             "filter" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 let mut results = Vec::new();
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     if result.to_boolean() {
                         results.push(elem.clone());
@@ -3515,11 +3260,12 @@ impl VM {
             }
             "forEach" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 for (i, elem) in arr.iter().enumerate() {
                     self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                 }
                 Ok(Value::Undefined)
@@ -3527,6 +3273,7 @@ impl VM {
             "reduce" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
                 let initial = args.get(1).cloned();
+                let recv = receiver.clone();
 
                 let mut iter = arr.iter().enumerate();
                 let mut acc = if let Some(init) = initial {
@@ -3542,18 +3289,19 @@ impl VM {
                         acc,
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                 }
                 Ok(acc)
             }
             "find" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     if result.to_boolean() {
                         return Ok(elem.clone());
@@ -3563,11 +3311,12 @@ impl VM {
             }
             "findIndex" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     if result.to_boolean() {
                         return Ok(Value::Number(i as f64));
@@ -3577,11 +3326,12 @@ impl VM {
             }
             "some" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     if result.to_boolean() {
                         return Ok(Value::Boolean(true));
@@ -3591,11 +3341,12 @@ impl VM {
             }
             "every" => {
                 let callback = args.first().cloned().unwrap_or(Value::Undefined);
+                let recv = receiver.clone();
                 for (i, elem) in arr.iter().enumerate() {
                     let result = self.invoke_callback(&callback, &[
                         elem.clone(),
                         Value::Number(i as f64),
-                        receiver.clone(),
+                        recv.clone(),
                     ])?;
                     if !result.to_boolean() {
                         return Ok(Value::Boolean(false));
@@ -3977,7 +3728,7 @@ impl VM {
                     },
                     properties: HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 };
                 Ok(Value::Object(Rc::new(RefCell::new(iterator))))
             }
@@ -3994,7 +3745,7 @@ impl VM {
                     },
                     properties: HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 };
                 Ok(Value::Object(Rc::new(RefCell::new(iterator))))
             }
@@ -4007,7 +3758,7 @@ impl VM {
                     },
                     properties: HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 };
                 Ok(Value::Object(Rc::new(RefCell::new(iterator))))
             }
@@ -4152,7 +3903,7 @@ impl VM {
                             },
                             properties: std::collections::HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         },
                     ))));
                 }
@@ -4173,7 +3924,7 @@ impl VM {
                             },
                             properties: std::collections::HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         },
                     ))));
                 }
@@ -4194,7 +3945,7 @@ impl VM {
                             },
                             properties: std::collections::HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         },
                     ))));
                 }
@@ -4474,7 +4225,7 @@ impl VM {
                             },
                             properties: HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         };
                         Ok(Value::Object(Rc::new(RefCell::new(iterator))))
                     }
@@ -4487,7 +4238,7 @@ impl VM {
                             },
                             properties: HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         };
                         Ok(Value::Object(Rc::new(RefCell::new(iterator))))
                     }
@@ -4562,6 +4313,43 @@ impl VM {
         }
     }
 
+    /// Try to dispatch to a built-in constructor.
+    /// Returns Some(result) if callee matches the named constructor, None otherwise.
+    fn try_builtin_constructor(
+        &self,
+        name: &str,
+        callee: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value>> {
+        let global = self.get_global(name)?;
+        if let (Value::Object(global_ref), Value::Object(callee_ref)) = (&global, callee) {
+            if Rc::ptr_eq(global_ref, callee_ref) {
+                let ctor_name = format!("__{}_constructor", name);
+                if let Some(ctor) = self.get_global(&ctor_name) {
+                    if let Value::Object(ctor_obj) = ctor {
+                        if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
+                            return Some(func(args));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get the super class from the current class context.
+    /// Returns None if there is no current class or no super class.
+    fn get_super_class(&self) -> Option<Value> {
+        let class = self.current_class.as_ref()?;
+        if let Value::Object(obj) = class {
+            let obj_ref = obj.borrow();
+            if let ObjectKind::Class { super_class, .. } = &obj_ref.kind {
+                return super_class.as_ref().map(|sc| sc.as_ref().clone());
+            }
+        }
+        None
+    }
+
     fn new_instance(&mut self, arg_count: usize) -> Result<()> {
         let callee_pos = self.stack.len() - arg_count - 1;
         let callee = self.stack[callee_pos].clone();
@@ -4600,6 +4388,7 @@ impl VM {
                 properties,
                 private_fields,
                 prototype: Some(constructor_obj.clone()),
+                cached_shape_id: None,
             })))
         } else {
             Value::new_object()
@@ -4674,135 +4463,17 @@ impl VM {
                         self.stack.truncate(callee_pos);
 
                         // Check if callee is a known built-in constructor
-                        let date_global = self.get_global("Date");
-                        let map_global = self.get_global("Map");
-                        let set_global = self.get_global("Set");
-
-                        if let (Some(date), Value::Object(callee_ref)) = (date_global, &callee) {
-                            if let Value::Object(date_ref) = date {
-                                if Rc::ptr_eq(&date_ref, callee_ref) {
-                                    // Call Date constructor
-                                    if let Some(ctor) = self.get_global("__Date_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let (Some(map), Value::Object(callee_ref)) = (map_global, &callee) {
-                            if let Value::Object(map_ref) = map {
-                                if Rc::ptr_eq(&map_ref, callee_ref) {
-                                    // Call Map constructor
-                                    if let Some(ctor) = self.get_global("__Map_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        if let (Some(set), Value::Object(callee_ref)) = (set_global, &callee) {
-                            if let Value::Object(set_ref) = set {
-                                if Rc::ptr_eq(&set_ref, callee_ref) {
-                                    // Call Set constructor
-                                    if let Some(ctor) = self.get_global("__Set_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for ArrayBuffer constructor
-                        if let Some(ab) = self.get_global("ArrayBuffer") {
-                            if let (Value::Object(ab_ref), Value::Object(callee_ref)) = (&ab, &callee) {
-                                if Rc::ptr_eq(ab_ref, callee_ref) {
-                                    if let Some(ctor) = self.get_global("__ArrayBuffer_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for DataView constructor
-                        if let Some(dv) = self.get_global("DataView") {
-                            if let (Value::Object(dv_ref), Value::Object(callee_ref)) = (&dv, &callee) {
-                                if Rc::ptr_eq(dv_ref, callee_ref) {
-                                    if let Some(ctor) = self.get_global("__DataView_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for Proxy constructor
-                        if let Some(proxy) = self.get_global("Proxy") {
-                            if let (Value::Object(proxy_ref), Value::Object(callee_ref)) = (&proxy, &callee) {
-                                if Rc::ptr_eq(proxy_ref, callee_ref) {
-                                    if let Some(ctor) = self.get_global("__Proxy_constructor") {
-                                        if let Value::Object(ctor_obj) = ctor {
-                                            if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                let result = func(&args)?;
-                                                self.push(result)?;
-                                                return Ok(());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for TypedArray constructors
-                        let typed_array_names = [
+                        let builtin_constructors = [
+                            "Date", "Map", "Set", "ArrayBuffer", "DataView", "Proxy",
                             "Int8Array", "Uint8Array", "Uint8ClampedArray",
                             "Int16Array", "Uint16Array",
                             "Int32Array", "Uint32Array",
                             "Float32Array", "Float64Array",
                         ];
-                        for ta_name in typed_array_names {
-                            if let Some(ta) = self.get_global(ta_name) {
-                                if let (Value::Object(ta_ref), Value::Object(callee_ref)) = (&ta, &callee) {
-                                    if Rc::ptr_eq(ta_ref, callee_ref) {
-                                        let ctor_name = format!("__{}_constructor", ta_name);
-                                        if let Some(ctor) = self.get_global(&ctor_name) {
-                                            if let Value::Object(ctor_obj) = ctor {
-                                                if let ObjectKind::NativeFunction { func, .. } = &ctor_obj.borrow().kind {
-                                                    let result = func(&args)?;
-                                                    self.push(result)?;
-                                                    return Ok(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
+                        for name in builtin_constructors {
+                            if let Some(result) = self.try_builtin_constructor(name, &callee, &args) {
+                                self.push(result?)?;
+                                return Ok(());
                             }
                         }
 
@@ -5070,8 +4741,11 @@ impl VM {
 
             // Skip IC for megamorphic sites
             if !self.is_megamorphic(name) {
-                // Compute object's shape ID
-                let shape_id = compute_shape_id(&obj_ref.properties);
+                // Get cached shape ID or compute if not available
+                // Note: We still compute without caching here to avoid borrow_mut overhead
+                // The cache is populated when properties are modified
+                let shape_id = obj_ref.cached_shape_id
+                    .unwrap_or_else(|| compute_shape_id_raw(&obj_ref.properties));
 
                 // Try polymorphic inline cache first
                 if let Some(_cached_offset) = self.pic_lookup(name, shape_id) {
@@ -5172,7 +4846,7 @@ impl VM {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -5188,7 +4862,7 @@ impl VM {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -5203,7 +4877,7 @@ impl VM {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }));
 
         // Add .next() method
@@ -5313,7 +4987,7 @@ impl VM {
                 },
                 properties: HashMap::default(),
                 private_fields: HashMap::default(),
-                prototype: None,
+                prototype: None, cached_shape_id: None,
             }))));
             obj_ref.set_property("return", Value::Object(Rc::new(RefCell::new(Object {
                 kind: ObjectKind::NativeFunction {
@@ -5322,7 +4996,7 @@ impl VM {
                 },
                 properties: HashMap::default(),
                 private_fields: HashMap::default(),
-                prototype: None,
+                prototype: None, cached_shape_id: None,
             }))));
             obj_ref.set_property("throw", Value::Object(Rc::new(RefCell::new(Object {
                 kind: ObjectKind::NativeFunction {
@@ -5331,7 +5005,7 @@ impl VM {
                 },
                 properties: HashMap::default(),
                 private_fields: HashMap::default(),
-                prototype: None,
+                prototype: None, cached_shape_id: None,
             }))));
         }
 

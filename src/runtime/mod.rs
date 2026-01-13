@@ -75,6 +75,31 @@ impl Runtime {
     {
         self.vm.register_native(name, func);
     }
+
+    /// Set source code for debugging
+    pub fn set_source(&mut self, filename: &str, source: &str) {
+        self.vm.set_source(filename, source);
+    }
+
+    /// Attach a debugger to the VM
+    pub fn attach_debugger(&mut self, debugger: crate::debugger::TimeTravelDebugger) {
+        self.vm.attach_debugger(debugger);
+    }
+
+    /// Detach the debugger from the VM
+    pub fn detach_debugger(&mut self) -> Option<crate::debugger::TimeTravelDebugger> {
+        self.vm.detach_debugger()
+    }
+
+    /// Get a reference to the debugger if attached
+    pub fn get_debugger(&self) -> Option<std::rc::Rc<std::cell::RefCell<crate::debugger::TimeTravelDebugger>>> {
+        self.vm.get_debugger()
+    }
+
+    /// Run the debugger's interactive REPL
+    pub fn run_debugger_interactive(&mut self) {
+        self.vm.debug_interactive();
+    }
 }
 
 impl Default for Runtime {

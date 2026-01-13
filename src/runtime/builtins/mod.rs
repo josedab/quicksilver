@@ -68,7 +68,7 @@ fn register_console(vm: &mut VM) {
     // console.log
     vm.register_native("console_log", |args| {
         let indent = get_indent();
-        let output: Vec<String> = args.iter().map(|v| format_console_value(v)).collect();
+        let output: Vec<String> = args.iter().map(format_console_value).collect();
         println!("{}{}", indent, output.join(" "));
         Ok(Value::Undefined)
     });
@@ -594,7 +594,7 @@ fn create_date_object(timestamp: f64) -> Value {
         kind: super::value::ObjectKind::Date(timestamp),
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let value = Value::Object(obj);
@@ -603,7 +603,7 @@ fn create_date_object(timestamp: f64) -> Value {
     let ts = timestamp;
 
     // getTime
-    value.set_property("getTime", create_date_method(ts, |ts| Value::Number(ts)));
+    value.set_property("getTime", create_date_method(ts, Value::Number));
 
     // getFullYear
     value.set_property("getFullYear", create_date_method(ts, |ts| {
@@ -694,7 +694,7 @@ fn create_date_object(timestamp: f64) -> Value {
     }));
 
     // valueOf (same as getTime)
-    value.set_property("valueOf", create_date_method(ts, |ts| Value::Number(ts)));
+    value.set_property("valueOf", create_date_method(ts, Value::Number));
 
     value
 }
@@ -714,7 +714,7 @@ where
         },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
     Value::Object(obj)
 }
@@ -722,7 +722,7 @@ where
 /// Convert year/month/day to timestamp
 fn ymd_to_timestamp(year: i32, month: u32, day: u32, hours: u32, minutes: u32, seconds: u32, ms: f64) -> f64 {
     // Adjust for years < 100
-    let year = if year >= 0 && year <= 99 { year + 1900 } else { year };
+    let year = if (0..=99).contains(&year) { year + 1900 } else { year };
 
     // Days from year 0 to this year
     let y = year - if month <= 2 { 1 } else { 0 };
@@ -835,7 +835,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::Map(initial_entries),
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let value = Value::Object(obj.clone());
@@ -858,7 +858,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "get".to_string(), func: get_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // set method
@@ -882,7 +882,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "set".to_string(), func: set_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // has method
@@ -903,7 +903,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "has".to_string(), func: has_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // delete method
@@ -922,7 +922,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "delete".to_string(), func: delete_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // clear method
@@ -938,7 +938,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "clear".to_string(), func: clear_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // size getter (implemented as property for simplicity)
@@ -954,7 +954,7 @@ fn create_map_object(initial_entries: Vec<(Value, Value)>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "size".to_string(), func: size_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     value
@@ -1005,7 +1005,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::Set(initial_items),
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let value = Value::Object(obj.clone());
@@ -1029,7 +1029,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "add".to_string(), func: add_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // has method
@@ -1050,7 +1050,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "has".to_string(), func: has_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // delete method
@@ -1069,7 +1069,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "delete".to_string(), func: delete_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // clear method
@@ -1085,7 +1085,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "clear".to_string(), func: clear_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // size getter
@@ -1101,7 +1101,7 @@ fn create_set_object(initial_items: Vec<Value>) -> Value {
         kind: super::value::ObjectKind::NativeFunction { name: "size".to_string(), func: size_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     value
@@ -1140,7 +1140,7 @@ fn register_promise(vm: &mut VM) {
             },
             properties: std::collections::HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }));
 
         let promise = Value::Object(obj.clone());
@@ -1414,7 +1414,7 @@ fn create_resolved_promise(value: Value) -> Value {
         },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let promise = Value::Object(obj.clone());
@@ -1436,7 +1436,7 @@ fn create_rejected_promise(reason: Value) -> Value {
         },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let promise = Value::Object(obj.clone());
@@ -1458,7 +1458,7 @@ fn create_pending_promise() -> Value {
         },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     let promise = Value::Object(obj.clone());
@@ -1517,7 +1517,7 @@ fn add_promise_methods(promise: &Value, obj: std::rc::Rc<std::cell::RefCell<supe
         kind: super::value::ObjectKind::NativeFunction { name: "then".to_string(), func: then_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // .catch(onRejected) - shorthand for .then(undefined, onRejected)
@@ -1557,7 +1557,7 @@ fn add_promise_methods(promise: &Value, obj: std::rc::Rc<std::cell::RefCell<supe
         kind: super::value::ObjectKind::NativeFunction { name: "catch".to_string(), func: catch_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 
     // .finally(onFinally)
@@ -1593,7 +1593,7 @@ fn add_promise_methods(promise: &Value, obj: std::rc::Rc<std::cell::RefCell<supe
         kind: super::value::ObjectKind::NativeFunction { name: "finally".to_string(), func: finally_fn },
         properties: std::collections::HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }))));
 }
 
@@ -1616,11 +1616,11 @@ pub struct PendingCancel {
 
 thread_local! {
     /// Pending timer registrations (will be processed by VM after native call)
-    pub static PENDING_TIMERS: RefCell<Vec<PendingTimer>> = RefCell::new(Vec::new());
+    pub static PENDING_TIMERS: RefCell<Vec<PendingTimer>> = const { RefCell::new(Vec::new()) };
     /// Pending timer cancellations
-    pub static PENDING_CANCELS: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    pub static PENDING_CANCELS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     /// Pending microtask registrations
-    pub static PENDING_MICROTASKS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+    pub static PENDING_MICROTASKS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Register setTimeout and setInterval
@@ -1724,11 +1724,11 @@ fn register_fetch(vm: &mut VM) {
             kind: super::value::ObjectKind::Ordinary,
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         // Set response properties
-        response.set_property("ok", Value::Boolean(status >= 200 && status < 300));
+        response.set_property("ok", Value::Boolean((200..300).contains(&status)));
         response.set_property("status", Value::Number(status as f64));
         response.set_property("statusText", Value::String(
             match status {
@@ -1858,10 +1858,10 @@ fn register_fetch(vm: &mut VM) {
             kind: super::value::ObjectKind::Ordinary,
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
-        response.set_property("ok", Value::Boolean(status >= 200 && status < 300));
+        response.set_property("ok", Value::Boolean((200..300).contains(&status)));
         response.set_property("status", Value::Number(status as f64));
         response.set_property("statusText", Value::String(
             match status {
@@ -2390,7 +2390,7 @@ fn register_deno(vm: &mut VM) {
         kind: super::value::ObjectKind::Ordinary,
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     })));
 
     // Attach methods to Deno object
@@ -2410,7 +2410,7 @@ fn register_deno(vm: &mut VM) {
         kind: super::value::ObjectKind::Ordinary,
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     })));
     env_obj.set_property("get", vm.get_global("Deno_env_get").unwrap_or(Value::Undefined));
     env_obj.set_property("set", vm.get_global("Deno_env_set").unwrap_or(Value::Undefined));
@@ -2421,7 +2421,7 @@ fn register_deno(vm: &mut VM) {
         kind: super::value::ObjectKind::Ordinary,
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     })));
     stdin_obj.set_property("readLine", vm.get_global("Deno_stdin_readLine").unwrap_or(Value::Undefined));
     stdin_obj.set_property("read", vm.get_global("Deno_stdin_read").unwrap_or(Value::Undefined));
@@ -2433,7 +2433,7 @@ fn register_deno(vm: &mut VM) {
         kind: super::value::ObjectKind::Ordinary,
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     })));
     stdout_obj.set_property("write", vm.get_global("Deno_stdout_write").unwrap_or(Value::Undefined));
     stdout_obj.set_property("writeSync", vm.get_global("Deno_stdout_writeSync").unwrap_or(Value::Undefined));
@@ -2445,7 +2445,7 @@ fn register_deno(vm: &mut VM) {
         kind: super::value::ObjectKind::Ordinary,
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     })));
     stderr_obj.set_property("write", vm.get_global("Deno_stderr_write").unwrap_or(Value::Undefined));
     stderr_obj.set_property("writeSync", vm.get_global("Deno_stderr_writeSync").unwrap_or(Value::Undefined));
@@ -3111,7 +3111,7 @@ fn register_weakmap(vm: &mut VM) {
             kind: super::value::ObjectKind::WeakMap(Vec::new()),
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         // Attach methods
@@ -3242,25 +3242,25 @@ fn attach_weakmap_methods(weakmap: &Value) {
             kind: super::value::ObjectKind::NativeFunction { name: "get".to_string(), func: get_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("set", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "set".to_string(), func: set_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("has", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "has".to_string(), func: has_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("delete", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "delete".to_string(), func: delete_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
     }
 }
@@ -3277,7 +3277,7 @@ fn register_weakset(vm: &mut VM) {
             kind: super::value::ObjectKind::WeakSet(Vec::new()),
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         attach_weakset_methods(&weakset);
@@ -3380,19 +3380,19 @@ fn attach_weakset_methods(weakset: &Value) {
             kind: super::value::ObjectKind::NativeFunction { name: "add".to_string(), func: add_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("has", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "has".to_string(), func: has_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("delete", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "delete".to_string(), func: delete_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
     }
 }
@@ -3446,7 +3446,7 @@ fn create_regexp(pattern: &str, flags: &str) -> Result<Value> {
         },
         properties: HashMap::default(),
         private_fields: HashMap::default(),
-        prototype: None,
+        prototype: None, cached_shape_id: None,
     }));
 
     // Attach properties
@@ -3561,19 +3561,19 @@ fn attach_regexp_methods(regexp: &Value) {
             kind: super::value::ObjectKind::NativeFunction { name: "test".to_string(), func: test_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("exec", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "exec".to_string(), func: exec_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
         obj_ref.set_property("toString", Value::Object(Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::NativeFunction { name: "toString".to_string(), func: tostring_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
     }
 }
@@ -3605,7 +3605,7 @@ fn register_proxy(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         Ok(proxy)
@@ -3632,7 +3632,7 @@ fn register_proxy(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }));
 
         let proxy = Value::Object(proxy_obj.clone());
@@ -3653,7 +3653,7 @@ fn register_proxy(vm: &mut VM) {
             kind: super::value::ObjectKind::NativeFunction { name: "revoke".to_string(), func: revoke_fn },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         }))));
 
         Ok(result)
@@ -3846,7 +3846,7 @@ fn register_typed_arrays(vm: &mut VM) {
                     kind: ObjectKind::ArrayBuffer(new_buffer),
                     properties: std::collections::HashMap::default(),
                     private_fields: HashMap::default(),
-                    prototype: None,
+                    prototype: None, cached_shape_id: None,
                 }))));
             }
         }
@@ -4554,7 +4554,7 @@ fn register_url(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         };
 
         let obj_rc = Rc::new(RefCell::new(url_obj));
@@ -4573,7 +4573,7 @@ fn register_url(vm: &mut VM) {
             kind: super::value::ObjectKind::URLSearchParams { params: search_params },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         };
         obj_rc.borrow_mut().set_property("searchParams", Value::Object(Rc::new(RefCell::new(params_obj))));
 
@@ -4649,7 +4649,7 @@ fn register_url(vm: &mut VM) {
             kind: super::value::ObjectKind::URLSearchParams { params },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         };
 
         Ok(Value::Object(Rc::new(RefCell::new(obj))))
@@ -4686,7 +4686,7 @@ fn register_error(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         // Set message property explicitly for JavaScript access
@@ -4751,7 +4751,7 @@ fn register_error(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         error_obj.set_property("message", Value::String(message.clone()));
@@ -4776,7 +4776,7 @@ fn register_error(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         error_obj.set_property("message", Value::String(message.clone()));
@@ -4801,7 +4801,7 @@ fn register_error(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         error_obj.set_property("message", Value::String(message.clone()));
@@ -4826,7 +4826,7 @@ fn register_error(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         error_obj.set_property("message", Value::String(message.clone()));
@@ -5027,7 +5027,7 @@ fn register_concurrency(vm: &mut VM) {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })));
 
         Ok(channel_obj)
@@ -5386,7 +5386,7 @@ fn deep_clone(value: &Value) -> Value {
                         kind: ObjectKind::Map(cloned_entries),
                         properties: HashMap::default(),
                         private_fields: HashMap::default(),
-                        prototype: None,
+                        prototype: None, cached_shape_id: None,
                     })))
                 }
                 ObjectKind::Set(items) => {
@@ -5395,7 +5395,7 @@ fn deep_clone(value: &Value) -> Value {
                         kind: ObjectKind::Set(cloned_items),
                         properties: HashMap::default(),
                         private_fields: HashMap::default(),
-                        prototype: None,
+                        prototype: None, cached_shape_id: None,
                     })))
                 }
                 ObjectKind::Date(ts) => {
@@ -5403,7 +5403,7 @@ fn deep_clone(value: &Value) -> Value {
                         kind: ObjectKind::Date(*ts),
                         properties: HashMap::default(),
                         private_fields: HashMap::default(),
-                        prototype: None,
+                        prototype: None, cached_shape_id: None,
                     })))
                 }
                 // Functions and other types cannot be cloned
@@ -5420,13 +5420,28 @@ fn register_performance(vm: &mut VM) {
     use std::time::Instant;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::security::{Capability, PermissionState};
+
+    // Get sandbox for permission checks
+    let sandbox = vm.get_sandbox();
 
     // Store the start time for Performance.now()
     let start_time = Arc::new(Instant::now());
 
     // Performance.now() - returns milliseconds since page load
+    // Requires HighResTime permission (can be used for timing attacks)
     let start_time_now = Arc::clone(&start_time);
+    let sandbox_now = sandbox.clone();
     vm.register_native("Performance_now", move |_args| {
+        // Check HighResTime permission if sandbox is enabled
+        if let Some(ref sandbox_rc) = sandbox_now {
+            let sandbox = sandbox_rc.borrow();
+            if sandbox.check(&Capability::HighResTime) != PermissionState::Granted {
+                // Return lower resolution time (millisecond precision only)
+                let elapsed = start_time_now.elapsed();
+                return Ok(Value::Number((elapsed.as_millis() as f64).floor()));
+            }
+        }
         let elapsed = start_time_now.elapsed();
         Ok(Value::Number(elapsed.as_secs_f64() * 1000.0))
     });
@@ -5539,9 +5554,22 @@ fn register_encoding(vm: &mut VM) {
 /// Register basic crypto API
 fn register_crypto(vm: &mut VM) {
     use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::security::{Capability, PermissionState};
+
+    // Get sandbox for permission checks
+    let sandbox = vm.get_sandbox();
 
     // crypto.getRandomValues(typedArray) - fill with random values
-    vm.register_native("crypto_getRandomValues", |args| {
+    let sandbox_random = sandbox.clone();
+    vm.register_native("crypto_getRandomValues", move |args| {
+        // Check Crypto permission if sandbox is enabled
+        if let Some(ref sandbox_rc) = sandbox_random {
+            let sandbox = sandbox_rc.borrow();
+            if sandbox.check(&Capability::Crypto) != PermissionState::Granted {
+                return Err(crate::error::Error::type_error("Crypto permission denied"));
+            }
+        }
+
         let arr = args.first().ok_or_else(|| {
             crate::error::Error::type_error("getRandomValues requires a TypedArray")
         })?;
@@ -5583,7 +5611,16 @@ fn register_crypto(vm: &mut VM) {
     });
 
     // crypto.randomUUID() - generate a random UUID v4
-    vm.register_native("crypto_randomUUID", |_args| {
+    let sandbox_uuid = sandbox.clone();
+    vm.register_native("crypto_randomUUID", move |_args| {
+        // Check Crypto permission if sandbox is enabled
+        if let Some(ref sandbox_rc) = sandbox_uuid {
+            let sandbox = sandbox_rc.borrow();
+            if sandbox.check(&Capability::Crypto) != PermissionState::Granted {
+                return Err(crate::error::Error::type_error("Crypto permission denied"));
+            }
+        }
+
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let mut seed = SystemTime::now()
