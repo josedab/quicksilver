@@ -286,7 +286,7 @@ impl Value {
             kind: ObjectKind::Ordinary,
             properties,
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -296,7 +296,7 @@ impl Value {
             kind: ObjectKind::Array(elements),
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -312,7 +312,7 @@ impl Value {
             },
             properties,
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -322,7 +322,56 @@ impl Value {
             kind: ObjectKind::Function(func),
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
+        })))
+    }
+
+    /// Create a new Date value from timestamp in milliseconds
+    pub fn new_date(timestamp: f64) -> Value {
+        Value::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::Date(timestamp),
+            properties: HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })))
+    }
+
+    /// Create a new Map value from key-value pairs
+    pub fn new_map(entries: Vec<(Value, Value)>) -> Value {
+        Value::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::Map(entries),
+            properties: HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })))
+    }
+
+    /// Create a new Set value from values
+    pub fn new_set(values: Vec<Value>) -> Value {
+        Value::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::Set(values),
+            properties: HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })))
+    }
+
+    /// Create a new Error value with optional stack trace
+    pub fn new_error_with_stack(name: String, message: String, stack: Option<String>) -> Value {
+        let mut properties = HashMap::default();
+        properties.insert("name".to_string(), Value::String(name.clone()));
+        properties.insert("message".to_string(), Value::String(message.clone()));
+        if let Some(ref s) = stack {
+            properties.insert("stack".to_string(), Value::String(s.clone()));
+        }
+        Value::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::Error {
+                name,
+                message,
+            },
+            properties,
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -383,7 +432,7 @@ impl Value {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -448,7 +497,7 @@ impl Value {
             },
             properties: static_methods, // Static methods stored in properties
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -459,7 +508,7 @@ impl Value {
             kind: ObjectKind::ArrayBuffer(buffer),
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -479,7 +528,7 @@ impl Value {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -496,7 +545,7 @@ impl Value {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -510,7 +559,7 @@ impl Value {
             },
             properties: HashMap::default(),
             private_fields: HashMap::default(),
-            prototype: None,
+            prototype: None, cached_shape_id: None,
         })))
     }
 
@@ -540,7 +589,7 @@ impl Value {
                             },
                             properties: HashMap::default(),
                             private_fields: HashMap::default(),
-                            prototype: None,
+                            prototype: None, cached_shape_id: None,
                         }))));
                     }
                 }
@@ -565,7 +614,7 @@ impl Value {
                         },
                         properties: HashMap::default(),
                         private_fields: HashMap::default(),
-                        prototype: None,
+                        prototype: None, cached_shape_id: None,
                     }))));
                 }
 
@@ -655,6 +704,9 @@ impl fmt::Debug for Value {
                     ObjectKind::URL { href, .. } => write!(f, "URL {{ {} }}", href),
                     ObjectKind::URLSearchParams { params } => write!(f, "URLSearchParams({})", params.len()),
                     ObjectKind::Channel { capacity, .. } => write!(f, "Channel(capacity={})", capacity),
+                    ObjectKind::Effect { effect_type, operation, .. } => write!(f, "[Effect: {}.{}]", effect_type, operation),
+                    ObjectKind::Module { specifier, .. } => write!(f, "[Module: {}]", specifier),
+                    ObjectKind::Actor { id, .. } => write!(f, "[Actor: {}]", id),
                 }
             }
             Value::Symbol(id) => write!(f, "Symbol({})", id),
@@ -679,6 +731,9 @@ pub struct Object {
     pub private_fields: HashMap<String, Value>,
     /// Prototype
     pub prototype: Option<Rc<RefCell<Object>>>,
+    /// Cached shape ID for inline cache optimization
+    /// Set to None when properties change, computed lazily
+    pub cached_shape_id: Option<u64>,
 }
 
 impl Object {
@@ -689,6 +744,7 @@ impl Object {
             properties: HashMap::default(),
             private_fields: HashMap::default(),
             prototype: None,
+            cached_shape_id: None,
         }
     }
 
@@ -927,6 +983,10 @@ impl Object {
             }
         }
 
+        // Invalidate shape cache if adding a new property (shape changes)
+        if !self.properties.contains_key(key) {
+            self.cached_shape_id = None;
+        }
         self.properties.insert(key.to_string(), value);
     }
 
@@ -1107,6 +1167,31 @@ pub enum ObjectKind {
         channel: std::sync::Arc<crate::concurrency::Channel<Value>>,
         /// Channel capacity (0 = unbuffered)
         capacity: usize,
+    },
+    /// Effect object for algebraic effects
+    Effect {
+        /// The effect type name (e.g., "Log", "Database")
+        effect_type: String,
+        /// The operation name (e.g., "log", "query")
+        operation: String,
+        /// Arguments to the effect operation
+        args: Vec<Value>,
+    },
+    /// Module object for ES modules
+    Module {
+        /// Module specifier/path
+        specifier: String,
+        /// Exported bindings
+        exports: HashMap<String, Value>,
+        /// Whether the module has been evaluated
+        evaluated: bool,
+    },
+    /// Actor object for distributed runtime
+    Actor {
+        /// Actor identifier
+        id: u64,
+        /// Actor mailbox (pending messages)
+        mailbox: Vec<Value>,
     },
 }
 
