@@ -45,11 +45,12 @@ pub mod repl;
 pub mod ffi;
 pub mod native;
 pub mod modules;
+pub mod prelude;
 
 mod error;
 
 pub use error::{Error, Result};
-pub use runtime::{Runtime, Value};
+pub use runtime::{Runtime, Value, ObjectKind};
 pub use bytecode::cache::{BytecodeCache, CacheConfig, CacheStats, compile_cached, clear_cache, cache_stats, global_cache};
 
 /// Quicksilver version
