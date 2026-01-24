@@ -12,17 +12,22 @@ pub use types::{CallFrame, ExceptionHandler, Microtask, ResourceLimits, Timer};
 
 use cache::{compute_shape_id_raw, hash_property_name, InlineCacheEntry};
 
+use super::async_runtime::{AsyncExecutor, SuspendedAsyncFunction};
 use super::value::{Function, GeneratorState, NativeFn, Object, ObjectKind, PromiseState, Value};
 use crate::bytecode::{compile, Chunk, Opcode};
+use crate::event_loop::EventLoop;
 use crate::debugger::TimeTravelDebugger;
 use crate::error::{Error, Result, StackFrame, StackTrace};
-use crate::modules::ModuleLoader;
+use crate::modules::{ModuleLoader, HmrModuleLoader, HmrUpdateResult};
+use crate::effects::{EffectRegistry, EffectHandler, EffectOp, EffectValue, CloneableAny};
+use crate::distributed::{DistributedRuntime, ClusterConfig, TaskId, ClusterError};
 use crate::security::Sandbox;
+use std::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Maximum call stack depth
 const MAX_CALL_DEPTH: usize = 1024;
@@ -65,6 +70,10 @@ pub struct VM {
     return_at_depth: Option<usize>,
     /// Module loader for ES Modules support
     module_loader: ModuleLoader,
+    /// HMR-enabled module loader (optional)
+    hmr_loader: Option<HmrModuleLoader>,
+    /// Whether HMR is enabled
+    hmr_enabled: bool,
     /// Cache of evaluated module namespace objects by path
     module_cache: HashMap<String, Value>,
     /// Timer queue for setTimeout/setInterval
@@ -86,6 +95,16 @@ pub struct VM {
     unhandled_rejections: Vec<Value>,
     /// Whether to warn on unhandled rejections
     warn_unhandled_rejections: bool,
+    /// Async executor for managing suspended async functions
+    async_executor: AsyncExecutor,
+    /// Event loop for Promise/A+ compliance
+    event_loop: EventLoop,
+    /// Effect registry for algebraic effects
+    effect_registry: EffectRegistry,
+    /// Distributed runtime for cluster computing
+    distributed_runtime: Option<DistributedRuntime>,
+    /// Whether distributed computing is enabled
+    distributed_enabled: bool,
 }
 
 impl VM {
@@ -108,6 +127,8 @@ impl VM {
             inline_cache: vec![InlineCacheEntry::default(); IC_SIZE],
             return_at_depth: None,
             module_loader: ModuleLoader::new(),
+            hmr_loader: None,
+            hmr_enabled: false,
             module_cache: HashMap::default(),
             timers: Vec::with_capacity(8),
             next_timer_id: 1,
@@ -118,6 +139,11 @@ impl VM {
             memory_usage: 0,
             unhandled_rejections: Vec::new(),
             warn_unhandled_rejections: true,
+            async_executor: AsyncExecutor::new(),
+            event_loop: EventLoop::new(),
+            effect_registry: EffectRegistry::new(),
+            distributed_runtime: None,
+            distributed_enabled: false,
         }
     }
 
@@ -232,8 +258,339 @@ impl VM {
 
     /// Set the base directory for module resolution
     pub fn set_module_base_dir(&mut self, base_dir: PathBuf) {
-        self.module_loader = ModuleLoader::with_base_dir(base_dir);
+        self.module_loader = ModuleLoader::with_base_dir(base_dir.clone());
+        // Also update HMR loader if enabled
+        if self.hmr_enabled {
+            self.hmr_loader = Some(HmrModuleLoader::with_config(
+                base_dir,
+                std::time::Duration::from_millis(500),
+            ));
+        }
     }
+
+    /// Enable Hot Module Reloading
+    ///
+    /// When enabled, the VM will use an HMR-capable module loader that can
+    /// detect file changes and reload modules without losing application state.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let mut vm = VM::new();
+    /// vm.enable_hmr();
+    /// // Now modules can be hot-reloaded
+    /// let updates = vm.check_hmr_updates();
+    /// ```
+    pub fn enable_hmr(&mut self) {
+        if !self.hmr_enabled {
+            self.hmr_enabled = true;
+            let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            self.hmr_loader = Some(HmrModuleLoader::with_config(
+                base_dir,
+                Duration::from_millis(500),
+            ));
+        }
+    }
+
+    /// Enable HMR with custom configuration
+    pub fn enable_hmr_with_config(&mut self, base_dir: PathBuf, poll_interval: Duration) {
+        self.hmr_enabled = true;
+        self.hmr_loader = Some(HmrModuleLoader::with_config(base_dir, poll_interval));
+    }
+
+    /// Disable Hot Module Reloading
+    pub fn disable_hmr(&mut self) {
+        self.hmr_enabled = false;
+        self.hmr_loader = None;
+    }
+
+    /// Check if HMR is enabled
+    pub fn is_hmr_enabled(&self) -> bool {
+        self.hmr_enabled
+    }
+
+    /// Check for HMR updates and return any pending file changes
+    ///
+    /// This should be called periodically (e.g., in a dev server loop) to
+    /// detect file changes and queue module updates.
+    pub fn check_hmr_updates(&self) -> Vec<crate::hmr::FileChange> {
+        if let Some(ref loader) = self.hmr_loader {
+            loader.check_for_updates()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Apply pending HMR updates
+    ///
+    /// This reloads any modules that have changed since the last check.
+    /// Returns the results of each update attempt.
+    pub fn apply_hmr_updates(&mut self) -> Vec<HmrUpdateResult> {
+        if let Some(ref loader) = self.hmr_loader {
+            let results = loader.apply_pending_updates();
+
+            // Invalidate cached module namespaces for updated modules
+            for result in &results {
+                if result.success {
+                    self.module_cache.remove(&result.module_id);
+                    // Also invalidate affected modules
+                    for affected in &result.affected_modules {
+                        self.module_cache.remove(affected);
+                    }
+                }
+            }
+
+            results
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Accept HMR updates for a specific module
+    ///
+    /// This marks a module as able to accept hot updates without requiring
+    /// a full page reload.
+    pub fn accept_hmr(&self, module_path: &str) {
+        if let Some(ref loader) = self.hmr_loader {
+            loader.accept(&PathBuf::from(module_path));
+        }
+    }
+
+    /// Register a callback to run when a module is hot-reloaded
+    pub fn on_hmr_update<F>(&self, module_path: &str, callback: F)
+    where
+        F: Fn(&crate::modules::Module) + Send + Sync + 'static,
+    {
+        if let Some(ref loader) = self.hmr_loader {
+            loader.on_update(module_path, callback);
+        }
+    }
+
+    /// Invalidate a module and force a full reload on next access
+    pub fn invalidate_module(&self, module_path: &str) {
+        if let Some(ref loader) = self.hmr_loader {
+            loader.invalidate(&PathBuf::from(module_path));
+        }
+    }
+
+    // ==================== Algebraic Effects ====================
+
+    /// Register an effect handler
+    ///
+    /// Effect handlers intercept `perform` operations and can return values
+    /// to the caller. Multiple handlers can be registered for the same effect
+    /// type - they are tried in reverse order (most recent first).
+    ///
+    /// # Example
+    /// ```ignore
+    /// use quicksilver::effects::LogHandler;
+    /// use std::sync::Arc;
+    ///
+    /// let mut vm = VM::new();
+    /// vm.register_effect_handler(Arc::new(LogHandler::new()));
+    ///
+    /// // Now `perform Log.log("message")` will be handled
+    /// ```
+    pub fn register_effect_handler(&mut self, handler: Arc<dyn EffectHandler>) {
+        self.effect_registry.register(handler);
+    }
+
+    /// Handle an effect using the registered handlers
+    ///
+    /// This is called internally when a `perform` operation is executed.
+    /// Returns the result value if a handler was found, None otherwise.
+    fn handle_effect(&self, effect_type: &str, operation: &str, args: &[Value]) -> Option<Value> {
+        // Convert Value args to CloneableAny args
+        let cloneable_args: Vec<Box<dyn CloneableAny>> = args.iter().map(|v| {
+            let boxed: Box<dyn CloneableAny> = match v {
+                Value::Number(n) => Box::new(*n),
+                Value::String(s) => Box::new(s.clone()),
+                Value::Boolean(b) => Box::new(*b),
+                Value::Null | Value::Undefined => Box::new(()),
+                _ => Box::new(v.to_js_string()),
+            };
+            boxed
+        }).collect();
+
+        // Create effect value
+        let effect = EffectValue {
+            op: EffectOp::new(effect_type, operation),
+            args: cloneable_args,
+        };
+
+        // Try to handle the effect
+        if let Some(result) = self.effect_registry.handle(&effect) {
+            // Convert the result back to a Value
+            if let Some(n) = result.as_any().downcast_ref::<f64>() {
+                return Some(Value::Number(*n));
+            }
+            if let Some(s) = result.as_any().downcast_ref::<String>() {
+                return Some(Value::String(s.clone()));
+            }
+            if let Some(b) = result.as_any().downcast_ref::<bool>() {
+                return Some(Value::Boolean(*b));
+            }
+            if let Some(i) = result.as_any().downcast_ref::<i64>() {
+                return Some(Value::Number(*i as f64));
+            }
+            if let Some(u) = result.as_any().downcast_ref::<u64>() {
+                return Some(Value::Number(*u as f64));
+            }
+            if result.as_any().downcast_ref::<()>().is_some() {
+                return Some(Value::Undefined);
+            }
+            // Default: return undefined for handled effects with unknown result types
+            return Some(Value::Undefined);
+        }
+
+        None
+    }
+
+    /// Get the effect registry for inspection or advanced usage
+    pub fn effect_registry(&self) -> &EffectRegistry {
+        &self.effect_registry
+    }
+
+    // ==================== Distributed Runtime Integration ====================
+
+    /// Enable distributed computing with default configuration
+    pub fn enable_distributed(&mut self) {
+        self.distributed_runtime = Some(DistributedRuntime::new());
+        self.distributed_enabled = true;
+    }
+
+    /// Enable distributed computing with custom configuration
+    pub fn enable_distributed_with_config(&mut self, config: ClusterConfig) {
+        self.distributed_runtime = Some(DistributedRuntime::with_config(config));
+        self.distributed_enabled = true;
+    }
+
+    /// Connect to an existing cluster
+    pub fn connect_to_cluster(&mut self, address: &str) -> std::result::Result<(), ClusterError> {
+        let runtime = DistributedRuntime::connect(address)?;
+        self.distributed_runtime = Some(runtime);
+        self.distributed_enabled = true;
+        Ok(())
+    }
+
+    /// Disable distributed computing
+    pub fn disable_distributed(&mut self) {
+        self.distributed_runtime = None;
+        self.distributed_enabled = false;
+    }
+
+    /// Check if distributed computing is enabled
+    pub fn is_distributed_enabled(&self) -> bool {
+        self.distributed_enabled && self.distributed_runtime.is_some()
+    }
+
+    /// Submit a task to the cluster for distributed execution
+    pub fn submit_distributed_task(&mut self, bytecode: Vec<u8>, args: Value) -> std::result::Result<TaskId, ClusterError> {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.submit_task(bytecode, args)
+        } else {
+            Err(ClusterError::ConnectionFailed("Distributed runtime not enabled".to_string()))
+        }
+    }
+
+    /// Check if a distributed task has completed
+    pub fn is_distributed_task_complete(&self, task_id: TaskId) -> bool {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.is_task_complete(task_id)
+        } else {
+            false
+        }
+    }
+
+    /// Get the result of a distributed task
+    pub fn get_distributed_task_result(&self, task_id: TaskId) -> std::result::Result<Option<Value>, ClusterError> {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.get_task_result(task_id)
+        } else {
+            Err(ClusterError::ConnectionFailed("Distributed runtime not enabled".to_string()))
+        }
+    }
+
+    /// Cancel a distributed task
+    pub fn cancel_distributed_task(&self, task_id: TaskId) -> bool {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.cancel_task(task_id)
+        } else {
+            false
+        }
+    }
+
+    /// Spawn a new actor for message passing
+    pub fn spawn_actor(&self) -> std::result::Result<u64, ClusterError> {
+        if let Some(ref runtime) = self.distributed_runtime {
+            Ok(runtime.spawn_actor())
+        } else {
+            Err(ClusterError::ConnectionFailed("Distributed runtime not enabled".to_string()))
+        }
+    }
+
+    /// Send a message to an actor
+    pub fn send_to_actor(&self, actor_id: u64, value: Value) -> std::result::Result<(), ClusterError> {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.send_to_actor(actor_id, value)
+        } else {
+            Err(ClusterError::ConnectionFailed("Distributed runtime not enabled".to_string()))
+        }
+    }
+
+    /// Receive a message from an actor's mailbox
+    pub fn receive_from_actor(&self, actor_id: u64) -> std::result::Result<Option<Value>, ClusterError> {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.receive_from_actor(actor_id)
+        } else {
+            Err(ClusterError::ConnectionFailed("Distributed runtime not enabled".to_string()))
+        }
+    }
+
+    /// Get cluster information as a JavaScript value
+    pub fn get_cluster_info(&self) -> Value {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.get_cluster_info()
+        } else {
+            Value::Undefined
+        }
+    }
+
+    /// Tick the distributed runtime (check for timeouts, etc.)
+    pub fn tick_distributed(&self) {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.tick();
+        }
+    }
+
+    /// Get the number of pending distributed tasks
+    pub fn pending_distributed_task_count(&self) -> usize {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.pending_task_count()
+        } else {
+            0
+        }
+    }
+
+    /// Get the number of local actors
+    pub fn actor_count(&self) -> usize {
+        if let Some(ref runtime) = self.distributed_runtime {
+            runtime.actor_count()
+        } else {
+            0
+        }
+    }
+
+    /// Get a reference to the distributed runtime for advanced usage
+    pub fn distributed_runtime(&self) -> Option<&DistributedRuntime> {
+        self.distributed_runtime.as_ref()
+    }
+
+    /// Get the underlying cluster for advanced operations
+    pub fn cluster(&self) -> Option<std::sync::Arc<crate::distributed::Cluster>> {
+        self.distributed_runtime.as_ref().map(|r| r.cluster())
+    }
+
+    // ==================== End Distributed Runtime Integration ====================
 
     /// Get the current file path for module resolution
     fn get_current_path(&self) -> Option<PathBuf> {
@@ -635,13 +992,111 @@ impl VM {
         Ok(())
     }
 
-    /// Run the event loop (timers + microtasks)
+    /// Run the event loop (timers + microtasks + async resumption)
     pub fn run_event_loop(&mut self) -> Result<()> {
         // First run any pending microtasks
         self.run_microtasks()?;
+
+        // Resume any suspended async functions that are ready
+        self.resume_ready_async_functions()?;
+
         // Then process timers
         self.run_timers()?;
+
+        // Check for more ready async functions after timer processing
+        self.resume_ready_async_functions()?;
+
         Ok(())
+    }
+
+    /// Resume suspended async functions whose awaited promises are ready
+    fn resume_ready_async_functions(&mut self) -> Result<()> {
+        while let Some(suspended) = self.async_executor.get_ready_function() {
+            // Get the awaited value
+            let awaited_value = match suspended.get_awaited_value() {
+                Ok(v) => v,
+                Err(e) => {
+                    // Promise was rejected - reject the async function's result promise
+                    let reason = Value::String(e.to_string());
+                    self.event_loop.reject_promise(&suspended.result_promise, reason);
+                    continue;
+                }
+            };
+
+            // Restore execution state and continue
+            match self.resume_async_function(suspended, awaited_value) {
+                Ok(result) => {
+                    // Async function completed - result promise already handled
+                    // Run microtasks that might have been queued
+                    self.run_microtasks()?;
+                    // If result is a value, it means the function returned normally
+                    // The promise resolution is handled in resume_async_function
+                    let _ = result;
+                }
+                Err(e) => {
+                    // Error during resumption - this shouldn't typically happen
+                    // as errors are handled within resume_async_function
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resume a suspended async function with the resolved value
+    fn resume_async_function(
+        &mut self,
+        suspended: SuspendedAsyncFunction,
+        resolved_value: Value,
+    ) -> Result<Value> {
+        // Restore the function's execution state
+        let func = suspended.function.clone();
+        let result_promise = suspended.result_promise.clone();
+
+        // Restore stack state
+        self.stack = suspended.stack;
+
+        // Push the resolved value onto the stack (result of await expression)
+        self.push(resolved_value)?;
+
+        // Restore call frame
+        let bp = suspended.bp;
+        let mut frame = CallFrame::for_function(func.clone(), bp);
+        frame.ip = suspended.ip;
+
+        self.frames.push(frame);
+
+        // Continue execution
+        match self.execute() {
+            Ok(result) => {
+                // Async function completed successfully - fulfill the result promise
+                self.event_loop.fulfill_promise(&result_promise, result.clone());
+                Ok(result)
+            }
+            Err(e) => {
+                // Async function threw an error - reject the result promise
+                let reason = Value::String(e.to_string());
+                self.event_loop.reject_promise(&result_promise, reason);
+                Err(e)
+            }
+        }
+    }
+
+    /// Get a reference to the event loop
+    pub fn event_loop(&mut self) -> &mut EventLoop {
+        &mut self.event_loop
+    }
+
+    /// Get a reference to the async executor
+    pub fn async_executor(&mut self) -> &mut AsyncExecutor {
+        &mut self.async_executor
+    }
+
+    /// Check if there are any pending async operations
+    pub fn has_pending_async(&self) -> bool {
+        self.async_executor.has_suspended()
+            || self.has_pending_microtasks()
+            || self.has_pending_timers()
     }
 
     /// Process pending timer registrations and cancellations from native calls
@@ -947,6 +1402,31 @@ impl VM {
         }
 
         result
+    }
+
+    /// Run a generator bytecode chunk from a specific instruction pointer
+    /// Returns (value, new_ip, yielded) where:
+    /// - value: the yielded or returned value
+    /// - new_ip: the instruction pointer after yield (for resumption)
+    /// - yielded: true if execution was suspended by yield, false if completed
+    pub fn run_generator_from(&mut self, chunk: &Chunk, start_ip: usize) -> Result<(Value, usize, bool)> {
+        let mut frame = CallFrame::new(chunk.clone());
+        frame.ip = start_ip;
+        self.frames.push(frame);
+
+        // Run execution - the yield opcode will return early
+        let result = self.execute();
+
+        // Check if we yielded or completed
+        let final_ip = self.frames.last().map(|f| f.ip).unwrap_or(chunk.code.len());
+        let yielded = final_ip < chunk.code.len();
+
+        self.frames.pop();
+
+        match result {
+            Ok(value) => Ok((value, final_ip, yielded)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Execute until frames.len() returns to target_depth
@@ -1581,14 +2061,104 @@ impl VM {
 
                 Some(Opcode::Delete) => {
                     // Simplified: just return true
+                    // For computed property deletes
                     self.stack.pop();
                     self.push(Value::Boolean(true))?;
+                }
+
+                Some(Opcode::DeleteProperty) => {
+                    let index = self.read_u16()?;
+                    let name = self.get_constant_string(index)?;
+                    let obj = self.stack.pop().unwrap_or(Value::Undefined);
+
+                    // Check for Proxy first
+                    if let Value::Object(obj_rc) = &obj {
+                        let proxy_info = {
+                            let obj_ref = obj_rc.borrow();
+                            if let ObjectKind::Proxy { target, handler, revoked } = &obj_ref.kind {
+                                Some((target.clone(), handler.clone(), *revoked))
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((target, handler, revoked)) = proxy_info {
+                            if revoked {
+                                return Err(Error::type_error("Cannot perform 'deleteProperty' on a revoked proxy"));
+                            }
+
+                            // Check for deleteProperty trap
+                            if let Some(trap) = handler.get_property("deleteProperty") {
+                                if matches!(&trap, Value::Object(_)) {
+                                    let property = Value::String(name.clone());
+                                    let target_val = (*target).clone();
+                                    let result = self.call_function_with_this(
+                                        &trap,
+                                        &[target_val, property],
+                                        *handler,
+                                    )?;
+                                    self.push(Value::Boolean(result.to_boolean()))?;
+                                    continue;
+                                }
+                            }
+
+                            // No trap, delete from target
+                            let deleted = target.delete_property(&name);
+                            self.push(Value::Boolean(deleted))?;
+                            continue;
+                        }
+                    }
+
+                    // Non-proxy: delete property
+                    let deleted = obj.delete_property(&name);
+                    self.push(Value::Boolean(deleted))?;
                 }
 
                 Some(Opcode::In) => {
                     let obj = self.stack.pop().unwrap_or(Value::Undefined);
                     let key = self.stack.pop().unwrap_or(Value::Undefined);
-                    let result = obj.get_property(&key.to_js_string()).is_some();
+                    let key_str = key.to_js_string();
+
+                    // Check for Proxy first
+                    if let Value::Object(obj_rc) = &obj {
+                        let proxy_info = {
+                            let obj_ref = obj_rc.borrow();
+                            if let ObjectKind::Proxy { target, handler, revoked } = &obj_ref.kind {
+                                Some((target.clone(), handler.clone(), *revoked))
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((target, handler, revoked)) = proxy_info {
+                            if revoked {
+                                return Err(Error::type_error("Cannot perform 'has' on a revoked proxy"));
+                            }
+
+                            // Check for has trap
+                            if let Some(trap) = handler.get_property("has") {
+                                if matches!(&trap, Value::Object(_)) {
+                                    let property = Value::String(key_str.clone());
+                                    let target_val = (*target).clone();
+                                    let result = self.call_function_with_this(
+                                        &trap,
+                                        &[target_val, property],
+                                        *handler,
+                                    )?;
+                                    self.push(Value::Boolean(result.to_boolean()))?;
+                                    continue;
+                                }
+                            }
+
+                            // No trap, check target
+                            let result = (*target).get_property(&key_str).is_some();
+                            self.push(Value::Boolean(result))?;
+                            continue;
+                        }
+                    }
+
+                    // Non-proxy: check property
+                    let result = obj.get_property(&key_str).is_some();
                     self.push(Value::Boolean(result))?;
                 }
 
@@ -2095,7 +2665,7 @@ impl VM {
                 }
 
                 Some(Opcode::Await) => {
-                    // Await a promise - extract its resolved value
+                    // Await a promise - extract its resolved value or suspend execution
                     let value = self.stack.pop().unwrap_or(Value::Undefined);
 
                     let result = if let Value::Object(obj) = &value {
@@ -2117,8 +2687,49 @@ impl VM {
                                     return Err(Error::InternalError(format!("Uncaught (in promise): {}", reason.to_js_string())));
                                 }
                                 PromiseState::Pending => {
-                                    // In a full implementation, this would suspend execution
-                                    // For now, return undefined (synchronous execution model)
+                                    // Promise is pending - check if we're in an async function
+                                    // and suspend execution if so
+                                    drop(obj_ref);
+
+                                    // Check if current function is async
+                                    let is_async = self.frames.last()
+                                        .and_then(|f| f.function.as_ref())
+                                        .map(|f| f.borrow().is_async)
+                                        .unwrap_or(false);
+
+                                    if is_async {
+                                        // Create a suspended async function state
+                                        if let Some(frame) = self.frames.last() {
+                                            if let Some(ref func) = frame.function {
+                                                // Create internal promise for the async function result
+                                                let result_promise = self.event_loop.create_promise();
+
+                                                // Create suspended state
+                                                let mut suspended = SuspendedAsyncFunction::new(
+                                                    func.clone(),
+                                                    result_promise.clone(),
+                                                );
+
+                                                // Save execution state
+                                                let ip = frame.ip;
+                                                let bp = frame.bp;
+                                                let locals: Vec<Value> = self.stack[bp..].to_vec();
+                                                let stack_snapshot = self.stack.clone();
+
+                                                suspended.save_state(ip, locals, stack_snapshot, bp);
+                                                suspended.awaited_promise = Some(value.clone());
+
+                                                // Add to async executor for later resumption
+                                                self.async_executor.suspend(suspended, value);
+
+                                                // Return the promise wrapping the async function result
+                                                let promise_obj = super::promise::create_promise_from_internal(result_promise);
+                                                return Ok(promise_obj);
+                                            }
+                                        }
+                                    }
+
+                                    // Not in async function or can't suspend - return undefined
                                     Value::Undefined
                                 }
                             }
@@ -2169,9 +2780,18 @@ impl VM {
 
                 Some(Opcode::ExportAll) => {
                     // Re-export all from the module on the stack
-                    let _module = self.stack.pop().unwrap_or(Value::Undefined);
-                    // In a full implementation, this would iterate over the module's exports
-                    // and add them to the current module's export namespace
+                    let module = self.stack.pop().unwrap_or(Value::Undefined);
+
+                    // Iterate over the module's exports and re-export them
+                    if let Value::Object(obj) = module {
+                        let borrowed = obj.borrow();
+                        for (key, value) in &borrowed.properties {
+                            // Skip internal properties like __esModule
+                            if !key.starts_with("__") {
+                                self.globals.insert(format!("__export__{}", key), value.clone());
+                            }
+                        }
+                    }
                 }
 
                 Some(Opcode::DynamicImport) => {
@@ -2200,30 +2820,32 @@ impl VM {
                     }
                     args.reverse();
 
-                    // Create an Effect object that represents this effect operation
-                    let effect_obj = Object {
-                        kind: ObjectKind::Effect {
-                            effect_type: effect_type.clone(),
-                            operation: operation.clone(),
-                            args: args.clone(),
-                        },
-                        properties: HashMap::default(),
-                        private_fields: HashMap::default(),
-                        prototype: None,
-                        cached_shape_id: None,
-                    };
-                    let effect_value = Value::Object(Rc::new(RefCell::new(effect_obj)));
-
-                    // Look for an effect handler in the current scope
-                    // For now, check if there's a registered handler for this effect type
-                    let handler_name = format!("__effect_handler_{}_{}", effect_type, operation);
-                    if let Some(handler) = self.get_global(&handler_name) {
-                        // Call the handler with the arguments
-                        let result = self.call_function_with_this(&handler, &args, Value::Undefined)?;
+                    // First, try the effect registry for a registered handler
+                    if let Some(result) = self.handle_effect(&effect_type, &operation, &args) {
                         self.push(result)?;
                     } else {
-                        // No handler found - push the effect object (for potential handling upstream)
-                        self.push(effect_value)?;
+                        // Fallback: check for a global JS handler function
+                        let handler_name = format!("__effect_handler_{}_{}", effect_type, operation);
+                        if let Some(handler) = self.get_global(&handler_name) {
+                            // Call the handler with the arguments
+                            let result = self.call_function_with_this(&handler, &args, Value::Undefined)?;
+                            self.push(result)?;
+                        } else {
+                            // No handler found - create an Effect object for potential handling upstream
+                            let effect_obj = Object {
+                                kind: ObjectKind::Effect {
+                                    effect_type: effect_type.clone(),
+                                    operation: operation.clone(),
+                                    args: args.clone(),
+                                },
+                                properties: HashMap::default(),
+                                private_fields: HashMap::default(),
+                                prototype: None,
+                                cached_shape_id: None,
+                            };
+                            let effect_value = Value::Object(Rc::new(RefCell::new(effect_obj)));
+                            self.push(effect_value)?;
+                        }
                     }
                 }
 
@@ -4464,7 +5086,8 @@ impl VM {
 
                         // Check if callee is a known built-in constructor
                         let builtin_constructors = [
-                            "Date", "Map", "Set", "ArrayBuffer", "DataView", "Proxy",
+                            "Date", "Map", "Set", "WeakMap", "WeakSet",
+                            "ArrayBuffer", "DataView", "Proxy",
                             "Int8Array", "Uint8Array", "Uint8ClampedArray",
                             "Int16Array", "Uint16Array",
                             "Int32Array", "Uint32Array",
@@ -4868,10 +5491,15 @@ impl VM {
 
     /// Create a generator object from a generator function
     fn create_generator(&self, function: Function, initial_locals: Vec<Value>) -> Value {
+        // For a simpler implementation, we collect all yielded values upfront
+        // by running the generator function and collecting yields
+        let yielded_values = self.collect_generator_yields(&function, &initial_locals);
+
+        // Create generator with collected yields as an array to iterate through
         let generator_obj = Rc::new(RefCell::new(Object {
             kind: ObjectKind::Generator {
                 function: Box::new(function),
-                ip: 0,
+                ip: 0, // Used as index into yielded values
                 locals: initial_locals,
                 state: GeneratorState::Suspended,
             },
@@ -4880,63 +5508,61 @@ impl VM {
             prototype: None, cached_shape_id: None,
         }));
 
+        // Store yielded values as a property
+        generator_obj.borrow_mut().set_property("__yields__", Value::new_array(yielded_values));
+
         // Add .next() method
         let gen_clone = Rc::clone(&generator_obj);
-        let next_fn: NativeFn = Rc::new(move |args| {
-            let input_value = args.first().cloned().unwrap_or(Value::Undefined);
+        let next_fn: NativeFn = Rc::new(move |_args| {
             let mut obj_ref = gen_clone.borrow_mut();
 
-            if let ObjectKind::Generator { state, function, ip, locals } = &mut obj_ref.kind {
-                match *state {
-                    GeneratorState::Completed => {
-                        // Return { value: undefined, done: true }
-                        let result = Value::new_object();
-                        if let Value::Object(r) = &result {
-                            r.borrow_mut().set_property("value", Value::Undefined);
-                            r.borrow_mut().set_property("done", Value::Boolean(true));
-                        }
-                        return Ok(result);
-                    }
-                    GeneratorState::Executing => {
-                        return Err(Error::type_error("Generator is already executing"));
-                    }
-                    GeneratorState::Suspended => {
-                        *state = GeneratorState::Executing;
+            // Get the current index and yielded values
+            let current_idx = if let ObjectKind::Generator { ip, state, .. } = &obj_ref.kind {
+                if matches!(state, GeneratorState::Completed) {
+                    let result = Value::new_object();
+                    result.set_property("value", Value::Undefined);
+                    result.set_property("done", Value::Boolean(true));
+                    return Ok(result);
+                }
+                *ip
+            } else {
+                return Err(Error::type_error("Not a generator"));
+            };
 
-                        // Save state for execution
-                        let func = function.as_ref().clone();
-                        let saved_ip = *ip;
-                        let mut saved_locals = locals.clone();
-
-                        // If resuming (not first call), push input value as the yield result
-                        if saved_ip > 0 {
-                            saved_locals.push(input_value);
-                        }
-
-                        // Release the borrow before executing
-                        drop(obj_ref);
-
-                        // Execute generator - simplified: just run from current IP
-                        // In a full implementation, we'd resume from the saved IP
-                        // For now, return done since proper suspension requires VM changes
-                        let mut gen_ref = gen_clone.borrow_mut();
-                        if let ObjectKind::Generator { state, ip: gen_ip, .. } = &mut gen_ref.kind {
-                            // Mark as completed for now (full implementation needs yield handling)
-                            *state = GeneratorState::Completed;
-                            *gen_ip = func.chunk.code.len();
-                        }
-                        drop(gen_ref);
-
-                        let result = Value::new_object();
-                        if let Value::Object(r) = &result {
-                            r.borrow_mut().set_property("value", Value::Undefined);
-                            r.borrow_mut().set_property("done", Value::Boolean(true));
-                        }
-                        Ok(result)
-                    }
+            // Get yielded values array
+            let yields = if let Some(Value::Object(arr)) = obj_ref.properties.get("__yields__") {
+                if let ObjectKind::Array(items) = &arr.borrow().kind {
+                    items.clone()
+                } else {
+                    vec![]
                 }
             } else {
-                Err(Error::type_error("Not a generator"))
+                vec![]
+            };
+
+            // Check if we have more values
+            if current_idx < yields.len() {
+                let value = yields[current_idx].clone();
+
+                // Update index
+                if let ObjectKind::Generator { ip, .. } = &mut obj_ref.kind {
+                    *ip = current_idx + 1;
+                }
+
+                let result = Value::new_object();
+                result.set_property("value", value);
+                result.set_property("done", Value::Boolean(false));
+                Ok(result)
+            } else {
+                // No more values - mark as completed
+                if let ObjectKind::Generator { state, .. } = &mut obj_ref.kind {
+                    *state = GeneratorState::Completed;
+                }
+
+                let result = Value::new_object();
+                result.set_property("value", Value::Undefined);
+                result.set_property("done", Value::Boolean(true));
+                Ok(result)
             }
         });
 
@@ -5010,6 +5636,473 @@ impl VM {
         }
 
         Value::Object(generator_obj)
+    }
+
+    /// Collect all yielded values from a generator function by executing it
+    /// This is a simplified approach that doesn't support lazy evaluation
+    fn collect_generator_yields(&self, function: &Function, initial_locals: &[Value]) -> Vec<Value> {
+        let mut yields = Vec::new();
+        let chunk = &function.chunk;
+
+        // Create a collector VM with a single frame
+        let mut collector_vm = VM::new();
+
+        // Copy globals from current VM for access
+        for (k, v) in &self.globals {
+            collector_vm.globals.insert(k.clone(), v.clone());
+        }
+
+        // Push initial locals (function arguments) onto the stack
+        // This is how normal function calls work - args are on the stack
+        for local in initial_locals {
+            collector_vm.stack.push(local.clone());
+        }
+
+        // Create frame with bp pointing to start of locals on stack
+        let mut frame = CallFrame::new(chunk.clone());
+        frame.bp = 0; // Locals start at stack position 0
+        collector_vm.frames.push(frame);
+
+        let mut iter_count = 0;
+        // Execute until completion, collecting yields
+        loop {
+            if collector_vm.frames.is_empty() {
+                break;
+            }
+
+            let frame = collector_vm.frames.last_mut().unwrap();
+            if frame.ip >= chunk.code.len() {
+                break;
+            }
+
+            let opcode = Opcode::from_u8(chunk.code[frame.ip]);
+            frame.ip += 1;
+
+            match opcode {
+                Some(Opcode::Yield) => {
+                    // Collect the yielded value - use peek, not pop
+                    // The compiler emits a Pop after Yield to clean up the value
+                    let value = collector_vm.stack.last().cloned().unwrap_or(Value::Undefined);
+                    yields.push(value);
+                }
+                Some(Opcode::Return) | Some(Opcode::ReturnUndefined) => {
+                    break;
+                }
+                _ => {
+                    if let Err(_) = collector_vm.execute_single_gen_instruction(opcode) {
+                        break;
+                    }
+                }
+            }
+            iter_count += 1;
+            if iter_count > 10000 {
+                break; // Safety limit
+            }
+        }
+
+        collector_vm.frames.pop();
+        yields
+    }
+
+    /// Execute a single instruction for generator collection (simplified)
+    fn execute_single_gen_instruction(&mut self, opcode: Option<Opcode>) -> Result<()> {
+        match opcode {
+            Some(Opcode::Constant) => {
+                let index = self.read_u16()?;
+                let frame = self.frames.last().unwrap();
+                let value = frame.chunk.constants.get(index as usize).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::Pop) => {
+                self.stack.pop();
+            }
+            Some(Opcode::Dup) => {
+                if let Some(top) = self.stack.last().cloned() {
+                    self.push(top)?;
+                }
+            }
+            Some(Opcode::Add) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                let result = match (&a, &b) {
+                    (Value::String(s1), _) => Value::String(format!("{}{}", s1, b.to_js_string())),
+                    (_, Value::String(s2)) => Value::String(format!("{}{}", a.to_js_string(), s2)),
+                    (Value::Number(n1), Value::Number(n2)) => Value::Number(n1 + n2),
+                    _ => Value::Number(a.to_number() + b.to_number()),
+                };
+                self.push(result)?;
+            }
+            Some(Opcode::Sub) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() - b.to_number()))?;
+            }
+            Some(Opcode::Mul) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() * b.to_number()))?;
+            }
+            Some(Opcode::Div) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() / b.to_number()))?;
+            }
+            Some(Opcode::Mod) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() % b.to_number()))?;
+            }
+            Some(Opcode::Neg) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(-value.to_number()))?;
+            }
+            Some(Opcode::Not) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!value.to_boolean()))?;
+            }
+            Some(Opcode::GetLocal) => {
+                let slot = self.read_u8()? as usize;
+                let bp = self.frames.last().map(|f| f.bp).unwrap_or(0);
+                let value = self.stack.get(bp + slot).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::SetLocal) => {
+                let slot = self.read_u8()? as usize;
+                let bp = self.frames.last().map(|f| f.bp).unwrap_or(0);
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                // Ensure stack is large enough
+                let idx = bp + slot;
+                while self.stack.len() <= idx {
+                    self.stack.push(Value::Undefined);
+                }
+                self.stack[idx] = value;
+            }
+            Some(Opcode::GetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::SetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                self.globals.insert(name, value);
+            }
+            Some(Opcode::DefineGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.globals.insert(name, value);
+            }
+            Some(Opcode::Jump) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.ip = (frame.ip as isize + offset as isize) as usize;
+                }
+            }
+            Some(Opcode::JumpIfFalse) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                // Use peek (not pop) - the compiler emits a Pop opcode to clean up
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !value.to_boolean() {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+            }
+            Some(Opcode::JumpIfTrue) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                // Use peek (not pop) - the compiler emits a Pop opcode to clean up
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                if value.to_boolean() {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+            }
+            Some(Opcode::Lt) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() < b.to_number()))?;
+            }
+            Some(Opcode::Le) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() <= b.to_number()))?;
+            }
+            Some(Opcode::Gt) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() > b.to_number()))?;
+            }
+            Some(Opcode::Ge) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() >= b.to_number()))?;
+            }
+            Some(Opcode::Eq) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.equals(&b)))?;
+            }
+            Some(Opcode::Ne) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!a.equals(&b)))?;
+            }
+            Some(Opcode::StrictEq) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.strict_equals(&b)))?;
+            }
+            Some(Opcode::StrictNe) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!a.strict_equals(&b)))?;
+            }
+            Some(Opcode::True) => {
+                self.push(Value::Boolean(true))?;
+            }
+            Some(Opcode::False) => {
+                self.push(Value::Boolean(false))?;
+            }
+            Some(Opcode::Null) => {
+                self.push(Value::Null)?;
+            }
+            Some(Opcode::Undefined) => {
+                self.push(Value::Undefined)?;
+            }
+            Some(Opcode::Increment) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(value.to_number() + 1.0))?;
+            }
+            Some(Opcode::Decrement) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(value.to_number() - 1.0))?;
+            }
+            Some(Opcode::Nop) => {
+                // No operation
+            }
+            _ => {
+                // For unhandled opcodes, we may need to skip operands
+                // This is a simplified implementation
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute a single instruction and return
+    /// Returns Some(value) if execution should stop (return/yield), None to continue
+    fn execute_one_instruction(&mut self) -> Result<Option<Value>> {
+        if self.frames.is_empty() {
+            return Ok(Some(Value::Undefined));
+        }
+
+        let frame = self.frames.last_mut().unwrap();
+        if frame.ip >= frame.chunk.code.len() {
+            return Ok(Some(self.stack.pop().unwrap_or(Value::Undefined)));
+        }
+
+        let opcode = Opcode::from_u8(frame.chunk.code[frame.ip]);
+        frame.ip += 1;
+
+        // Handle just the essential opcodes for generator collection
+        match opcode {
+            Some(Opcode::Return) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                return Ok(Some(value));
+            }
+            Some(Opcode::Yield) => {
+                // Yield returns the value - handled specially in collect_generator_yields
+                return Ok(Some(self.stack.pop().unwrap_or(Value::Undefined)));
+            }
+            Some(Opcode::Constant) => {
+                let index = self.read_u16()?;
+                let frame = self.frames.last().unwrap();
+                let value = frame.chunk.constants.get(index as usize).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::Pop) => {
+                self.stack.pop();
+            }
+            Some(Opcode::Dup) => {
+                if let Some(top) = self.stack.last().cloned() {
+                    self.push(top)?;
+                }
+            }
+            Some(Opcode::Add) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                let result = match (&a, &b) {
+                    (Value::String(s1), _) => Value::String(format!("{}{}", s1, b.to_js_string())),
+                    (_, Value::String(s2)) => Value::String(format!("{}{}", a.to_js_string(), s2)),
+                    (Value::Number(n1), Value::Number(n2)) => Value::Number(n1 + n2),
+                    _ => Value::Number(a.to_number() + b.to_number()),
+                };
+                self.push(result)?;
+            }
+            Some(Opcode::Sub) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() - b.to_number()))?;
+            }
+            Some(Opcode::Mul) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() * b.to_number()))?;
+            }
+            Some(Opcode::Div) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() / b.to_number()))?;
+            }
+            Some(Opcode::Mod) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(a.to_number() % b.to_number()))?;
+            }
+            Some(Opcode::Neg) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(-value.to_number()))?;
+            }
+            Some(Opcode::Not) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!value.to_boolean()))?;
+            }
+            Some(Opcode::GetLocal) => {
+                let slot = self.read_u8()? as usize;
+                let bp = self.frames.last().map(|f| f.bp).unwrap_or(0);
+                let value = self.stack.get(bp + slot).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::SetLocal) => {
+                let slot = self.read_u8()? as usize;
+                let bp = self.frames.last().map(|f| f.bp).unwrap_or(0);
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                // Ensure stack is large enough
+                let idx = bp + slot;
+                while self.stack.len() <= idx {
+                    self.stack.push(Value::Undefined);
+                }
+                self.stack[idx] = value;
+            }
+            Some(Opcode::GetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
+            }
+            Some(Opcode::SetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                self.globals.insert(name, value);
+            }
+            Some(Opcode::DefineGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.globals.insert(name, value);
+            }
+            Some(Opcode::Jump) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                if let Some(frame) = self.frames.last_mut() {
+                    frame.ip = (frame.ip as isize + offset as isize) as usize;
+                }
+            }
+            Some(Opcode::JumpIfFalse) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                // Use peek (not pop) - the compiler emits a Pop opcode to clean up
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                if !value.to_boolean() {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+            }
+            Some(Opcode::JumpIfTrue) => {
+                // Use signed relative offset like main VM
+                let offset = self.read_i16()?;
+                // Use peek (not pop) - the compiler emits a Pop opcode to clean up
+                let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                if value.to_boolean() {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.ip = (frame.ip as isize + offset as isize) as usize;
+                    }
+                }
+            }
+            Some(Opcode::Lt) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() < b.to_number()))?;
+            }
+            Some(Opcode::Le) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() <= b.to_number()))?;
+            }
+            Some(Opcode::Gt) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() > b.to_number()))?;
+            }
+            Some(Opcode::Ge) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.to_number() >= b.to_number()))?;
+            }
+            Some(Opcode::Eq) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.equals(&b)))?;
+            }
+            Some(Opcode::Ne) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!a.equals(&b)))?;
+            }
+            Some(Opcode::StrictEq) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(a.strict_equals(&b)))?;
+            }
+            Some(Opcode::StrictNe) => {
+                let b = self.stack.pop().unwrap_or(Value::Undefined);
+                let a = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Boolean(!a.strict_equals(&b)))?;
+            }
+            Some(Opcode::True) => {
+                self.push(Value::Boolean(true))?;
+            }
+            Some(Opcode::False) => {
+                self.push(Value::Boolean(false))?;
+            }
+            Some(Opcode::Null) => {
+                self.push(Value::Null)?;
+            }
+            Some(Opcode::Undefined) => {
+                self.push(Value::Undefined)?;
+            }
+            Some(Opcode::Increment) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(value.to_number() + 1.0))?;
+            }
+            Some(Opcode::Decrement) => {
+                let value = self.stack.pop().unwrap_or(Value::Undefined);
+                self.push(Value::Number(value.to_number() - 1.0))?;
+            }
+            _ => {
+                // For other opcodes, skip them (simplified implementation)
+                // This may cause issues with complex generators
+            }
+        }
+        Ok(None)
     }
 }
 
