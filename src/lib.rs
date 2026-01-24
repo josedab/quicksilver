@@ -47,6 +47,7 @@ pub mod ffi;
 pub mod native;
 pub mod modules;
 pub mod prelude;
+pub mod typescript;
 
 mod error;
 
