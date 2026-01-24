@@ -3,12 +3,14 @@
 //! This module provides the runtime execution environment including
 //! the interpreter, value types, and built-in functions.
 
+pub mod async_runtime;
 mod builtins;
 pub mod intern;
+pub mod promise;
 mod value;
 mod vm;
 
-pub use value::{Function as JsFunction, Object, ObjectKind, Value};
+pub use value::{Function as JsFunction, Object, ObjectKind, PromiseState, Value};
 pub use vm::{CallFrame, VM};
 
 use crate::error::Result;

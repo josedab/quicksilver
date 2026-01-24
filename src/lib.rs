@@ -28,6 +28,7 @@
 pub mod ast;
 pub mod bytecode;
 pub mod debugger;
+pub mod event_loop;
 pub mod gc;
 pub mod lexer;
 pub mod parser;
