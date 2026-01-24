@@ -462,6 +462,7 @@ impl Optimizer {
             | Opcode::GetProperty
             | Opcode::SetProperty
             | Opcode::DefineProperty
+            | Opcode::DeleteProperty
             | Opcode::GetPrivateField
             | Opcode::SetPrivateField
             | Opcode::DefinePrivateField

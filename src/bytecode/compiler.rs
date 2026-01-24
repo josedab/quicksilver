@@ -954,10 +954,10 @@ impl Compiler {
         let compiled = self.compile_function_body(func)?;
 
         // Store the compiled function as a Value in the constants pool
-        let func_value = Value::new_function(crate::runtime::JsFunction::new(
-            compiled.name.clone(),
-            compiled.chunk,
-        ));
+        let mut runtime_func = crate::runtime::JsFunction::new(compiled.name.clone(), compiled.chunk);
+        runtime_func.is_async = func.is_async;
+        runtime_func.is_generator = func.is_generator;
+        let func_value = Value::new_function(runtime_func);
         let func_idx = self.chunk.add_constant(func_value);
         self.emit(Opcode::CreateFunction);
         self.emit_u16(func_idx);
@@ -2113,6 +2113,36 @@ impl Compiler {
     }
 
     fn compile_unary(&mut self, unary: &UnaryExpression) -> Result<()> {
+        use crate::ast::MemberProperty;
+
+        // Handle delete specially for member expressions
+        if matches!(unary.operator, UnaryOperator::Delete) {
+            if let Expression::Member(member) = &unary.argument {
+                // Compile the object
+                self.compile_expr(&member.object)?;
+
+                // Get the property name
+                match &member.property {
+                    MemberProperty::Identifier(id) => {
+                        let idx = self.chunk.add_constant(Value::String(id.name.clone()));
+                        self.emit(Opcode::DeleteProperty);
+                        self.emit_u16(idx as u16);
+                    }
+                    MemberProperty::Expression(expr) if member.computed => {
+                        // For computed properties like delete obj[expr], evaluate the expression
+                        // and fall back to simple delete
+                        self.compile_expr(expr)?;
+                        self.emit(Opcode::Delete);
+                    }
+                    _ => {
+                        // Fallback for other cases
+                        self.emit(Opcode::Delete);
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         self.compile_expr(&unary.argument)?;
 
         match unary.operator {

@@ -87,6 +87,9 @@ pub enum Opcode {
     /// Define a private field
     /// Operands: name_index (u16)
     DefinePrivateField = 0x37,
+    /// Delete a property by name
+    /// Operands: name_index (u16)
+    DeleteProperty = 0x38,
 
     // ========== Arithmetic ==========
     /// Add two values
@@ -318,6 +321,7 @@ impl Opcode {
             0x35 => Some(Opcode::GetPrivateField),
             0x36 => Some(Opcode::SetPrivateField),
             0x37 => Some(Opcode::DefinePrivateField),
+            0x38 => Some(Opcode::DeleteProperty),
 
             0x40 => Some(Opcode::Add),
             0x41 => Some(Opcode::Sub),
@@ -492,6 +496,7 @@ impl Opcode {
             | Opcode::GetProperty
             | Opcode::SetProperty
             | Opcode::DefineProperty
+            | Opcode::DeleteProperty
             | Opcode::GetPrivateField
             | Opcode::SetPrivateField
             | Opcode::DefinePrivateField
