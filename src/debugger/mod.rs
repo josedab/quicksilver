@@ -9,6 +9,10 @@
 //! - Inspect variables at any point in time
 //! - Set breakpoints
 //! - Find when variables changed
+//! - Debug Adapter Protocol (DAP) support for IDE integration
+//! - Web-based debugger UI
+//! - Call stack tracking
+//! - Variable diff view
 //!
 //! # Example
 //! ```text
@@ -17,6 +21,28 @@
 //! (ttdb) next    # Step forward
 //! (ttdb) p x     # Print variable x
 //! ```
+//!
+//! # Web UI
+//! ```text
+//! quicksilver debug --serve script.js
+//! # Opens http://localhost:9229 with interactive debugger UI
+//! ```
+//!
+//! # VS Code Integration
+//! The debugger supports the Debug Adapter Protocol (DAP), allowing integration
+//! with VS Code and other compatible IDEs. Key features:
+//! - Step backward (time-travel!)
+//! - Reverse continue
+//! - Variable inspection at any point in time
+//! - Find when variables changed
+
+pub mod dap;
+pub mod server;
+pub mod ui;
+
+pub use dap::{DAPServer, DAPMessage, DAPRequest, DAPResponse, DAPEvent, Capabilities};
+pub use server::{DebugServer, DEFAULT_PORT};
+pub use ui::{DebuggerUI, CallStack, CallFrame, VariableDiff, ChangeType, Timeline, ExecutionHeatMap};
 
 use crate::bytecode::Opcode;
 use crate::Value;
