@@ -645,6 +645,17 @@ impl Value {
             _ => false,
         }
     }
+
+    /// Delete a property from this value (if it's an object)
+    pub fn delete_property(&self, key: &str) -> bool {
+        match self {
+            Value::Object(obj) => {
+                let mut obj = obj.borrow_mut();
+                obj.delete_property(key)
+            }
+            _ => false,
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -990,6 +1001,28 @@ impl Object {
         self.properties.insert(key.to_string(), value);
     }
 
+    /// Delete a property from this object
+    pub fn delete_property(&mut self, key: &str) -> bool {
+        // Handle array elements
+        if let ObjectKind::Array(arr) = &mut self.kind {
+            if let Ok(idx) = key.parse::<usize>() {
+                if idx < arr.len() {
+                    arr[idx] = Value::Undefined;
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        // Invalidate shape cache on deletion
+        if self.properties.contains_key(key) {
+            self.cached_shape_id = None;
+            self.properties.remove(key);
+            return true;
+        }
+        false
+    }
+
     /// Check if object has own property
     pub fn has_own_property(&self, key: &str) -> bool {
         self.properties.contains_key(key)
@@ -1248,7 +1281,7 @@ impl TypedArrayKind {
 }
 
 /// Promise state
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PromiseState {
     Pending,
     Fulfilled,
