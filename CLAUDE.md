@@ -192,16 +192,17 @@ cargo run -- test_feature.js
 - **AI-Native Runtime**: JSDoc → LLM tool schema generation (OpenAI/Anthropic formats)
 - **WebAssembly**: Complete WASM module parsing (Type, Import, Function, Table, Memory, Export, Code sections)
 
-#### Framework Implemented (Not Yet VM-Integrated)
-- **Effect System**: Algebraic effects infrastructure (needs `perform` statement in VM)
-- **Distributed Runtime**: Cluster primitives and actor model (needs network layer)
-- **Time-Travel Debugger**: Record/replay framework (needs VM integration)
-- **Hot Module Reloading**: Module tracking and updates (needs VM integration)
+#### Fully VM-Integrated
+- **Effect System**: Algebraic effects with `perform` statement, effect registry, and handler chaining
+- **Distributed Runtime**: Cluster computing, task submission, actor messaging, all accessible from VM
+- **Time-Travel Debugger**: Record/replay with DAP protocol support, production-ready TUI, step forward/backward
+- **Hot Module Reloading**: File watching, module graph tracking, hot updates with VM integration
+- **Async/Await Event Loop**: Complete Promise/A+ compliant event loop with microtask queue and timers
+- **Native TypeScript**: Type stripping transpiler for direct .ts file execution
 
 ### Not Yet Implemented
 - Generators (`yield`) - tokens exist, no semantics
 - ES Modules (`import`/`export`) - tokens exist, no module system
-- Full `async`/`await` - parser only, no event loop
 - `Proxy` traps - constructor only
 - True weak references for `WeakMap`/`WeakSet`
 
