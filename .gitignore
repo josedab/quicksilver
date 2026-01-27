@@ -2,3 +2,18 @@
 *.swp
 *.swo
 .DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+Thumbs.db
+*~
+
+# Rust
+**/*.rs.bk
+
+# Snapshots
+*.snapshot
