@@ -258,7 +258,7 @@ impl Timeline {
         let right_label = format!("{}", self.total_steps);
         let middle_label = format!("Step {} / {}", self.current_position + 1, self.total_steps);
 
-        let padding = (self.width - 2 - middle_label.len()) / 2;
+        let _padding = (self.width - 2 - middle_label.len()) / 2;
         write!(output, "║{}", left_label).unwrap();
         let remaining = self.width - 2 - left_label.len() - right_label.len();
         let left_pad = (remaining - middle_label.len()) / 2;

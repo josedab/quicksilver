@@ -18,6 +18,8 @@
 //! const result = compute(21); // Returns 42
 //! ```
 
+//! **Status:** ⚠️ Partial — Foreign function interface
+
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
@@ -367,18 +369,18 @@ pub mod stdlib {
                 use std::collections::hash_map::DefaultHasher;
                 use std::hash::{Hash, Hasher};
 
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 let mut hasher = DefaultHasher::new();
                 input.hash(&mut hasher);
                 Ok(Value::Number(hasher.finish() as f64))
             })
             .function("base64_encode", |args| {
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 let encoded = base64_encode(input.as_bytes());
                 Ok(Value::String(encoded))
             })
             .function("base64_decode", |args| {
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 match base64_decode(&input) {
                     Ok(bytes) => Ok(Value::String(String::from_utf8_lossy(&bytes).to_string())),
                     Err(e) => Err(FfiError::ConversionError(e)),
@@ -390,14 +392,14 @@ pub mod stdlib {
     pub fn crypto_module() -> FfiModule {
         FfiModule::new("crypto")
             .function("random_bytes", |args| {
-                let len = i32::from_js_value(args.get(0).unwrap_or(&Value::Number(16.0)))? as usize;
+                let len = i32::from_js_value(args.first().unwrap_or(&Value::Number(16.0)))? as usize;
                 let bytes: Vec<Value> = (0..len)
                     .map(|_| Value::Number((rand::random::<u8>()) as f64))
                     .collect();
                 Ok(Value::new_array(bytes))
             })
             .function("random_int", |args| {
-                let min = i64::from_js_value(args.get(0).unwrap_or(&Value::Number(0.0)))?;
+                let min = i64::from_js_value(args.first().unwrap_or(&Value::Number(0.0)))?;
                 let max = i64::from_js_value(args.get(1).unwrap_or(&Value::Number(100.0)))?;
                 let value = min + (rand::random::<u64>() % (max - min) as u64) as i64;
                 Ok(Value::Number(value as f64))
@@ -408,11 +410,11 @@ pub mod stdlib {
     pub fn string_module() -> FfiModule {
         FfiModule::new("string")
             .function("reverse", |args| {
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 Ok(Value::String(input.chars().rev().collect()))
             })
             .function("capitalize", |args| {
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 let mut chars = input.chars();
                 let result = match chars.next() {
                     Some(c) => c.to_uppercase().to_string() + chars.as_str(),
@@ -421,7 +423,7 @@ pub mod stdlib {
                 Ok(Value::String(result))
             })
             .function("words", |args| {
-                let input = String::from_js_value(args.get(0).unwrap_or(&Value::Undefined))?;
+                let input = String::from_js_value(args.first().unwrap_or(&Value::Undefined))?;
                 let words: Vec<Value> = input
                     .split_whitespace()
                     .map(|s| Value::String(s.to_string()))

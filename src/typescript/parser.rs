@@ -158,10 +158,7 @@ impl<'src> TypeScriptParser<'src> {
             return true;
         }
         let next_char = self.source[next_pos..].chars().next();
-        match next_char {
-            Some(c) if c.is_alphanumeric() || c == '_' || c == '$' => false,
-            _ => true,
-        }
+        !matches!(next_char, Some(c) if c.is_alphanumeric() || c == '_' || c == '$')
     }
 
     /// Parse a type annotation (after the colon)

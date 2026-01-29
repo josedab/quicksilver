@@ -1835,9 +1835,8 @@ fn register_fetch(vm: &mut VM) {
 
         // For now, we can't actually make HTTP requests without a runtime
         // Return a mock response based on the URL pattern
-        let (status, response_body) = if url.starts_with("mock://") {
+        let (status, response_body) = if let Some(path) = url.strip_prefix("mock://") {
             // Mock responses for testing
-            let path = &url[7..];
             match path {
                 "success" => (200, r#"{"success": true}"#.to_string()),
                 "error" => (500, r#"{"error": "Server error"}"#.to_string()),
@@ -2595,7 +2594,7 @@ fn register_global_functions(vm: &mut VM) {
         let text = args.first().map(|v| v.to_js_string()).unwrap_or_default();
         let radix = args.get(1).map(|v| v.to_number() as u32).unwrap_or(10);
 
-        if radix != 0 && (radix < 2 || radix > 36) {
+        if radix != 0 && !(2..=36).contains(&radix) {
             return Ok(Value::Number(f64::NAN));
         }
 
@@ -2680,11 +2679,11 @@ fn register_global_functions(vm: &mut VM) {
                 let s = s.strip_suffix('n').unwrap_or(s);
                 match s.parse::<BigInt>() {
                     Ok(n) => Ok(Value::BigInt(n)),
-                    Err(_) => Err(crate::error::Error::syntax_error(&format!("Cannot convert {} to BigInt", val.to_js_string()))),
+                    Err(_) => Err(crate::error::Error::syntax_error(format!("Cannot convert {} to BigInt", val.to_js_string()))),
                 }
             }
             Value::Boolean(b) => Ok(Value::BigInt(BigInt::from(if *b { 1 } else { 0 }))),
-            _ => Err(crate::error::Error::type_error(&format!("Cannot convert {} to BigInt", val.type_of()))),
+            _ => Err(crate::error::Error::type_error(format!("Cannot convert {} to BigInt", val.type_of()))),
         }
     });
 
@@ -2831,7 +2830,7 @@ fn register_global_functions(vm: &mut VM) {
                 let desc_ref = desc_obj.borrow();
                 // Check for value property in descriptor
                 if let Some(value) = desc_ref.get_property("value") {
-                    target.borrow_mut().set_property(&key, value);
+                    target.borrow_mut().set_property(key, value);
                 }
                 // Check for getter
                 if let Some(getter) = desc_ref.get_property("get") {
@@ -2851,7 +2850,7 @@ fn register_global_functions(vm: &mut VM) {
 
         if let (Value::Object(target), Value::String(key)) = (&obj, &prop) {
             let target_ref = target.borrow();
-            if let Some(value) = target_ref.get_property(&key) {
+            if let Some(value) = target_ref.get_property(key) {
                 // Create a descriptor object
                 let descriptor = Value::new_object();
                 descriptor.set_property("value", value);
@@ -2929,7 +2928,7 @@ fn register_global_functions(vm: &mut VM) {
 
         if let (Value::Object(target), Value::String(key)) = (&obj, &prop) {
             let target_ref = target.borrow();
-            return Ok(Value::Boolean(target_ref.properties.contains_key(&*key)));
+            return Ok(Value::Boolean(target_ref.properties.contains_key(key)));
         }
         Ok(Value::Boolean(false))
     });

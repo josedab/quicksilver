@@ -109,7 +109,7 @@ pub struct AsyncExecutor {
     /// Queue of suspended async functions waiting to be resumed
     suspended: Vec<SuspendedAsyncFunction>,
     /// Currently executing async function (if any)
-    current: Option<SuspendedAsyncFunction>,
+    _current: Option<SuspendedAsyncFunction>,
 }
 
 impl Default for AsyncExecutor {
@@ -123,7 +123,7 @@ impl AsyncExecutor {
     pub fn new() -> Self {
         Self {
             suspended: Vec::new(),
-            current: None,
+            _current: None,
         }
     }
 

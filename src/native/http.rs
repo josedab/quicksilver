@@ -347,7 +347,7 @@ impl HttpClient {
     fn check_network_security(&self, host: &str) -> HttpResult<()> {
         self.network_security
             .check_host(host)
-            .map_err(|e| HttpError::PermissionDenied(e))
+            .map_err(HttpError::PermissionDenied)
     }
 
     /// Resolve hostname and check for DNS rebinding attacks
@@ -371,7 +371,7 @@ impl HttpClient {
         let addr = addrs[0];
         self.network_security
             .check_resolved_ip(host, &addr.ip())
-            .map_err(|e| HttpError::PermissionDenied(e))?;
+            .map_err(HttpError::PermissionDenied)?;
 
         Ok(addr)
     }
@@ -421,7 +421,7 @@ impl HttpClient {
         let addr = self.resolve_and_check(&host, port)?;
 
         // Connect (HTTP only for this simple implementation)
-        let mut stream = TcpStream::connect(&addr)
+        let mut stream = TcpStream::connect(addr)
             .map_err(|e| HttpError::ConnectionFailed(e.to_string()))?;
 
         // Build request

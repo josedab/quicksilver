@@ -25,6 +25,7 @@ pub struct ShapeEntry {
 
 /// Entry in the polymorphic inline cache for property access
 #[derive(Clone)]
+#[derive(Default)]
 pub struct InlineCacheEntry {
     /// Hash of the property name being cached
     pub name_hash: u64,
@@ -38,17 +39,6 @@ pub struct InlineCacheEntry {
     pub total_hits: u32,
 }
 
-impl Default for InlineCacheEntry {
-    fn default() -> Self {
-        Self {
-            name_hash: 0,
-            shapes: Default::default(),
-            shape_count: 0,
-            is_megamorphic: false,
-            total_hits: 0,
-        }
-    }
-}
 
 impl InlineCacheEntry {
     /// Look up property offset for a given shape

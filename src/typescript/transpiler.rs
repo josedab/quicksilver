@@ -572,7 +572,7 @@ impl TypeScriptTranspiler {
                 // Numeric enum: bi-directional mapping
                 output.push_str("    ");
                 output.push_str(name);
-                output.push_str("[");
+                output.push('[');
                 output.push_str(name);
                 output.push_str("[\"");
                 output.push_str(member_name);
@@ -672,9 +672,7 @@ impl TypeScriptTranspiler {
                         // Found an unmatched { - check if it's an object literal
                         // Look back to see what precedes it
                         let mut back = i;
-                        if back > 0 {
-                            back -= 1;
-                        }
+                        back = back.saturating_sub(1);
                         while back > 0 && (bytes[back] as char).is_whitespace() {
                             back -= 1;
                         }

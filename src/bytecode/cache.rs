@@ -203,14 +203,12 @@ impl BytecodeCache {
     /// Clear the entire cache
     pub fn clear(&self) -> Result<(), Error> {
         if self.config.cache_dir.exists() {
-            for entry in fs::read_dir(&self.config.cache_dir)
-                .map_err(|e| Error::InternalError(format!("Failed to read cache directory: {}", e)))?
+            for entry in (fs::read_dir(&self.config.cache_dir)
+                .map_err(|e| Error::InternalError(format!("Failed to read cache directory: {}", e)))?).flatten()
             {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if path.extension().map(|e| e == CACHE_EXT).unwrap_or(false) {
-                        let _ = fs::remove_file(&path);
-                    }
+                let path = entry.path();
+                if path.extension().map(|e| e == CACHE_EXT).unwrap_or(false) {
+                    let _ = fs::remove_file(&path);
                 }
             }
         }
