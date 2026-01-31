@@ -206,7 +206,7 @@ impl VM {
         self.check_stack_depth()?;
 
         // Other checks are done periodically to reduce overhead
-        if self.operation_count % self.resource_limits.check_interval != 0 {
+        if !self.operation_count.is_multiple_of(self.resource_limits.check_interval) {
             return Ok(());
         }
 
@@ -274,7 +274,8 @@ impl VM {
     /// detect file changes and reload modules without losing application state.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// use quicksilver::runtime::VM;
     /// let mut vm = VM::new();
     /// vm.enable_hmr();
     /// // Now modules can be hot-reloaded
@@ -381,7 +382,8 @@ impl VM {
     /// type - they are tried in reverse order (most recent first).
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// use quicksilver::runtime::VM;
     /// use quicksilver::effects::LogHandler;
     /// use std::sync::Arc;
     ///
@@ -594,7 +596,7 @@ impl VM {
 
     /// Get the current file path for module resolution
     fn get_current_path(&self) -> Option<PathBuf> {
-        self.current_file.as_ref().map(|f| PathBuf::from(f))
+        self.current_file.as_ref().map(PathBuf::from)
     }
 
     /// Load a module and return its namespace object
@@ -1548,8 +1550,12 @@ impl VM {
                 Some(Opcode::GetGlobal) => {
                     let index = self.read_u16()?;
                     let name = self.get_constant_string(index)?;
-                    let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
-                    self.push(value)?;
+                    match self.globals.get(&name).cloned() {
+                        Some(value) => self.push(value)?,
+                        None => return Err(Error::reference_error(
+                            &format!("'{}' is not defined", name)
+                        )),
+                    }
                 }
 
                 Some(Opcode::SetGlobal) => {
@@ -1557,6 +1563,13 @@ impl VM {
                     let name = self.get_constant_string(index)?;
                     let value = self.peek(0).clone();
                     self.globals.insert(name, value);
+                }
+
+                Some(Opcode::TryGetGlobal) => {
+                    let index = self.read_u16()?;
+                    let name = self.get_constant_string(index)?;
+                    let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
+                    self.push(value)?;
                 }
 
                 Some(Opcode::DefineGlobal) => {
@@ -1716,11 +1729,11 @@ impl VM {
                     }
 
                     // Check for setter first
-                    if let Some(setter) = self.find_setter(&obj, &name) {
+                    if let Some(setter) = self.find_setter(obj, &name) {
                         // Call the setter with obj as 'this' and value as argument
                         let obj_clone = obj.clone();
                         self.stack.pop(); // Remove object from stack
-                        self.call_function_with_this(&setter, &[value.clone()], obj_clone)?;
+                        self.call_function_with_this(&setter, std::slice::from_ref(&value), obj_clone)?;
                         self.push(value)?;
                     } else {
                         obj.set_property(&name, value.clone());
@@ -2534,6 +2547,48 @@ impl VM {
                                     drop(o_ref);
                                     obj.clone()
                                 }
+                                ObjectKind::Generator { .. } => {
+                                    // Generators are iterables - collect yields into an Iterator
+                                    let yields = if let Some(Value::Object(arr)) = o_ref.properties.get("__yields__") {
+                                        if let ObjectKind::Array(items) = &arr.borrow().kind {
+                                            items.clone()
+                                        } else { vec![] }
+                                    } else { vec![] };
+                                    drop(o_ref);
+                                    Value::Object(Rc::new(RefCell::new(Object {
+                                        kind: ObjectKind::Iterator {
+                                            values: yields,
+                                            index: 0,
+                                        },
+                                        properties: HashMap::default(),
+                                        private_fields: HashMap::default(),
+                                        prototype: None, cached_shape_id: None,
+                                    })))
+                                }
+                                ObjectKind::Map(entries) => {
+                                    // Map iterator yields [key, value] pairs
+                                    let values: Vec<Value> = entries.iter().map(|(k, v)| {
+                                        Value::new_array(vec![k.clone(), v.clone()])
+                                    }).collect();
+                                    drop(o_ref);
+                                    Value::Object(Rc::new(RefCell::new(Object {
+                                        kind: ObjectKind::Iterator { values, index: 0 },
+                                        properties: HashMap::default(),
+                                        private_fields: HashMap::default(),
+                                        prototype: None, cached_shape_id: None,
+                                    })))
+                                }
+                                ObjectKind::Set(items) => {
+                                    // Set iterator yields values
+                                    let values = items.clone();
+                                    drop(o_ref);
+                                    Value::Object(Rc::new(RefCell::new(Object {
+                                        kind: ObjectKind::Iterator { values, index: 0 },
+                                        properties: HashMap::default(),
+                                        private_fields: HashMap::default(),
+                                        prototype: None, cached_shape_id: None,
+                                    })))
+                                }
                                 _ => {
                                     drop(o_ref);
                                     Value::Undefined
@@ -2634,9 +2689,29 @@ impl VM {
                         }
                     } else {
                         // No handler, propagate the error with stack trace
+                        let (kind, message) = if let Value::Object(ref obj) = error {
+                            let obj = obj.borrow();
+                            if let ObjectKind::Error { ref name, ref message } = obj.kind {
+                                let k = match name.as_str() {
+                                    "TypeError" => crate::error::ErrorKind::TypeError,
+                                    "ReferenceError" => crate::error::ErrorKind::ReferenceError,
+                                    "RangeError" => crate::error::ErrorKind::RangeError,
+                                    "SyntaxError" => crate::error::ErrorKind::SyntaxError,
+                                    "EvalError" => crate::error::ErrorKind::EvalError,
+                                    "URIError" => crate::error::ErrorKind::UriError,
+                                    "Error" => crate::error::ErrorKind::GenericError,
+                                    _ => crate::error::ErrorKind::InternalError,
+                                };
+                                (k, message.clone())
+                            } else {
+                                (crate::error::ErrorKind::InternalError, error.to_string())
+                            }
+                        } else {
+                            (crate::error::ErrorKind::InternalError, error.to_string())
+                        };
                         return Err(self.error_with_stack(Error::RuntimeError {
-                            kind: crate::error::ErrorKind::InternalError,
-                            message: error.to_string(),
+                            kind,
+                            message,
                             stack_trace: StackTrace::new(),
                         }));
                     }
@@ -2886,6 +2961,7 @@ impl VM {
 
         let actual_arg_count = expanded_args.len();
         let callee = self.stack[callee_pos].clone();
+        let callee_desc = callee.to_js_string();
 
         match callee {
             Value::Object(obj) => {
@@ -3032,12 +3108,12 @@ impl VM {
                         self.push(result)?;
                     }
                     _ => {
-                        return Err(Error::type_error("Value is not callable"));
+                        return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
                     }
                 }
             }
             _ => {
-                return Err(Error::type_error("Value is not callable"));
+                return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
             }
         }
 
@@ -3064,6 +3140,7 @@ impl VM {
 
         // Get the callee before we modify the stack
         let callee = self.stack[callee_pos].clone();
+        let callee_desc = callee.to_js_string();
 
         match &callee {
             Value::Object(obj) => {
@@ -3175,12 +3252,12 @@ impl VM {
                         self.process_pending_timers();
                     }
                     _ => {
-                        return Err(Error::type_error("Value is not callable"));
+                        return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
                     }
                 }
             }
             _ => {
-                return Err(Error::type_error("Value is not callable"));
+                return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
             }
         }
 
@@ -3293,30 +3370,27 @@ impl VM {
 
                                 if let Some(method) = method_opt {
                                     // Method found on function object, call it
-                                    match &method {
-                                        Value::Object(method_obj) => {
-                                            let method_ref = method_obj.borrow();
-                                            match &method_ref.kind {
-                                                ObjectKind::NativeFunction {
-                                                    func: method_func,
-                                                    ..
-                                                } => {
-                                                    let method_func = method_func.clone();
-                                                    drop(method_ref);
-                                                    return method_func(args);
-                                                }
-                                                ObjectKind::Function(_) => {
-                                                    drop(method_ref);
-                                                    return self.call_function_with_this(
-                                                        &method,
-                                                        args,
-                                                        receiver.clone(),
-                                                    );
-                                                }
-                                                _ => {}
+                                    if let Value::Object(method_obj) = &method {
+                                        let method_ref = method_obj.borrow();
+                                        match &method_ref.kind {
+                                            ObjectKind::NativeFunction {
+                                                func: method_func,
+                                                ..
+                                            } => {
+                                                let method_func = method_func.clone();
+                                                drop(method_ref);
+                                                return method_func(args);
                                             }
+                                            ObjectKind::Function(_) => {
+                                                drop(method_ref);
+                                                return self.call_function_with_this(
+                                                    &method,
+                                                    args,
+                                                    receiver.clone(),
+                                                );
+                                            }
+                                            _ => {}
                                         }
-                                        _ => {}
                                     }
                                 }
                                 // No method found, this is a direct call on the native function
@@ -3388,7 +3462,7 @@ impl VM {
                             }
                             _ => {
                                 drop(obj_ref);
-                                Err(Error::type_error(&format!(
+                                Err(Error::type_error(format!(
                                     "Method '{}' not supported on function",
                                     method_name
                                 )))
@@ -3465,7 +3539,7 @@ impl VM {
                             }
                             _ => {
                                 drop(obj_ref);
-                                Err(Error::type_error(&format!(
+                                Err(Error::type_error(format!(
                                     "Method '{}' not supported on bound function",
                                     method_name
                                 )))
@@ -3569,28 +3643,25 @@ impl VM {
                         // Try to get method from properties
                         if let Some(method) = receiver.get_property(method_name) {
                             // Method found, call it
-                            match &method {
-                                Value::Object(method_obj) => {
-                                    let method_ref = method_obj.borrow();
-                                    match &method_ref.kind {
-                                        ObjectKind::NativeFunction { func, .. } => {
-                                            let func = func.clone();
-                                            drop(method_ref);
-                                            return func(args);
-                                        }
-                                        ObjectKind::Function(_) => {
-                                            drop(method_ref);
-                                            // Call user-defined function with this
-                                            let this = receiver.clone();
-                                            return self.call_function_with_this(&method, args, this);
-                                        }
-                                        _ => {}
+                            if let Value::Object(method_obj) = &method {
+                                let method_ref = method_obj.borrow();
+                                match &method_ref.kind {
+                                    ObjectKind::NativeFunction { func, .. } => {
+                                        let func = func.clone();
+                                        drop(method_ref);
+                                        return func(args);
                                     }
+                                    ObjectKind::Function(_) => {
+                                        drop(method_ref);
+                                        // Call user-defined function with this
+                                        let this = receiver.clone();
+                                        return self.call_function_with_this(&method, args, this);
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
-                        Err(Error::type_error(&format!(
+                        Err(Error::type_error(format!(
                             "'{}' is not a function",
                             method_name
                         )))
@@ -3600,28 +3671,25 @@ impl VM {
                         if let Some(method) = obj_ref.get_property(method_name) {
                             drop(obj_ref);
                             // Method found, call it
-                            match &method {
-                                Value::Object(method_obj) => {
-                                    let method_ref = method_obj.borrow();
-                                    match &method_ref.kind {
-                                        ObjectKind::NativeFunction { func, .. } => {
-                                            let func = func.clone();
-                                            drop(method_ref);
-                                            return func(args);
-                                        }
-                                        ObjectKind::Function(_) => {
-                                            drop(method_ref);
-                                            // Call user-defined function with this
-                                            let this = receiver.clone();
-                                            return self.call_function_with_this(&method, args, this);
-                                        }
-                                        _ => {}
+                            if let Value::Object(method_obj) = &method {
+                                let method_ref = method_obj.borrow();
+                                match &method_ref.kind {
+                                    ObjectKind::NativeFunction { func, .. } => {
+                                        let func = func.clone();
+                                        drop(method_ref);
+                                        return func(args);
                                     }
+                                    ObjectKind::Function(_) => {
+                                        drop(method_ref);
+                                        // Call user-defined function with this
+                                        let this = receiver.clone();
+                                        return self.call_function_with_this(&method, args, this);
+                                    }
+                                    _ => {}
                                 }
-                                _ => {}
                             }
                         }
-                        Err(Error::type_error(&format!(
+                        Err(Error::type_error(format!(
                             "'{}' is not a function",
                             method_name
                         )))
@@ -3630,7 +3698,7 @@ impl VM {
             }
             Value::String(s) => self.call_string_method(s, method_name, args),
             Value::Number(n) => self.call_number_method(*n, method_name, args),
-            _ => Err(Error::type_error(&format!(
+            _ => Err(Error::type_error(format!(
                 "Cannot call method '{}' on {:?}",
                 method_name, receiver
             ))),
@@ -3641,7 +3709,7 @@ impl VM {
         match method_name {
             "toString" => {
                 let radix = args.first().map(|v| v.to_number() as u32).unwrap_or(10);
-                if radix < 2 || radix > 36 {
+                if !(2..=36).contains(&radix) {
                     return Err(Error::range_error("radix must be between 2 and 36"));
                 }
                 if radix == 10 {
@@ -3696,13 +3764,13 @@ impl VM {
             }
             "toPrecision" => {
                 let precision = args.first().map(|v| v.to_number() as usize).unwrap_or(6);
-                if precision < 1 || precision > 100 {
+                if !(1..=100).contains(&precision) {
                     return Err(Error::range_error("toPrecision() argument must be between 1 and 100"));
                 }
                 Ok(Value::String(format!("{:.1$}", n, precision - 1)))
             }
             "valueOf" => Ok(Value::Number(n)),
-            _ => Err(Error::type_error(&format!(
+            _ => Err(Error::type_error(format!(
                 "Number method '{}' not implemented",
                 method_name
             ))),
@@ -4156,7 +4224,7 @@ impl VM {
                     }
                 } else {
                     // Default string comparison sort
-                    sorted.sort_by(|a, b| a.to_js_string().cmp(&b.to_js_string()));
+                    sorted.sort_by_key(|a| a.to_js_string());
                 }
                 Ok(Value::new_array(sorted))
             }
@@ -4203,7 +4271,7 @@ impl VM {
                 };
 
                 if actual_index < 0 || actual_index >= len {
-                    return Err(Error::range_error(&format!(
+                    return Err(Error::range_error(format!(
                         "Invalid index {} for array of length {}",
                         index, len
                     )));
@@ -4317,7 +4385,7 @@ impl VM {
                         let end = if end < 0 {
                             (len + end).max(0) as usize
                         } else {
-                            end.min(len as i64) as usize
+                            end.min(len) as usize
                         };
 
                         // Calculate count
@@ -4384,7 +4452,7 @@ impl VM {
                 };
                 Ok(Value::Object(Rc::new(RefCell::new(iterator))))
             }
-            _ => Err(Error::type_error(&format!(
+            _ => Err(Error::type_error(format!(
                 "Array method '{}' not implemented",
                 method_name
             ))),
@@ -4597,7 +4665,7 @@ impl VM {
                 }
                 Ok(Value::Undefined)
             }
-            _ => Err(Error::type_error(&format!(
+            _ => Err(Error::type_error(format!(
                 "URLSearchParams.{} is not a function",
                 method_name
             ))),
@@ -4888,7 +4956,7 @@ impl VM {
                 // In Rust, strings are always valid UTF-8
                 Ok(Value::String(s.to_string()))
             }
-            _ => Err(Error::type_error(&format!(
+            _ => Err(Error::type_error(format!(
                 "String method '{}' not implemented",
                 method_name
             ))),
@@ -5689,7 +5757,7 @@ impl VM {
                     break;
                 }
                 _ => {
-                    if let Err(_) = collector_vm.execute_single_gen_instruction(opcode) {
+                    if collector_vm.execute_single_gen_instruction(opcode).is_err() {
                         break;
                     }
                 }
@@ -5788,6 +5856,12 @@ impl VM {
                 let name = self.get_constant_string(index)?;
                 let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
                 self.globals.insert(name, value);
+            }
+            Some(Opcode::TryGetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
             }
             Some(Opcode::DefineGlobal) => {
                 let index = self.read_u16()?;
@@ -5897,6 +5971,7 @@ impl VM {
 
     /// Execute a single instruction and return
     /// Returns Some(value) if execution should stop (return/yield), None to continue
+    #[allow(dead_code)]
     fn execute_one_instruction(&mut self) -> Result<Option<Value>> {
         if self.frames.is_empty() {
             return Ok(Some(Value::Undefined));
@@ -6014,6 +6089,12 @@ impl VM {
                 if let Some(frame) = self.frames.last_mut() {
                     frame.ip = (frame.ip as isize + offset as isize) as usize;
                 }
+            }
+            Some(Opcode::TryGetGlobal) => {
+                let index = self.read_u16()?;
+                let name = self.get_constant_string(index)?;
+                let value = self.globals.get(&name).cloned().unwrap_or(Value::Undefined);
+                self.push(value)?;
             }
             Some(Opcode::JumpIfFalse) => {
                 // Use signed relative offset like main VM
