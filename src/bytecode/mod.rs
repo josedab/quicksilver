@@ -3,6 +3,8 @@
 //! This module defines the bytecode format used by the Quicksilver VM.
 //! The bytecode is a register-based format designed for efficient interpretation.
 
+//! **Status:** ✅ Complete — Compiler, opcodes, optimizer — production-ready
+
 mod compiler;
 mod opcode;
 mod optimizer;
@@ -231,6 +233,7 @@ impl Chunk {
             // 2-byte operand (constant index)
             Opcode::Constant
             | Opcode::GetGlobal
+            | Opcode::TryGetGlobal
             | Opcode::SetGlobal
             | Opcode::DefineGlobal
             | Opcode::GetProperty

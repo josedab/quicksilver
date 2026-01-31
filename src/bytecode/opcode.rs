@@ -63,6 +63,10 @@ pub enum Opcode {
     /// Store to register
     /// Operands: register (u8)
     StoreReg = 0x29,
+    /// Load a global variable without throwing ReferenceError if undefined.
+    /// Used by `typeof` to safely check undefined variables.
+    /// Operands: name_index (u16)
+    TryGetGlobal = 0x2A,
 
     // ========== Properties ==========
     /// Get a property by name
@@ -312,6 +316,7 @@ impl Opcode {
             0x27 => Some(Opcode::CloseUpvalue),
             0x28 => Some(Opcode::LoadReg),
             0x29 => Some(Opcode::StoreReg),
+            0x2A => Some(Opcode::TryGetGlobal),
 
             0x30 => Some(Opcode::GetProperty),
             0x31 => Some(Opcode::SetProperty),
@@ -488,6 +493,7 @@ impl Opcode {
             // 2-byte operand
             Opcode::Constant
             | Opcode::GetGlobal
+            | Opcode::TryGetGlobal
             | Opcode::SetGlobal
             | Opcode::DefineGlobal
             | Opcode::GetUpvalue

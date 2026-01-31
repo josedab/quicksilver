@@ -457,6 +457,7 @@ impl Optimizer {
             // 2-byte operand
             Opcode::Constant
             | Opcode::GetGlobal
+            | Opcode::TryGetGlobal
             | Opcode::SetGlobal
             | Opcode::DefineGlobal
             | Opcode::GetProperty

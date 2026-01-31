@@ -2143,6 +2143,19 @@ impl Compiler {
             }
         }
 
+        // typeof <identifier> uses TryGetGlobal to avoid ReferenceError on undefined vars
+        if matches!(unary.operator, UnaryOperator::Typeof) {
+            if let Expression::Identifier(id) = &unary.argument {
+                if self.resolve_local(&id.name).is_none() {
+                    let idx = self.chunk.add_constant(Value::String(id.name.clone()));
+                    self.emit(Opcode::TryGetGlobal);
+                    self.emit_u16(idx);
+                    self.emit(Opcode::Typeof);
+                    return Ok(());
+                }
+            }
+        }
+
         self.compile_expr(&unary.argument)?;
 
         match unary.operator {
