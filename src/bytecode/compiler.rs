@@ -1786,8 +1786,8 @@ impl Compiler {
                 let effect_type_index = self.chunk.add_constant(Value::String(perform_expr.effect_type.clone()));
                 let operation_index = self.chunk.add_constant(Value::String(perform_expr.operation.clone()));
                 self.emit(Opcode::Perform);
-                self.emit_u16(effect_type_index as u16);
-                self.emit_u16(operation_index as u16);
+                self.emit_u16(effect_type_index);
+                self.emit_u16(operation_index);
                 self.emit_byte(perform_expr.arguments.len() as u8);
                 Ok(())
             }
@@ -2126,7 +2126,7 @@ impl Compiler {
                     MemberProperty::Identifier(id) => {
                         let idx = self.chunk.add_constant(Value::String(id.name.clone()));
                         self.emit(Opcode::DeleteProperty);
-                        self.emit_u16(idx as u16);
+                        self.emit_u16(idx);
                     }
                     MemberProperty::Expression(expr) if member.computed => {
                         // For computed properties like delete obj[expr], evaluate the expression
