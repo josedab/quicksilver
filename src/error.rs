@@ -293,6 +293,8 @@ pub enum ErrorKind {
     EvalError,
     /// URIError - malformed URI
     UriError,
+    /// Generic Error - user-thrown Error objects
+    GenericError,
     /// InternalError - internal engine error
     InternalError,
 }
@@ -306,6 +308,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::SyntaxError => write!(f, "SyntaxError"),
             ErrorKind::EvalError => write!(f, "EvalError"),
             ErrorKind::UriError => write!(f, "URIError"),
+            ErrorKind::GenericError => write!(f, "Error"),
             ErrorKind::InternalError => write!(f, "InternalError"),
         }
     }
@@ -513,6 +516,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// These constants provide consistent error messages following JavaScript conventions.
 /// Use the helper functions below to generate formatted error messages.
+#[allow(dead_code)]
 pub mod messages {
     // Type errors
     pub const NOT_A_FUNCTION: &str = "is not a function";
