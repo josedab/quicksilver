@@ -149,6 +149,13 @@ impl Value {
                     }
                     ObjectKind::Function(_) => "[Function]".to_string(),
                     ObjectKind::NativeFunction { name, .. } => format!("[Native: {}]", name),
+                    ObjectKind::Error { name, message } => {
+                        if message.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{}: {}", name, message)
+                        }
+                    }
                     ObjectKind::URL { href, .. } => href.clone(),
                     ObjectKind::URLSearchParams { params } => {
                         params
@@ -323,6 +330,23 @@ impl Value {
             properties: HashMap::default(),
             private_fields: HashMap::default(),
             prototype: None, cached_shape_id: None,
+        })))
+    }
+
+    /// Create a native function Value from a Rust closure
+    pub fn make_native_fn<F>(name: &str, func: F) -> Value
+    where
+        F: Fn(&[Value]) -> crate::Result<Value> + 'static,
+    {
+        Value::Object(Rc::new(RefCell::new(Object {
+            kind: ObjectKind::NativeFunction {
+                name: name.to_string(),
+                func: Rc::new(func),
+            },
+            properties: HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None,
+            cached_shape_id: None,
         })))
     }
 
@@ -880,10 +904,7 @@ impl Object {
 
         // Check URLSearchParams properties
         if let ObjectKind::URLSearchParams { params } = &self.kind {
-            match key {
-                "size" => return Some(Value::Number(params.len() as f64)),
-                _ => {}
-            }
+            if key == "size" { return Some(Value::Number(params.len() as f64)) }
         }
 
         // Check class prototype methods (for instances of classes)
