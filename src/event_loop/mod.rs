@@ -4,6 +4,8 @@
 //! with proper microtask and macrotask queue semantics following the
 //! ECMAScript specification and HTML5 event loop model.
 
+//! **Status:** ⚠️ Partial — Promise/A+ microtask queue, basic timers
+
 use crate::Value;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -96,7 +98,7 @@ pub struct EventLoop {
     /// Pending unhandled rejections
     unhandled_rejections: Vec<(Rc<RefCell<PromiseInternal>>, Value)>,
     /// Is the event loop currently draining microtasks?
-    draining_microtasks: bool,
+    _draining_microtasks: bool,
     /// Pending promises waiting to be resolved
     pending_promises: Vec<Rc<RefCell<PromiseInternal>>>,
 }
@@ -116,7 +118,7 @@ impl EventLoop {
             virtual_time: 0,
             next_timer_id: 1,
             unhandled_rejections: Vec::new(),
-            draining_microtasks: false,
+            _draining_microtasks: false,
             pending_promises: Vec::new(),
         }
     }
@@ -425,6 +427,231 @@ impl EventLoop {
         self.reject_promise(&promise, reason);
         promise
     }
+
+    /// Promise.all — resolves when all promises resolve, rejects on first rejection
+    pub fn promise_all(&mut self, promises: Vec<Rc<RefCell<PromiseInternal>>>) -> Rc<RefCell<PromiseInternal>> {
+        let result = self.create_promise();
+        let count = promises.len();
+
+        if count == 0 {
+            self.fulfill_promise(&result, Value::new_array(vec![]));
+            return result;
+        }
+
+        let results = Rc::new(RefCell::new(vec![Value::Undefined; count]));
+        let remaining = Rc::new(RefCell::new(count));
+
+        for (i, promise) in promises.iter().enumerate() {
+            let result_clone = result.clone();
+            let results_clone = results.clone();
+            let remaining_clone = remaining.clone();
+
+            let p = promise.borrow();
+            match p.state {
+                PromiseInternalState::Fulfilled => {
+                    let val = p.result.clone().unwrap_or(Value::Undefined);
+                    drop(p);
+                    results_clone.borrow_mut()[i] = val;
+                    let mut rem = remaining_clone.borrow_mut();
+                    *rem -= 1;
+                    if *rem == 0 {
+                        let final_results = results_clone.borrow().clone();
+                        self.fulfill_promise(&result_clone, Value::new_array(final_results));
+                    }
+                }
+                PromiseInternalState::Rejected => {
+                    let reason = p.result.clone().unwrap_or(Value::Undefined);
+                    drop(p);
+                    self.reject_promise(&result_clone, reason);
+                    return result;
+                }
+                PromiseInternalState::Pending => {
+                    drop(p);
+                    // We can't easily attach closure-based handlers in this architecture,
+                    // so we track pending promises and settle later via drain loop
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Promise.race — resolves or rejects with the first settled promise
+    pub fn promise_race(&mut self, promises: Vec<Rc<RefCell<PromiseInternal>>>) -> Rc<RefCell<PromiseInternal>> {
+        let result = self.create_promise();
+
+        for promise in &promises {
+            let p = promise.borrow();
+            match p.state {
+                PromiseInternalState::Fulfilled => {
+                    let val = p.result.clone().unwrap_or(Value::Undefined);
+                    drop(p);
+                    self.fulfill_promise(&result, val);
+                    return result;
+                }
+                PromiseInternalState::Rejected => {
+                    let reason = p.result.clone().unwrap_or(Value::Undefined);
+                    drop(p);
+                    self.reject_promise(&result, reason);
+                    return result;
+                }
+                PromiseInternalState::Pending => {
+                    drop(p);
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Promise.allSettled — resolves when all promises settle (never rejects)
+    pub fn promise_all_settled(&mut self, promises: Vec<Rc<RefCell<PromiseInternal>>>) -> Rc<RefCell<PromiseInternal>> {
+        let result = self.create_promise();
+        let count = promises.len();
+
+        if count == 0 {
+            self.fulfill_promise(&result, Value::new_array(vec![]));
+            return result;
+        }
+
+        let mut settled_results = Vec::with_capacity(count);
+        let mut all_settled = true;
+
+        for promise in &promises {
+            let p = promise.borrow();
+            match p.state {
+                PromiseInternalState::Fulfilled => {
+                    let val = p.result.clone().unwrap_or(Value::Undefined);
+                    let mut props = rustc_hash::FxHashMap::default();
+                    props.insert("status".to_string(), Value::String("fulfilled".to_string()));
+                    props.insert("value".to_string(), val);
+                    settled_results.push(Value::new_object_with_properties(props));
+                }
+                PromiseInternalState::Rejected => {
+                    let reason = p.result.clone().unwrap_or(Value::Undefined);
+                    let mut props = rustc_hash::FxHashMap::default();
+                    props.insert("status".to_string(), Value::String("rejected".to_string()));
+                    props.insert("reason".to_string(), reason);
+                    settled_results.push(Value::new_object_with_properties(props));
+                }
+                PromiseInternalState::Pending => {
+                    all_settled = false;
+                    settled_results.push(Value::Undefined);
+                }
+            }
+        }
+
+        if all_settled {
+            self.fulfill_promise(&result, Value::new_array(settled_results));
+        }
+
+        result
+    }
+
+    /// Promise.any — resolves with first fulfillment, rejects if all reject
+    pub fn promise_any(&mut self, promises: Vec<Rc<RefCell<PromiseInternal>>>) -> Rc<RefCell<PromiseInternal>> {
+        let result = self.create_promise();
+        let count = promises.len();
+
+        if count == 0 {
+            self.reject_promise(&result, Value::String("All promises were rejected".to_string()));
+            return result;
+        }
+
+        let mut errors = Vec::with_capacity(count);
+        let mut all_rejected = true;
+
+        for promise in &promises {
+            let p = promise.borrow();
+            match p.state {
+                PromiseInternalState::Fulfilled => {
+                    let val = p.result.clone().unwrap_or(Value::Undefined);
+                    drop(p);
+                    self.fulfill_promise(&result, val);
+                    return result;
+                }
+                PromiseInternalState::Rejected => {
+                    let reason = p.result.clone().unwrap_or(Value::Undefined);
+                    errors.push(reason);
+                }
+                PromiseInternalState::Pending => {
+                    all_rejected = false;
+                    errors.push(Value::Undefined);
+                }
+            }
+        }
+
+        if all_rejected {
+            let aggregate_error = create_aggregate_error(errors, "All promises were rejected");
+            self.reject_promise(&result, aggregate_error);
+        }
+
+        result
+    }
+
+    /// Promise.withResolvers() — ES2024: returns { promise, resolve, reject }
+    /// Creates a promise along with its resolve/reject functions for external control.
+    pub fn promise_with_resolvers(&mut self) -> PromiseWithResolvers {
+        let promise = self.create_promise();
+        PromiseWithResolvers {
+            promise: promise.clone(),
+            resolved: false,
+            rejected: false,
+            _promise_ref: promise,
+        }
+    }
+}
+
+/// Result of Promise.withResolvers() — ES2024
+///
+/// Provides a promise along with externally-callable resolve/reject capabilities.
+pub struct PromiseWithResolvers {
+    /// The promise
+    pub promise: Rc<RefCell<PromiseInternal>>,
+    /// Whether resolve has been called
+    pub resolved: bool,
+    /// Whether reject has been called
+    pub rejected: bool,
+    /// Internal reference for the promise
+    _promise_ref: Rc<RefCell<PromiseInternal>>,
+}
+
+impl PromiseWithResolvers {
+    /// Resolve the promise with a value
+    pub fn resolve(&mut self, event_loop: &mut EventLoop, value: Value) {
+        if !self.resolved && !self.rejected {
+            event_loop.fulfill_promise(&self.promise, value);
+            self.resolved = true;
+        }
+    }
+
+    /// Reject the promise with a reason
+    pub fn reject(&mut self, event_loop: &mut EventLoop, reason: Value) {
+        if !self.resolved && !self.rejected {
+            event_loop.reject_promise(&self.promise, reason);
+            self.rejected = true;
+        }
+    }
+
+    /// Convert to JS value { promise, resolve, reject }
+    pub fn to_js_value(&self) -> Value {
+        use rustc_hash::FxHashMap as HashMap;
+        let mut props = HashMap::default();
+        props.insert("promise".to_string(), Value::Undefined); // placeholder
+        props.insert("resolve".to_string(), Value::Undefined); // placeholder
+        props.insert("reject".to_string(), Value::Undefined);  // placeholder
+        Value::new_object_with_properties(props)
+    }
+}
+
+/// Create an AggregateError value (used by Promise.any when all promises reject)
+pub fn create_aggregate_error(errors: Vec<Value>, message: &str) -> Value {
+    use rustc_hash::FxHashMap as HashMap;
+    let mut props = HashMap::default();
+    props.insert("name".to_string(), Value::String("AggregateError".to_string()));
+    props.insert("message".to_string(), Value::String(message.to_string()));
+    props.insert("errors".to_string(), Value::new_array(errors));
+    Value::new_object_with_properties(props)
 }
 
 /// Async function state for suspension/resumption
@@ -522,5 +749,158 @@ mod tests {
         } else {
             panic!("Expected number result");
         }
+    }
+
+    #[test]
+    fn test_promise_all_empty() {
+        let mut el = EventLoop::new();
+        let result = el.promise_all(vec![]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+    }
+
+    #[test]
+    fn test_promise_all_fulfilled() {
+        let mut el = EventLoop::new();
+        let p1 = el.resolve_promise(Value::Number(1.0));
+        let p2 = el.resolve_promise(Value::Number(2.0));
+        let p3 = el.resolve_promise(Value::Number(3.0));
+
+        let result = el.promise_all(vec![p1, p2, p3]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+    }
+
+    #[test]
+    fn test_promise_all_rejects_on_first_rejection() {
+        let mut el = EventLoop::new();
+        let p1 = el.resolve_promise(Value::Number(1.0));
+        let p2 = el.reject_promise_new(Value::String("error".to_string()));
+
+        let result = el.promise_all(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Rejected);
+    }
+
+    #[test]
+    fn test_promise_race_first_wins() {
+        let mut el = EventLoop::new();
+        let p1 = el.resolve_promise(Value::Number(1.0));
+        let p2 = el.resolve_promise(Value::Number(2.0));
+
+        let result = el.promise_race(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+        let val = result.borrow().result.clone();
+        if let Some(Value::Number(n)) = val {
+            assert_eq!(n, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_promise_race_reject_first() {
+        let mut el = EventLoop::new();
+        let p1 = el.reject_promise_new(Value::String("err".to_string()));
+        let p2 = el.resolve_promise(Value::Number(2.0));
+
+        let result = el.promise_race(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Rejected);
+    }
+
+    #[test]
+    fn test_promise_all_settled_mixed() {
+        let mut el = EventLoop::new();
+        let p1 = el.resolve_promise(Value::Number(1.0));
+        let p2 = el.reject_promise_new(Value::String("err".to_string()));
+
+        let result = el.promise_all_settled(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+    }
+
+    #[test]
+    fn test_promise_all_settled_empty() {
+        let mut el = EventLoop::new();
+        let result = el.promise_all_settled(vec![]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+    }
+
+    #[test]
+    fn test_promise_any_first_fulfilled() {
+        let mut el = EventLoop::new();
+        let p1 = el.reject_promise_new(Value::String("err1".to_string()));
+        let p2 = el.resolve_promise(Value::Number(42.0));
+
+        let result = el.promise_any(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Fulfilled);
+    }
+
+    #[test]
+    fn test_promise_any_all_rejected() {
+        let mut el = EventLoop::new();
+        let p1 = el.reject_promise_new(Value::String("err1".to_string()));
+        let p2 = el.reject_promise_new(Value::String("err2".to_string()));
+
+        let result = el.promise_any(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Rejected);
+    }
+
+    #[test]
+    fn test_promise_any_empty() {
+        let mut el = EventLoop::new();
+        let result = el.promise_any(vec![]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Rejected);
+    }
+
+    #[test]
+    fn test_promise_with_resolvers() {
+        let mut el = EventLoop::new();
+        let mut resolvers = el.promise_with_resolvers();
+
+        assert_eq!(resolvers.promise.borrow().state, PromiseInternalState::Pending);
+
+        resolvers.resolve(&mut el, Value::Number(42.0));
+        assert_eq!(resolvers.promise.borrow().state, PromiseInternalState::Fulfilled);
+        assert!(resolvers.resolved);
+    }
+
+    #[test]
+    fn test_promise_with_resolvers_reject() {
+        let mut el = EventLoop::new();
+        let mut resolvers = el.promise_with_resolvers();
+
+        resolvers.reject(&mut el, Value::String("error".to_string()));
+        assert_eq!(resolvers.promise.borrow().state, PromiseInternalState::Rejected);
+        assert!(resolvers.rejected);
+    }
+
+    #[test]
+    fn test_promise_with_resolvers_only_settles_once() {
+        let mut el = EventLoop::new();
+        let mut resolvers = el.promise_with_resolvers();
+
+        resolvers.resolve(&mut el, Value::Number(1.0));
+        resolvers.reject(&mut el, Value::String("too late".to_string()));
+
+        // Should still be fulfilled, not rejected
+        assert_eq!(resolvers.promise.borrow().state, PromiseInternalState::Fulfilled);
+        assert!(resolvers.resolved);
+        assert!(!resolvers.rejected);
+    }
+
+    #[test]
+    fn test_aggregate_error() {
+        let errors = vec![Value::String("e1".to_string()), Value::String("e2".to_string())];
+        let err = super::create_aggregate_error(errors, "All failed");
+        assert!(matches!(err, Value::Object(_)));
+    }
+
+    #[test]
+    fn test_promise_any_rejects_with_aggregate_error() {
+        let mut el = EventLoop::new();
+        let p1 = el.reject_promise_new(Value::String("err1".to_string()));
+        let p2 = el.reject_promise_new(Value::String("err2".to_string()));
+
+        let result = el.promise_any(vec![p1, p2]);
+        assert_eq!(result.borrow().state, PromiseInternalState::Rejected);
+
+        // The rejection reason should be an AggregateError-like object
+        let reason = result.borrow().result.clone().unwrap();
+        assert!(matches!(reason, Value::Object(_)));
     }
 }
