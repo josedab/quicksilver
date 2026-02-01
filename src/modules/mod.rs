@@ -22,11 +22,18 @@
 //! ```
 
 use crate::ast::{ExportKind, ExportSpecifier, ImportDeclaration, ImportSpecifier, Program, Statement};
+use crate::npm::{PackageExports, PackageJson};
 use crate::parser::parse;
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
+
+/// Extensions to try when resolving a path without an extension
+const RESOLVE_EXTENSIONS: &[&str] = &["js", "mjs", "ts", "json"];
+
+/// Index filenames to try when resolving a directory
+const INDEX_FILES: &[&str] = &["index.js", "index.mjs", "index.ts"];
 
 /// Module loading error
 #[derive(Debug, Clone)]
@@ -158,6 +165,182 @@ impl Module {
     }
 }
 
+/// Import map for bare specifier remapping (WICG Import Maps spec)
+#[derive(Debug, Clone, Default)]
+pub struct ImportMap {
+    /// Direct specifier → URL/path mappings
+    pub imports: HashMap<String, String>,
+    /// Scoped mappings: scope prefix → { specifier → URL }
+    pub scopes: HashMap<String, HashMap<String, String>>,
+}
+
+impl ImportMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse an import map from a JSON string
+    pub fn from_json(json: &str) -> ModuleResult<Self> {
+        let value: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| ModuleError::ResolutionFailed(format!("Invalid import map JSON: {}", e)))?;
+
+        let mut map = Self::new();
+
+        if let Some(imports) = value.get("imports").and_then(|v| v.as_object()) {
+            for (key, val) in imports {
+                if let Some(target) = val.as_str() {
+                    map.imports.insert(key.clone(), target.to_string());
+                }
+            }
+        }
+
+        if let Some(scopes) = value.get("scopes").and_then(|v| v.as_object()) {
+            for (scope, mappings) in scopes {
+                if let Some(obj) = mappings.as_object() {
+                    let mut scope_map = HashMap::default();
+                    for (key, val) in obj {
+                        if let Some(target) = val.as_str() {
+                            scope_map.insert(key.clone(), target.to_string());
+                        }
+                    }
+                    map.scopes.insert(scope.clone(), scope_map);
+                }
+            }
+        }
+
+        Ok(map)
+    }
+
+    /// Resolve a specifier using the import map
+    pub fn resolve(&self, specifier: &str, referrer: Option<&Path>) -> Option<String> {
+        // Check scoped mappings first (most specific wins)
+        if let Some(referrer) = referrer {
+            let referrer_str = referrer.to_string_lossy();
+            for (scope, mappings) in &self.scopes {
+                if referrer_str.starts_with(scope.as_str()) {
+                    // Exact match
+                    if let Some(target) = mappings.get(specifier) {
+                        return Some(target.clone());
+                    }
+                    // Prefix match (for path-like mappings ending with /)
+                    for (prefix, target) in mappings {
+                        if prefix.ends_with('/') && specifier.starts_with(prefix.as_str()) {
+                            let suffix = &specifier[prefix.len()..];
+                            return Some(format!("{}{}", target, suffix));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check top-level imports
+        if let Some(target) = self.imports.get(specifier) {
+            return Some(target.clone());
+        }
+
+        // Prefix match for top-level imports
+        for (prefix, target) in &self.imports {
+            if prefix.ends_with('/') && specifier.starts_with(prefix.as_str()) {
+                let suffix = &specifier[prefix.len()..];
+                return Some(format!("{}{}", target, suffix));
+            }
+        }
+
+        None
+    }
+}
+
+/// Result of a dynamic import() call
+#[derive(Debug, Clone)]
+pub struct DynamicImportResult {
+    /// The namespace object containing all exports
+    pub namespace: Value,
+    /// Module ID
+    pub module_id: String,
+}
+
+/// import.meta object for a module
+#[derive(Debug, Clone)]
+pub struct ImportMeta {
+    /// The URL/path of the current module
+    pub url: String,
+    /// The directory of the current module
+    pub dirname: String,
+    /// The filename of the current module
+    pub filename: String,
+    /// Whether this is the main (entry) module
+    pub main: bool,
+    /// Custom resolve function placeholder
+    pub resolve: Option<String>,
+}
+
+impl ImportMeta {
+    /// Create import.meta for a module path
+    pub fn from_path(path: &Path, is_main: bool) -> Self {
+        let url = format!("file://{}", path.to_string_lossy());
+        let dirname = path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let filename = path.to_string_lossy().to_string();
+
+        Self {
+            url,
+            dirname,
+            filename,
+            main: is_main,
+            resolve: None,
+        }
+    }
+
+    /// Convert to a JavaScript Value object
+    pub fn to_js_value(&self) -> Value {
+        let mut props = HashMap::default();
+        props.insert("url".to_string(), Value::String(self.url.clone()));
+        props.insert("dirname".to_string(), Value::String(self.dirname.clone()));
+        props.insert("filename".to_string(), Value::String(self.filename.clone()));
+        props.insert("main".to_string(), Value::Boolean(self.main));
+        Value::new_object_with_properties(props)
+    }
+}
+
+/// Tracks which module is the entry point for import.meta.main
+#[derive(Debug, Clone, Default)]
+pub struct ModuleRegistry {
+    /// The entry module path
+    pub entry_module: Option<PathBuf>,
+    /// All loaded module paths in order
+    pub load_order: Vec<PathBuf>,
+}
+
+impl ModuleRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the entry module (the first module loaded via CLI)
+    pub fn set_entry(&mut self, path: PathBuf) {
+        self.entry_module = Some(path);
+    }
+
+    /// Check if a module is the entry module
+    pub fn is_entry(&self, path: &Path) -> bool {
+        self.entry_module.as_deref() == Some(path)
+    }
+
+    /// Record a module load
+    pub fn record_load(&mut self, path: PathBuf) {
+        if !self.load_order.contains(&path) {
+            self.load_order.push(path);
+        }
+    }
+
+    /// Get import.meta for a module
+    pub fn import_meta_for(&self, path: &Path) -> ImportMeta {
+        ImportMeta::from_path(path, self.is_entry(path))
+    }
+}
+
 /// Module loader and cache
 #[derive(Debug)]
 pub struct ModuleLoader {
@@ -167,6 +350,8 @@ pub struct ModuleLoader {
     loading: Arc<RwLock<Vec<String>>>,
     /// Base directory for resolution
     base_dir: PathBuf,
+    /// Import map for bare specifier remapping
+    import_map: Option<ImportMap>,
 }
 
 impl ModuleLoader {
@@ -176,6 +361,7 @@ impl ModuleLoader {
             modules: Arc::new(RwLock::new(HashMap::default())),
             loading: Arc::new(RwLock::new(Vec::new())),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            import_map: None,
         }
     }
 
@@ -185,11 +371,38 @@ impl ModuleLoader {
             modules: Arc::new(RwLock::new(HashMap::default())),
             loading: Arc::new(RwLock::new(Vec::new())),
             base_dir,
+            import_map: None,
         }
+    }
+
+    /// Set the import map for bare specifier remapping
+    pub fn set_import_map(&mut self, import_map: ImportMap) {
+        self.import_map = Some(import_map);
+    }
+
+    /// Load an import map from a JSON file path
+    pub fn load_import_map(&mut self, path: &Path) -> ModuleResult<()> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|e| ModuleError::IoError(e.to_string()))?;
+        let import_map = ImportMap::from_json(&contents)?;
+        self.import_map = Some(import_map);
+        Ok(())
     }
 
     /// Resolve a module specifier to an absolute path
     pub fn resolve(&self, specifier: &str, referrer: Option<&Path>) -> ModuleResult<PathBuf> {
+        // Check import map first for remapping
+        let resolved_specifier = if let Some(ref import_map) = self.import_map {
+            if let Some(mapped) = import_map.resolve(specifier, referrer) {
+                mapped
+            } else {
+                specifier.to_string()
+            }
+        } else {
+            specifier.to_string()
+        };
+        let specifier = &resolved_specifier;
+
         // Determine base directory for resolution
         let base = referrer
             .and_then(|p| p.parent())
@@ -197,42 +410,144 @@ impl ModuleLoader {
 
         if specifier.starts_with("./") || specifier.starts_with("../") {
             // Relative import
-            let mut path = base.join(specifier);
-
-            // Try with .js extension if not present
-            if !path.exists() && path.extension().is_none() {
-                path.set_extension("js");
-            }
-
-            // Try as directory with index.js
-            if !path.exists() {
-                let index_path = PathBuf::from(specifier).join("index.js");
-                let full_index = base.join(&index_path);
-                if full_index.exists() {
-                    return Ok(full_index.canonicalize().map_err(|e| ModuleError::IoError(e.to_string()))?);
-                }
-            }
-
-            if path.exists() {
-                path.canonicalize().map_err(|e| ModuleError::IoError(e.to_string()))
-            } else {
-                Err(ModuleError::NotFound(specifier.to_string()))
-            }
+            let path = base.join(specifier);
+            self.try_resolve_path(&path)
+                .ok_or_else(|| ModuleError::NotFound(specifier.to_string()))
         } else if specifier.starts_with('/') {
             // Absolute import
             let path = PathBuf::from(specifier);
-            if path.exists() {
-                path.canonicalize().map_err(|e| ModuleError::IoError(e.to_string()))
-            } else {
-                Err(ModuleError::NotFound(specifier.to_string()))
-            }
+            self.try_resolve_path(&path)
+                .ok_or_else(|| ModuleError::NotFound(specifier.to_string()))
         } else {
-            // Bare specifier (node_modules style) - simplified
-            // In a full implementation, this would search node_modules
-            Err(ModuleError::ResolutionFailed(format!(
-                "Bare specifiers not yet supported: {}",
-                specifier
-            )))
+            // Bare specifier (node_modules traversal)
+            self.resolve_bare_specifier(specifier, base)
+                .ok_or_else(|| ModuleError::ResolutionFailed(format!(
+                    "Cannot find module '{}' in node_modules",
+                    specifier
+                )))
+        }
+    }
+
+    /// Try to resolve a file path, attempting extensions and index files
+    fn try_resolve_path(&self, path: &Path) -> Option<PathBuf> {
+        // 1. Try exact path
+        if path.is_file() {
+            return path.canonicalize().ok();
+        }
+
+        // 2. Try with extensions (only if path has no extension)
+        if path.extension().is_none() {
+            for ext in RESOLVE_EXTENSIONS {
+                let with_ext = path.with_extension(ext);
+                if with_ext.is_file() {
+                    return with_ext.canonicalize().ok();
+                }
+            }
+        }
+
+        // 3. Try as directory with index files
+        if path.is_dir() {
+            return self.try_index_files(path);
+        }
+
+        None
+    }
+
+    /// Try to resolve index files in a directory
+    fn try_index_files(&self, dir: &Path) -> Option<PathBuf> {
+        for name in INDEX_FILES {
+            let index = dir.join(name);
+            if index.is_file() {
+                return index.canonicalize().ok();
+            }
+        }
+        None
+    }
+
+    /// Resolve a bare specifier by walking up node_modules directories
+    fn resolve_bare_specifier(&self, specifier: &str, base: &Path) -> Option<PathBuf> {
+        let mut dir = Some(base.to_path_buf());
+        while let Some(current) = dir {
+            let pkg_dir = current.join("node_modules").join(specifier);
+
+            // 1. Check package.json for entry point
+            let pkg_json_path = pkg_dir.join("package.json");
+            if pkg_json_path.is_file() {
+                if let Some(resolved) = self.resolve_via_package_json(&pkg_dir, &pkg_json_path) {
+                    return Some(resolved);
+                }
+            }
+
+            // 2. Try index files in the package directory
+            if let Some(resolved) = self.try_index_files(&pkg_dir) {
+                return Some(resolved);
+            }
+
+            // 3. Try as a file with extensions (e.g. node_modules/specifier.js)
+            let file_path = current.join("node_modules").join(specifier);
+            if file_path.is_file() {
+                return file_path.canonicalize().ok();
+            }
+            if file_path.extension().is_none() {
+                for ext in RESOLVE_EXTENSIONS {
+                    let with_ext = file_path.with_extension(ext);
+                    if with_ext.is_file() {
+                        return with_ext.canonicalize().ok();
+                    }
+                }
+            }
+
+            dir = current.parent().map(Path::to_path_buf);
+        }
+        None
+    }
+
+    /// Resolve a module entry point via its package.json
+    fn resolve_via_package_json(&self, pkg_dir: &Path, pkg_json_path: &Path) -> Option<PathBuf> {
+        let contents = std::fs::read_to_string(pkg_json_path).ok()?;
+        let pkg = PackageJson::parse(&contents).ok()?;
+
+        // Check "exports" field first
+        if let Some(ref exports) = pkg.exports {
+            if let Some(entry) = Self::resolve_exports(exports) {
+                let entry_path = pkg_dir.join(&entry);
+                if let Some(resolved) = self.try_resolve_path(&entry_path) {
+                    return Some(resolved);
+                }
+            }
+        }
+
+        // Then "module" field (ESM preference)
+        if let Some(ref module) = pkg.module {
+            let entry_path = pkg_dir.join(module);
+            if let Some(resolved) = self.try_resolve_path(&entry_path) {
+                return Some(resolved);
+            }
+        }
+
+        // Then "main" field
+        if let Some(ref main) = pkg.main {
+            let entry_path = pkg_dir.join(main);
+            if let Some(resolved) = self.try_resolve_path(&entry_path) {
+                return Some(resolved);
+            }
+        }
+
+        None
+    }
+
+    /// Resolve the "exports" field of package.json
+    fn resolve_exports(exports: &PackageExports) -> Option<String> {
+        match exports {
+            PackageExports::Path(s) => Some(s.clone()),
+            PackageExports::Conditional(map) => {
+                map.get("import")
+                    .or_else(|| map.get("default"))
+                    .cloned()
+            }
+            PackageExports::Subpaths(map) => {
+                map.get(".").and_then(Self::resolve_exports)
+            }
         }
     }
 
@@ -285,6 +600,15 @@ impl ModuleLoader {
         }
 
         Ok(module)
+    }
+
+    /// Dynamic import() — loads a module at runtime and returns its namespace
+    pub fn dynamic_import(&self, specifier: &str, referrer: Option<&Path>) -> ModuleResult<DynamicImportResult> {
+        let module = self.load(specifier, referrer)?;
+        Ok(DynamicImportResult {
+            namespace: module.namespace_object(),
+            module_id: module.id.clone(),
+        })
     }
 
     /// Get a cached module
@@ -802,5 +1126,343 @@ mod tests {
 
         // Initially should not be called
         assert!(!called.load(Ordering::SeqCst));
+    }
+
+    // ==================== Extended Resolution Tests ====================
+
+    #[test]
+    fn test_resolve_mjs_extension() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.mjs"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./lib", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("lib.mjs"));
+    }
+
+    #[test]
+    fn test_resolve_ts_extension() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.ts"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./lib", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("lib.ts"));
+    }
+
+    #[test]
+    fn test_resolve_json_extension() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./config", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("config.json"));
+    }
+
+    #[test]
+    fn test_resolve_js_preferred_over_mjs() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("lib.js"), "export const x = 1;").unwrap();
+        fs::write(dir.path().join("lib.mjs"), "export const x = 2;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./lib", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("lib.js"));
+    }
+
+    #[test]
+    fn test_resolve_index_mjs() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("mylib");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("index.mjs"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./mylib", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("index.mjs"));
+    }
+
+    #[test]
+    fn test_resolve_index_ts() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("mylib");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("index.ts"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("./mylib", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("index.ts"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_with_main() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("my-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"my-pkg","main":"lib/entry.js"}"#).unwrap();
+        let lib = nm.join("lib");
+        fs::create_dir(&lib).unwrap();
+        fs::write(lib.join("entry.js"), "module.exports = {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("my-pkg", None).unwrap();
+        assert!(resolved.to_string_lossy().contains("entry.js"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_with_module_field() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("esm-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"esm-pkg","main":"index.cjs","module":"index.mjs"}"#).unwrap();
+        fs::write(nm.join("index.cjs"), "module.exports = {};").unwrap();
+        fs::write(nm.join("index.mjs"), "export default {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("esm-pkg", None).unwrap();
+        // Should prefer "module" over "main"
+        assert!(resolved.to_string_lossy().ends_with("index.mjs"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_index_js() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("simple-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("index.js"), "module.exports = {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("simple-pkg", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("index.js"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_file_with_ext() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("single-file.js"), "module.exports = {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("single-file", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("single-file.js"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_walks_up() {
+        let dir = tempdir().unwrap();
+        // Create node_modules at root
+        let nm = dir.path().join("node_modules").join("root-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("index.js"), "module.exports = {};").unwrap();
+
+        // Create a nested directory as the referrer
+        let nested = dir.path().join("src").join("deep");
+        fs::create_dir_all(&nested).unwrap();
+        let referrer = nested.join("app.js");
+        fs::write(&referrer, "").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("root-pkg", Some(&referrer)).unwrap();
+        assert!(resolved.to_string_lossy().contains("root-pkg"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_exports_path() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("exports-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"exports-pkg","exports":"./dist/index.js"}"#).unwrap();
+        let dist = nm.join("dist");
+        fs::create_dir(&dist).unwrap();
+        fs::write(dist.join("index.js"), "export default {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("exports-pkg", None).unwrap();
+        assert!(resolved.to_string_lossy().contains("dist"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_exports_conditional() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("cond-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"cond-pkg","exports":{"import":"./esm/index.js","default":"./cjs/index.js"}}"#).unwrap();
+        let esm = nm.join("esm");
+        fs::create_dir(&esm).unwrap();
+        fs::write(esm.join("index.js"), "export default {};").unwrap();
+        let cjs = nm.join("cjs");
+        fs::create_dir(&cjs).unwrap();
+        fs::write(cjs.join("index.js"), "module.exports = {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("cond-pkg", None).unwrap();
+        // Should prefer "import" condition
+        assert!(resolved.to_string_lossy().contains("esm"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_exports_default_fallback() {
+        let dir = tempdir().unwrap();
+        let nm = dir.path().join("node_modules").join("def-pkg");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("package.json"), r#"{"name":"def-pkg","exports":{"default":"./lib.js"}}"#).unwrap();
+        fs::write(nm.join("lib.js"), "export default {};").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let resolved = loader.resolve("def-pkg", None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("lib.js"));
+    }
+
+    #[test]
+    fn test_resolve_bare_specifier_not_found() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let result = loader.resolve("nonexistent-pkg", None);
+        assert!(matches!(result, Err(ModuleError::ResolutionFailed(_))));
+    }
+
+    #[test]
+    fn test_resolve_absolute_with_extension_resolution() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("abs.ts"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::new();
+        let full_path = dir.path().join("abs");
+        let resolved = loader.resolve(&full_path.to_string_lossy(), None).unwrap();
+        assert!(resolved.to_string_lossy().ends_with("abs.ts"));
+    }
+
+    // ==================== Import Map Tests ====================
+
+    #[test]
+    fn test_import_map_basic() {
+        let map = ImportMap::from_json(r#"{
+            "imports": {
+                "lodash": "./node_modules/lodash-es/lodash.js",
+                "react": "./vendor/react.js"
+            }
+        }"#).unwrap();
+
+        assert_eq!(map.resolve("lodash", None), Some("./node_modules/lodash-es/lodash.js".to_string()));
+        assert_eq!(map.resolve("react", None), Some("./vendor/react.js".to_string()));
+        assert_eq!(map.resolve("unknown", None), None);
+    }
+
+    #[test]
+    fn test_import_map_prefix() {
+        let map = ImportMap::from_json(r#"{
+            "imports": {
+                "lodash/": "./node_modules/lodash-es/"
+            }
+        }"#).unwrap();
+
+        assert_eq!(
+            map.resolve("lodash/clone", None),
+            Some("./node_modules/lodash-es/clone".to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_map_scoped() {
+        let map = ImportMap::from_json(r#"{
+            "imports": { "lodash": "./vendor/lodash.js" },
+            "scopes": {
+                "/src/special/": { "lodash": "./vendor/lodash-custom.js" }
+            }
+        }"#).unwrap();
+
+        // Without scope, uses top-level
+        assert_eq!(map.resolve("lodash", None), Some("./vendor/lodash.js".to_string()));
+
+        // With matching scope, uses scoped mapping
+        let referrer = Path::new("/src/special/app.js");
+        assert_eq!(
+            map.resolve("lodash", Some(referrer)),
+            Some("./vendor/lodash-custom.js".to_string())
+        );
+    }
+
+    #[test]
+    fn test_import_map_integration_with_loader() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("vendor-lib.js"), "export const x = 42;").unwrap();
+
+        let mut loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let mut imports = HashMap::default();
+        imports.insert("my-lib".to_string(), "./vendor-lib.js".to_string());
+        loader.set_import_map(ImportMap { imports, scopes: HashMap::default() });
+
+        // Should resolve bare specifier via import map
+        let resolved = loader.resolve("my-lib", None).unwrap();
+        assert!(resolved.to_string_lossy().contains("vendor-lib.js"));
+    }
+
+    // ==================== Dynamic Import Tests ====================
+
+    #[test]
+    fn test_dynamic_import() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("dynamic.js"), "export const val = 99;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let result = loader.dynamic_import("./dynamic.js", None).unwrap();
+        assert!(!result.module_id.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_import_not_found() {
+        let dir = tempdir().unwrap();
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let result = loader.dynamic_import("./missing.js", None);
+        assert!(result.is_err());
+    }
+
+    // ==================== import.meta Tests ====================
+
+    #[test]
+    fn test_import_meta_from_path() {
+        let path = Path::new("/src/app.js");
+        let meta = ImportMeta::from_path(path, true);
+        assert_eq!(meta.url, "file:///src/app.js");
+        assert_eq!(meta.dirname, "/src");
+        assert_eq!(meta.filename, "/src/app.js");
+        assert!(meta.main);
+    }
+
+    #[test]
+    fn test_import_meta_non_main() {
+        let path = Path::new("/src/utils.js");
+        let meta = ImportMeta::from_path(path, false);
+        assert!(!meta.main);
+    }
+
+    #[test]
+    fn test_import_meta_to_js_value() {
+        let path = Path::new("/src/app.js");
+        let meta = ImportMeta::from_path(path, true);
+        let value = meta.to_js_value();
+        assert!(matches!(value, Value::Object(_)));
+    }
+
+    #[test]
+    fn test_module_registry() {
+        let mut registry = ModuleRegistry::new();
+        let entry = PathBuf::from("/src/main.js");
+        let dep = PathBuf::from("/src/utils.js");
+
+        registry.set_entry(entry.clone());
+        registry.record_load(entry.clone());
+        registry.record_load(dep.clone());
+
+        assert!(registry.is_entry(&entry));
+        assert!(!registry.is_entry(&dep));
+        assert_eq!(registry.load_order.len(), 2);
+
+        let meta = registry.import_meta_for(&entry);
+        assert!(meta.main);
+        let meta = registry.import_meta_for(&dep);
+        assert!(!meta.main);
     }
 }
