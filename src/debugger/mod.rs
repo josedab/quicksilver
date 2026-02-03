@@ -36,12 +36,16 @@
 //! - Variable inspection at any point in time
 //! - Find when variables changed
 
+//! **Status:** ✅ Complete — Time-travel debugger with DAP protocol and TUI
+
 pub mod dap;
 pub mod server;
+pub mod sourcemap;
 pub mod ui;
 
 pub use dap::{DAPServer, DAPMessage, DAPRequest, DAPResponse, DAPEvent, Capabilities};
 pub use server::{DebugServer, DEFAULT_PORT};
+pub use sourcemap::{SourceMap, SourceMapRegistry, OriginalPosition, GeneratedPosition};
 pub use ui::{DebuggerUI, CallStack, CallFrame, VariableDiff, ChangeType, Timeline, ExecutionHeatMap};
 
 use crate::bytecode::Opcode;

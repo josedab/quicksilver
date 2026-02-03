@@ -248,12 +248,14 @@ fn handle_connection(
 
     // Route the request
     match (method, path) {
+        ("OPTIONS", _) => send_cors_preflight(&mut stream),
         ("GET", "/") => send_html(&mut stream, &get_web_ui()),
         ("GET", "/api/state") => handle_get_state(&mut stream, debugger),
         ("GET", "/api/current") => handle_get_current(&mut stream, debugger),
         ("GET", "/api/history") => handle_get_history(&mut stream, debugger),
         ("GET", "/api/source") => handle_get_source(&mut stream, debugger),
         ("GET", "/api/breakpoints") => handle_get_breakpoints(&mut stream, debugger),
+        ("GET", "/json") | ("GET", "/json/list") => handle_cdp_discover(&mut stream, debugger),
         ("POST", "/api/step/next") => handle_step_next(&mut stream, debugger),
         ("POST", "/api/step/back") => handle_step_back(&mut stream, debugger),
         ("POST", "/api/breakpoints") => handle_add_breakpoint(&mut stream, debugger, &body),
@@ -321,6 +323,53 @@ fn send_error(stream: &mut TcpStream, code: u16, message: &str) -> std::io::Resu
     );
     stream.write_all(response.as_bytes())?;
     stream.flush()
+}
+
+fn send_cors_preflight(stream: &mut TcpStream) -> std::io::Result<()> {
+    let response = "HTTP/1.1 204 No Content\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Access-Control-Max-Age: 86400\r\n\
+         Content-Length: 0\r\n\
+         \r\n";
+    stream.write_all(response.as_bytes())?;
+    stream.flush()
+}
+
+/// Chrome DevTools Protocol discovery endpoint (`/json` and `/json/list`).
+/// Returns a target descriptor compatible with Chrome DevTools.
+fn handle_cdp_discover(
+    stream: &mut TcpStream,
+    debugger: &Rc<RefCell<TimeTravelDebugger>>,
+) -> std::io::Result<()> {
+    let dbg = debugger.borrow();
+    let info = dbg.recording_info();
+    let target = CdpTarget {
+        description: "Quicksilver JavaScript runtime".to_string(),
+        devtools_frontend_url: String::new(),
+        id: "quicksilver-main".to_string(),
+        title: if info.filename.is_empty() { "quicksilver".to_string() } else { info.filename.clone() },
+        target_type: "node".to_string(),
+        url: info.filename,
+        websocket_debugger_url: String::new(),
+    };
+    send_json(stream, &vec![target])
+}
+
+/// Minimal Chrome DevTools Protocol target descriptor.
+#[derive(Debug, Serialize)]
+struct CdpTarget {
+    pub description: String,
+    #[serde(rename = "devtoolsFrontendUrl")]
+    pub devtools_frontend_url: String,
+    pub id: String,
+    pub title: String,
+    #[serde(rename = "type")]
+    pub target_type: String,
+    pub url: String,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    pub websocket_debugger_url: String,
 }
 
 fn handle_get_state(
@@ -951,5 +1000,30 @@ mod tests {
         let debugger = TimeTravelDebugger::new();
         let server = DebugServer::new(debugger, 9229);
         assert_eq!(server.url(), "http://localhost:9229");
+    }
+
+    #[test]
+    fn test_cdp_target_serialization() {
+        let target = CdpTarget {
+            description: "test".to_string(),
+            devtools_frontend_url: String::new(),
+            id: "t1".to_string(),
+            title: "main.js".to_string(),
+            target_type: "node".to_string(),
+            url: "main.js".to_string(),
+            websocket_debugger_url: String::new(),
+        };
+        let json = serde_json::to_string(&target).unwrap();
+        assert!(json.contains("\"type\":\"node\""));
+        assert!(json.contains("\"devtoolsFrontendUrl\""));
+        assert!(json.contains("\"webSocketDebuggerUrl\""));
+    }
+
+    #[test]
+    fn test_api_response_data() {
+        let resp: ApiResponse<Vec<String>> = ApiResponse::success(vec!["a".into(), "b".into()]);
+        assert!(resp.success);
+        assert_eq!(resp.data.unwrap().len(), 2);
+        assert!(resp.error.is_none());
     }
 }
