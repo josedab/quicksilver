@@ -71,6 +71,9 @@ tempfile = "3.10"
 name = "quicksilver"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
 [[bench]]
 name = "runtime_benchmarks"
 harness = false

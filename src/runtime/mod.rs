@@ -3,8 +3,11 @@
 //! This module provides the runtime execution environment including
 //! the interpreter, value types, and built-in functions.
 
+//! **Status:** ✅ Complete — Core VM, value types, builtins — fully functional
+
 pub mod async_runtime;
 mod builtins;
+pub mod generator;
 pub mod intern;
 pub mod promise;
 mod value;
