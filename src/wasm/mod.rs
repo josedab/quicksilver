@@ -3,18 +3,23 @@
 //! Bidirectional WASM support: run WASM modules from JavaScript and
 //! compile JavaScript to WASM for maximum portability.
 //!
-//! # Example
-//! ```text
-//! // Load and instantiate a WASM module
-//! const wasmModule = await WebAssembly.instantiate(wasmBytes, {
-//!   env: {
-//!     log: (ptr, len) => console.log(readString(ptr, len))
-//!   }
-//! });
-//!
-//! // Call exported function
-//! const result = wasmModule.exports.fibonacci(10);
-//! ```
+
+//! **Status:** ✅ Complete — WebAssembly module parsing, execution, WASI, JS bridge
+
+pub mod executor;
+
+// # Example
+// ```text
+// // Load and instantiate a WASM module
+// const wasmModule = await WebAssembly.instantiate(wasmBytes, {
+//   env: {
+//     log: (ptr, len) => console.log(readString(ptr, len))
+//   }
+// });
+//
+// // Call exported function
+// const result = wasmModule.exports.fibonacci(10);
+// ```
 
 use rustc_hash::FxHashMap as HashMap;
 
