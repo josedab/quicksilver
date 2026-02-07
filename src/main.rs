@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use quicksilver::{Runtime, VERSION};
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
@@ -79,6 +79,18 @@ enum Commands {
         /// The file to debug
         file: PathBuf,
     },
+
+    /// Run JavaScript tests
+    Test {
+        /// Test file or directory
+        path: PathBuf,
+        /// Filter tests by name pattern
+        #[arg(short, long)]
+        filter: Option<String>,
+        /// Verbose output
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn main() {
@@ -102,6 +114,7 @@ fn main() {
             Commands::Ast { input } => show_ast(&input),
             Commands::Bytecode { input } => show_bytecode(&input),
             Commands::Debug { file } => run_debug(&file),
+            Commands::Test { path, filter, verbose } => run_tests(&path, filter, verbose),
         }
         return;
     }
@@ -351,7 +364,7 @@ fn run_file(path: &PathBuf, profile: bool, script_args: &[String]) {
     let source = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file: {}", e);
+            eprintln!("Error reading '{}': {}", path.display(), e);
             std::process::exit(1);
         }
     };
@@ -451,7 +464,7 @@ fn run_file_with_hmr(
     let source = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file: {}", e);
+            eprintln!("Error reading '{}': {}", path.display(), e);
             return;
         }
     };
@@ -513,7 +526,7 @@ fn run_file_with_hmr(
     }
 }
 
-fn setup_module_hot(runtime: &mut Runtime, path: &PathBuf) {
+fn setup_module_hot(runtime: &mut Runtime, path: &Path) {
     let module_path = path.display().to_string();
 
     // Set up HMR API via JavaScript
@@ -554,7 +567,7 @@ fn setup_module_hot(runtime: &mut Runtime, path: &PathBuf) {
     }
 }
 
-fn set_script_args(runtime: &mut Runtime, path: &PathBuf, script_args: &[String]) {
+fn set_script_args(runtime: &mut Runtime, path: &Path, script_args: &[String]) {
     // Create process.argv array: [runtime, script, ...args]
     let args_js = format!(
         "globalThis.process = globalThis.process || {{}};
@@ -591,7 +604,7 @@ fn show_ast(input: &str) {
         match fs::read_to_string(input) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Error reading file: {}", e);
+                eprintln!("Error reading '{}': {}", input, e);
                 return;
             }
         }
@@ -614,7 +627,7 @@ fn show_bytecode(input: &str) {
         match fs::read_to_string(input) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("Error reading file: {}", e);
+                eprintln!("Error reading '{}': {}", input, e);
                 return;
             }
         }
@@ -638,7 +651,7 @@ fn run_debug(path: &PathBuf) {
     let source = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error reading file: {}", e);
+            eprintln!("Error reading '{}': {}", path.display(), e);
             std::process::exit(1);
         }
     };
@@ -679,5 +692,30 @@ fn run_debug(path: &PathBuf) {
 
         // Run interactive debugger for replay
         runtime.run_debugger_interactive();
+    }
+}
+
+fn run_tests(path: &PathBuf, filter: Option<String>, verbose: bool) {
+    use quicksilver::test_runner::{TestConfig, TestRunner};
+
+    let config = TestConfig {
+        filter,
+        verbose,
+        ..TestConfig::default()
+    };
+
+    let mut runner = TestRunner::new(config);
+
+    match runner.run_file(path) {
+        Ok(report) => {
+            print!("{}", report);
+            if report.failed > 0 {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("Test runner error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
