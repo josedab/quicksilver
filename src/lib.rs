@@ -24,6 +24,29 @@
 //!     Ok(())
 //! }
 //! ```
+// Clippy configuration for the Quicksilver runtime.
+//
+// These suppressions exist because:
+// - type_complexity: VM execution uses deeply nested Result<Option<Value>> types
+// - collapsible_if/match: Kept for readability in multi-step VM dispatch
+// - arc_with_non_send_sync: Value uses Rc<RefCell> (single-threaded by design)
+// - too_many_arguments: VM internal functions pass execution context
+// - new_without_default: Some types have required initialization logic
+// - should_implement_trait: Value has custom from_str/display semantics
+// - needless_range_loop: Index-based loops used for stack manipulation
+// - enum_variant_names: Opcode/AST variants follow JS naming conventions
+//
+// TODO: Incrementally address these by refactoring large functions and
+//       introducing builder patterns. Track progress in GitHub issues.
+#![allow(clippy::type_complexity)]
+#![allow(clippy::collapsible_if)]
+#![allow(clippy::collapsible_match)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::should_implement_trait)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::enum_variant_names)]
 
 pub mod ast;
 pub mod bytecode;
@@ -35,19 +58,36 @@ pub mod parser;
 pub mod runtime;
 pub mod snapshot;
 pub mod security;
+pub mod sandbox;
 pub mod concurrency;
 pub mod observability;
 pub mod ai;
 pub mod wasm;
+pub mod wasi_target;
 pub mod effects;
+pub mod edge;
 pub mod distributed;
+pub mod diagnostics;
 pub mod hmr;
 pub mod repl;
 pub mod ffi;
 pub mod native;
 pub mod modules;
+pub mod npm;
+pub mod agent;
+pub mod bindings;
+pub mod jit;
+pub mod test262;
+pub mod test_runner;
+pub mod c_api;
+pub mod durable;
+pub mod plugins;
+pub mod profiler;
+pub mod reactive;
 pub mod prelude;
 pub mod typescript;
+pub mod playground;
+pub mod workers;
 
 mod error;
 
