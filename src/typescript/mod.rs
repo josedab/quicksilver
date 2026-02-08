@@ -17,7 +17,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use quicksilver::typescript::TypeScriptTranspiler;
 //!
 //! let ts_code = r#"
@@ -32,8 +32,10 @@
 //! "#;
 //!
 //! let transpiler = TypeScriptTranspiler::new();
-//! let js_code = transpiler.transpile(ts_code)?;
+//! let js_code = transpiler.transpile(ts_code).unwrap();
 //! ```
+
+//! **Status:** ⚠️ Partial — Type stripping transpiler — no type checking
 
 mod parser;
 mod transpiler;

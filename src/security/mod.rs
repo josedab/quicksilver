@@ -14,6 +14,8 @@
 //! runtime.execute_with_sandbox(code, sandbox)?;
 //! ```
 
+//! **Status:** ✅ Complete — Capability-based permission model
+
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;

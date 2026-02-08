@@ -3,6 +3,8 @@
 //! Built-in APIs for file system, HTTP, and other system operations.
 //! These integrate with the capability-based security system.
 
+//! **Status:** ✅ Complete — HTTP server/client, WebSocket, static files, rate limiting
+
 pub mod fs;
 pub mod http;
 pub mod process;

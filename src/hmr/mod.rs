@@ -1,5 +1,7 @@
 //! Hot Module Reloading
 //!
+//! **Status:** ⚠️ Partial — File watching, module graph tracking
+//!
 //! Update code without losing application state. Modules can accept updates
 //! and preserve their state across reloads.
 //!

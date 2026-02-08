@@ -12,6 +12,8 @@
 //! The collector maintains a list of all GC-managed objects and periodically
 //! collects unreachable ones based on allocation thresholds.
 
+//! **Status:** ✅ Complete — Mark-and-sweep garbage collector
+
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
 use std::cell::RefCell;

@@ -16,6 +16,8 @@
 //! const value = await ch.recv();
 //! ```
 
+//! **Status:** ⚠️ Partial — Channels and basic task handles
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Condvar};
 

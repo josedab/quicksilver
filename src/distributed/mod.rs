@@ -1,5 +1,7 @@
 //! Distributed Runtime
 //!
+//! **Status:** 🧪 Experimental — Cluster computing, actor messaging (simulated)
+//!
 //! Built-in primitives for distributed computing, enabling JavaScript code
 //! to transparently run across multiple nodes with automatic serialization.
 //!

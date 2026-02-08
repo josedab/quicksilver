@@ -3,6 +3,8 @@
 //! This module defines the AST node types that represent parsed JavaScript code.
 //! The AST follows the ESTree specification with some modifications for Rust idioms.
 
+//! **Status:** ✅ Complete — AST node definitions for expressions, statements, patterns
+
 mod expr;
 mod pattern;
 mod stmt;

@@ -38,6 +38,8 @@
 //! });
 //! ```
 
+//! **Status:** 🧪 Experimental — Algebraic effects with perform/handle
+
 use std::any::Any;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;

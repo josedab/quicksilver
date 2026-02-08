@@ -3,6 +3,8 @@
 //! This module implements a recursive descent parser for JavaScript.
 //! It produces an AST from a stream of tokens.
 
+//! **Status:** ✅ Complete — ES2020 recursive descent parser
+
 use crate::ast::*;
 use crate::error::{Error, Result, SourceLocation};
 use crate::lexer::{Keyword, Lexer, Token, TokenKind};

@@ -9,6 +9,8 @@
 //! - Pretty-printed output
 //! - Error display with context
 
+//! **Status:** ⚠️ Partial — Basic REPL, limited completion
+
 use crate::{Runtime, Value};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;

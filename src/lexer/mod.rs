@@ -4,6 +4,8 @@
 //! from source code. It supports ES2020 syntax including template literals,
 //! regular expressions, and all keyword types.
 
+//! **Status:** ✅ Complete — Full JavaScript tokenization
+
 mod token;
 
 pub use token::{Keyword, Token, TokenKind};

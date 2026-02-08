@@ -9,6 +9,8 @@
 //! quicksilver run app.qss  # <1ms startup
 //! ```
 
+//! **Status:** ⚠️ Partial — Bytecode serialization framework
+
 use crate::bytecode::Chunk;
 use crate::runtime::{JsFunction, ObjectKind, Value};
 use crate::Error;
