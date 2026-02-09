@@ -59,6 +59,17 @@ Quicksilver is a JavaScript engine designed for embedded use cases, edge computi
 
 ## Installation
 
+### Prerequisites
+
+- Rust 1.70+ (install via [rustup](https://rustup.rs))
+- Cargo (included with Rust)
+
+Verify installation:
+```bash
+rustc --version  # Should be 1.70.0 or higher
+cargo --version
+```
+
 ### From Source
 
 ```bash
@@ -73,20 +84,25 @@ cargo build --release
 
 Run a JavaScript file:
 ```bash
-quicksilver script.js
+cargo run -- script.js
 ```
 
 Evaluate an expression:
 ```bash
-quicksilver -e "console.log('Hello, World!')"
+cargo run -- -e "console.log('Hello, World!')"
+```
+
+Start the REPL:
+```bash
+cargo run -- repl
 ```
 
 ### As a Library
 
-Add to your `Cargo.toml`:
+Add to your `Cargo.toml` (local path dependency):
 ```toml
 [dependencies]
-quicksilver = "0.1.0"
+quicksilver = { path = "../quicksilver" }
 ```
 
 Use in your Rust code:
@@ -168,6 +184,31 @@ Quicksilver uses a bytecode compilation and interpretation approach:
 5. **GC** (`src/gc/`): Garbage collection for memory management
 
 ## Development
+
+### Quick Reference
+
+```bash
+# Development workflow
+cargo check                   # Fast syntax check (~3s)
+cargo build                   # Debug build (~15s)
+cargo test                    # Run all 700+ tests (~6s)
+cargo clippy                  # Lints
+cargo fmt                     # Format code
+cargo run -- script.js        # Run a script
+cargo run -- -e "1+2"         # Evaluate expression
+cargo run -- repl             # Interactive REPL
+
+# Run specific tests
+cargo test arrow_functions    # By name/module
+cargo test --lib              # Unit tests only
+cargo test --test '*'         # Integration tests only
+
+# Release build (slow: ~100s, uses LTO)
+cargo build --release
+
+# Benchmarks
+cargo bench
+```
 
 ### Building
 ```bash

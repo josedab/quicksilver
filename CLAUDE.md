@@ -21,48 +21,91 @@ src/
 ├── main.rs           # CLI entry point
 ├── lib.rs            # Library exports
 ├── error.rs          # Error types (Error, Result)
-├── lexer/
-│   ├── mod.rs        # Lexer implementation (tokenization)
-│   └── token.rs      # Token types and definitions
-├── parser/
-│   └── mod.rs        # Recursive descent parser
-├── ast/
-│   ├── mod.rs        # AST node definitions
-│   ├── expr.rs       # Expression nodes
-│   ├── stmt.rs       # Statement nodes
-│   └── pattern.rs    # Destructuring patterns
-├── bytecode/
-│   ├── mod.rs        # Chunk and bytecode structures
-│   ├── opcode.rs     # Opcode definitions
-│   └── compiler.rs   # AST to bytecode compiler
-├── runtime/
-│   ├── mod.rs        # Runtime exports
-│   ├── vm.rs         # Stack-based virtual machine
-│   ├── value.rs      # JavaScript value types (Value, Object, ObjectKind)
-│   └── builtins.rs   # Built-in objects (console, Math, JSON, Date, Map, Set)
-├── gc/
-│   └── mod.rs        # Mark-and-sweep garbage collection
-├── snapshot/
-│   └── mod.rs        # Snapshot serialization for instant cold starts
-├── security/
-│   └── mod.rs        # Capability-based security and sandboxing
-├── concurrency/
-│   └── mod.rs        # Structured concurrency (channels, spawn, select)
-├── observability/
-│   └── mod.rs        # Built-in tracing, metrics, and profiling
-├── ai/
-│   └── mod.rs        # AI-native runtime (JSDoc → tool schemas)
-├── wasm/
-│   └── mod.rs        # WebAssembly module parsing and integration
-├── effects/
-│   └── mod.rs        # Algebraic effects system
-├── distributed/
-│   └── mod.rs        # Distributed runtime primitives (cluster, actors)
-├── debugger/
-│   └── mod.rs        # Time-travel debugger with record/replay
-└── hmr/
-    └── mod.rs        # Hot module reloading
+├── lexer/            # Tokenization
+├── parser/           # Recursive descent parser
+├── ast/              # AST node definitions
+├── bytecode/         # Bytecode compiler and opcodes
+├── runtime/          # VM, value types, builtins
+├── gc/               # Mark-and-sweep garbage collection
+├── snapshot/         # Snapshot serialization
+├── security/         # Capability-based security
+├── sandbox/          # Sandbox configuration
+├── concurrency/      # Channels, spawn, select
+├── observability/    # Tracing, metrics, profiling
+├── ai/               # AI-native runtime (JSDoc → tool schemas)
+├── agent/            # AI agent execution sandbox
+├── wasm/             # WebAssembly module parsing and execution
+├── effects/          # Algebraic effects system
+├── distributed/      # Distributed runtime primitives
+├── debugger/         # Time-travel debugger with record/replay
+├── hmr/              # Hot module reloading
+├── event_loop/       # Async/await event loop
+├── modules/          # ES Module loader
+├── npm/              # CommonJS/npm compatibility
+├── typescript/       # TypeScript type stripping
+├── native/           # Native APIs (HTTP, timers, etc.)
+├── edge/             # Edge computing (Cloudflare Workers compat)
+├── workers/          # Worker threads & shared memory
+├── playground/       # Web playground bridge
+├── c_api/            # C FFI API
+├── bindings/         # Multi-language SDK bindings
+├── ffi/              # Foreign function interface
+├── jit/              # JIT compilation (experimental)
+├── plugins/          # Plugin system
+├── profiler/         # Performance profiler
+├── reactive/         # Reactive state management
+├── diagnostics/      # Language diagnostics
+├── durable/          # Durable objects
+├── repl/             # Interactive REPL
+├── test262/          # Test262 conformance harness
+└── test_runner/      # Built-in test runner
 ```
+
+### Module Implementation Status
+
+| Module | LOC | Tests | Status | Notes |
+|--------|----:|------:|--------|-------|
+| `runtime` | 15,868 | 72 | ✅ Complete | Core VM, builtins, value types |
+| `bytecode` | 4,704 | 14 | ✅ Complete | Compiler, opcodes, optimizer |
+| `parser` | 2,903 | 8 | ✅ Complete | ES2020 recursive descent |
+| `lexer` | 1,280 | 7 | ✅ Complete | Full tokenization |
+| `ast` | 1,366 | 0 | ✅ Complete | Node definitions (tested via parser) |
+| `native` | 3,338 | 63 | ✅ Complete | HTTP server/client, WebSocket, timers |
+| `debugger` | 4,034 | 25 | ✅ Complete | Time-travel, DAP protocol, TUI |
+| `modules` | 1,468 | 34 | ✅ Complete | ES Module loader |
+| `typescript` | 2,590 | 18 | ⚠️ Partial | Type stripping only, no type checking |
+| `wasm` | 2,122 | 23 | ✅ Complete | Full instruction set, WASI, JS bridge |
+| `npm` | 1,760 | 29 | ⚠️ Partial | require(), core modules (path, util, process, os) |
+| `event_loop` | 904 | 20 | ⚠️ Partial | Promise/A+, microtask queue, timers |
+| `jit` | 928 | 13 | 🧪 Experimental | Basic compilation, not production-ready |
+| `agent` | 886 | 16 | ✅ Complete | AI agent sandbox, tool schemas |
+| `ai` | 479 | 3 | ✅ Complete | JSDoc → LLM tool schema generation |
+| `c_api` | 929 | 12 | ✅ Complete | Full C FFI with runtime/value/callback APIs |
+| `security` | 846 | 12 | ✅ Complete | Capability-based permissions |
+| `sandbox` | 553 | 15 | ✅ Complete | Sandbox configuration and enforcement |
+| `gc` | 470 | 6 | ✅ Complete | Mark-and-sweep GC |
+| `snapshot` | 895 | 1 | ⚠️ Partial | Serialization framework, limited coverage |
+| `edge` | 861 | 13 | ⚠️ Partial | Workers-compatible API surface |
+| `hmr` | 924 | 7 | ⚠️ Partial | File watching, module graph tracking |
+| `workers` | 578 | 25 | ✅ Complete | SharedArrayBuffer, Atomics, WorkerPool |
+| `concurrency` | 469 | 4 | ⚠️ Partial | Channels work, limited task API |
+| `distributed` | 786 | 7 | 🧪 Experimental | Cluster, actors (simulated) |
+| `effects` | 478 | 4 | 🧪 Experimental | Algebraic effects framework |
+| `plugins` | 900 | 17 | ⚠️ Partial | Plugin loading and lifecycle |
+| `profiler` | 1,197 | 14 | ⚠️ Partial | CPU/memory profiling |
+| `reactive` | 781 | 16 | ✅ Complete | Reactive state management |
+| `observability` | 681 | 4 | ⚠️ Partial | OpenTelemetry-compatible metrics |
+| `diagnostics` | 787 | 13 | ⚠️ Partial | Language server diagnostics |
+| `durable` | 546 | 7 | 🧪 Experimental | Durable objects framework |
+| `ffi` | 558 | 4 | ⚠️ Partial | Foreign function interface |
+| `bindings` | 581 | 13 | ✅ Complete | C/Python/Go bindings |
+| `playground` | 175 | 9 | ✅ Complete | Web playground evaluation bridge |
+| `repl` | 911 | 2 | ⚠️ Partial | Basic REPL, limited completion |
+| `test262` | 1,005 | 11 | ⚠️ Partial | Conformance micro-tests |
+| `test_runner` | 970 | 17 | ✅ Complete | Built-in test framework |
+| `wasi_target` | 738 | 13 | ⚠️ Partial | WASI target compilation |
+
+**Legend**: ✅ Complete — ⚠️ Partial — 🧪 Experimental
 
 ## Key Types
 

@@ -30,6 +30,7 @@ cargo bench
 | `builtins_showcase.js` | All built-in objects: Math, Date, Map, Set, etc. |
 | `async_patterns.js` | Async/await, promises, error handling |
 | `security_sandbox.js` | Capability-based security model |
+| `es_modules/` | ES Module import/export (main.js, math.js, utils.js) |
 
 ## Feature Demonstrations
 

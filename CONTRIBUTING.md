@@ -25,6 +25,47 @@ Please be respectful and constructive in all interactions. We welcome contributo
 
 - Rust 1.70 or later (2021 edition)
 - Cargo
+- (Optional) [just](https://github.com/casey/just) task runner: `cargo install just`
+
+### Automated Setup
+
+Run the setup script to install dev tools and pre-commit hooks:
+```bash
+./scripts/setup_dev_env.sh
+```
+
+This will:
+- Verify your Rust version
+- Install `just`, `cargo-deny`, and `cargo-watch` (optional)
+- Set up a pre-commit hook that runs `cargo fmt` and `cargo clippy`
+- Verify the build works
+
+### Quick Reference
+
+```bash
+# Core workflow
+cargo check                   # Fast syntax check (~3s)
+cargo build                   # Debug build (~15s)
+cargo test                    # Run all 700+ tests (~6s)
+cargo clippy                  # Lint check
+cargo fmt                     # Format code
+
+# Running JavaScript
+cargo run -- script.js        # Run a file
+cargo run -- -e "1 + 2"       # Evaluate expression
+cargo run -- repl             # Interactive REPL
+
+# Targeted testing
+cargo test arrow_functions    # Run tests matching a name
+cargo test --lib              # Unit tests only
+cargo test --test '*'         # Integration tests only
+cargo test -- --nocapture     # Show stdout from tests
+
+# With just (if installed)
+just check                    # fmt + clippy + test
+just run examples/hello_world.js
+just bench                    # Run benchmarks
+```
 
 ### Building
 
@@ -82,8 +123,9 @@ See `CLAUDE.md` for detailed architecture documentation.
 
 - Add tests for new features
 - Ensure existing tests pass
-- Integration tests go in `tests/`
-- Unit tests go in the same file as the code (in a `#[cfg(test)]` module)
+- Integration tests go in `tests/` — use for full JavaScript feature validation
+- Unit tests go in the same file as the code (in a `#[cfg(test)]` module) — use for pure functions, value conversions, individual opcode behavior
+- Doc tests go in `///` doc comments — use for public API examples that should always compile
 
 ### Commit Messages
 

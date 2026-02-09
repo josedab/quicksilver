@@ -63,7 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Developer Experience
 - Comprehensive error messages with source locations and stack traces
-- 217 tests (178 unit + 39 integration)
+- 596 tests (487 unit + 106 integration + 3 doc)
 - 8 example programs demonstrating features
 
 ### Known Limitations
