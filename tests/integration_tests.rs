@@ -492,13 +492,10 @@ mod error_handling {
     #[test]
     fn test_runtime_error_undefined_variable() {
         let result = run_js("undefinedVar + 1");
-        // Undefined variable + 1 returns NaN (undefined coerces to NaN)
-        assert!(result.is_ok());
-        if let Ok(value) = result {
-            if let Value::Number(n) = value {
-                assert!(n.is_nan(), "Expected NaN from undefined + 1");
-            }
-        }
+        // Accessing an undefined variable now throws ReferenceError
+        assert!(result.is_err(), "Expected ReferenceError for undefined variable");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("is not defined"), "Error should mention 'is not defined': {}", err_msg);
     }
 
     #[test]
