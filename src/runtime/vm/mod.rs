@@ -1552,9 +1552,15 @@ impl VM {
                     let name = self.get_constant_string(index)?;
                     match self.globals.get(&name).cloned() {
                         Some(value) => self.push(value)?,
-                        None => return Err(Error::reference_error(
-                            &format!("'{}' is not defined", name)
-                        )),
+                        None => {
+                            let suggestion = self.suggest_similar_global(&name);
+                            let msg = if let Some(similar) = suggestion {
+                                format!("'{}' is not defined. Did you mean '{}'?", name, similar)
+                            } else {
+                                format!("'{}' is not defined", name)
+                            };
+                            return Err(Error::reference_error(msg));
+                        }
                     }
                 }
 
@@ -3108,12 +3114,12 @@ impl VM {
                         self.push(result)?;
                     }
                     _ => {
-                        return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
+                        return Err(Error::type_error(format!("{} is not a function", callee_desc)));
                     }
                 }
             }
             _ => {
-                return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
+                return Err(Error::type_error(format!("{} is not a function", callee_desc)));
             }
         }
 
@@ -3252,12 +3258,12 @@ impl VM {
                         self.process_pending_timers();
                     }
                     _ => {
-                        return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
+                        return Err(Error::type_error(format!("{} is not a function", callee_desc)));
                     }
                 }
             }
             _ => {
-                return Err(Error::type_error(&format!("{} is not a function", callee_desc)));
+                return Err(Error::type_error(format!("{} is not a function", callee_desc)));
             }
         }
 
@@ -5064,9 +5070,8 @@ impl VM {
 
             // Initialize instance fields
             for (name, value) in instance_fields {
-                if name.starts_with('#') {
-                    // Private field - strip the # prefix for storage
-                    private_fields.insert(name[1..].to_string(), value);
+                if let Some(field_name) = name.strip_prefix('#') {
+                    private_fields.insert(field_name.to_string(), value);
                 } else {
                     // Public field
                     properties.insert(name, value);
@@ -6185,12 +6190,54 @@ impl VM {
         }
         Ok(None)
     }
+
+    /// Find a similar global name for "did you mean?" suggestions
+    fn suggest_similar_global(&self, name: &str) -> Option<String> {
+        let name_lower = name.to_lowercase();
+        let mut best_match: Option<(&str, usize)> = None;
+
+        for key in self.globals.keys() {
+            let dist = levenshtein_distance_small(&name_lower, &key.to_lowercase());
+            if dist <= 2 && dist > 0 {
+                if best_match.is_none() || dist < best_match.unwrap().1 {
+                    best_match = Some((key, dist));
+                }
+            }
+        }
+
+        best_match.map(|(s, _)| s.to_string())
+    }
 }
 
 impl Default for VM {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Levenshtein distance for short strings (used for typo detection)
+fn levenshtein_distance_small(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+    // Skip if lengths differ by more than the threshold
+    if a_len.abs_diff(b_len) > 2 { return 3; }
+
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0; b_len + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j] + cost)
+                .min(curr[j] + 1)
+                .min(prev[j + 1] + 1);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b_len]
 }
 
 #[cfg(test)]
@@ -6764,5 +6811,31 @@ mod tests {
 
         let result = runtime.eval("Number.POSITIVE_INFINITY === Infinity").unwrap();
         assert_eq!(result, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_did_you_mean_suggestion() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("consol.log('hi')");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("Did you mean 'console'?"), "Expected suggestion, got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_no_suggestion_for_unknown() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("totallyUnknownVariable");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(!err_msg.contains("Did you mean"), "Should not suggest for unknown: {}", err_msg);
+    }
+
+    #[test]
+    fn test_levenshtein_distance() {
+        assert_eq!(levenshtein_distance_small("console", "consol"), 1);
+        assert_eq!(levenshtein_distance_small("Math", "Maht"), 2);
+        assert_eq!(levenshtein_distance_small("abc", "abc"), 0);
+        assert_eq!(levenshtein_distance_small("", "abc"), 3);
     }
 }
