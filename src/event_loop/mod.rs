@@ -85,6 +85,19 @@ pub enum PromiseReactionType {
     Reject,
 }
 
+/// Result of running the event loop to completion via `run_to_completion()`
+#[derive(Debug, Clone, Default)]
+pub struct RunResult {
+    /// Total number of microtasks that were dequeued and processed
+    pub microtasks_processed: usize,
+    /// Total number of macrotasks that were dequeued and processed
+    pub macrotasks_processed: usize,
+    /// Number of full event loop iterations (each iteration = drain microtasks + one macrotask)
+    pub iterations: usize,
+    /// The virtual time when the event loop finished
+    pub final_time: u64,
+}
+
 /// The event loop manages task queues and execution order
 pub struct EventLoop {
     /// Microtask queue (high priority - runs between macrotasks)
@@ -101,6 +114,10 @@ pub struct EventLoop {
     _draining_microtasks: bool,
     /// Pending promises waiting to be resolved
     pending_promises: Vec<Rc<RefCell<PromiseInternal>>>,
+    /// Pending async tasks waiting for their awaited promise to settle
+    pending_async_tasks: Vec<AsyncTask>,
+    /// Next async task ID (reserved for future use)
+    _next_async_task_id: u64,
 }
 
 impl Default for EventLoop {
@@ -120,6 +137,8 @@ impl EventLoop {
             unhandled_rejections: Vec::new(),
             _draining_microtasks: false,
             pending_promises: Vec::new(),
+            pending_async_tasks: Vec::new(),
+            _next_async_task_id: 1,
         }
     }
 
@@ -600,6 +619,134 @@ impl EventLoop {
             _promise_ref: promise,
         }
     }
+
+    /// `queueMicrotask()` global function — enqueues a callback as a plain microtask
+    /// with no associated promise settlement. This mirrors the Web API `queueMicrotask()`.
+    pub fn queue_microtask_fn(&mut self, callback: Value) {
+        self.enqueue_microtask(Microtask {
+            callback,
+            args: vec![],
+            settle_promise: None,
+            is_fulfill: true,
+        });
+    }
+
+    /// Drain all microtasks from the queue, including any that are enqueued during
+    /// processing (as required by the HTML spec). Returns the (callback, args) pairs
+    /// that were dequeued, in order of execution.
+    pub fn drain_microtasks(&mut self) -> Vec<(Value, Vec<Value>)> {
+        self._draining_microtasks = true;
+        let mut drained = Vec::new();
+
+        // Keep draining until empty — new microtasks added during processing
+        // are picked up in subsequent iterations of this loop.
+        while let Some(task) = self.microtask_queue.pop_front() {
+            drained.push((task.callback, task.args));
+        }
+
+        self._draining_microtasks = false;
+        drained
+    }
+
+    /// Schedule a macrotask with 0ms delay (equivalent to `setImmediate`).
+    /// The task fires at the current virtual time on the next macrotask processing step.
+    pub fn set_immediate(&mut self, callback: Value, args: Vec<Value>) -> u64 {
+        self.schedule_timer(callback, 0, args, false)
+    }
+
+    /// Run the event loop to completion following the standard algorithm:
+    ///   1. Drain all microtasks
+    ///   2. If a macrotask is ready, execute it (advance time if needed)
+    ///   3. Repeat from step 1
+    ///   4. Stop when no microtasks and no macrotasks remain
+    ///
+    /// Returns a `RunResult` with statistics about what was processed.
+    pub fn run_to_completion(&mut self) -> RunResult {
+        let mut result = RunResult::default();
+
+        loop {
+            // Step 1: drain all microtasks
+            let drained = self.drain_microtasks();
+            result.microtasks_processed += drained.len();
+
+            // Step 2: try to process one macrotask
+            let macrotask = if self.has_pending_macrotasks() {
+                // If nothing is ready at the current time, advance to the next fire time
+                if self.get_next_ready_macrotask_peek() {
+                    self.get_next_ready_macrotask()
+                } else {
+                    self.advance_to_next_macrotask()
+                }
+            } else {
+                None
+            };
+
+            if let Some(_task) = macrotask {
+                result.macrotasks_processed += 1;
+                result.iterations += 1;
+                // After processing a macrotask, loop back to drain microtasks again
+                continue;
+            }
+
+            // No macrotask was available and microtask queue is empty — we're done
+            if !self.has_pending_microtasks() {
+                break;
+            }
+
+            result.iterations += 1;
+        }
+
+        result.final_time = self.virtual_time;
+        result
+    }
+
+    /// Peek whether any macrotask is ready at the current virtual time (without removing it)
+    fn get_next_ready_macrotask_peek(&self) -> bool {
+        self.macrotask_queue
+            .iter()
+            .any(|t| !t.cancelled && t.fire_at <= self.virtual_time)
+    }
+
+    /// Submit an async task that is waiting for a promise to settle.
+    /// The task will be returned by `get_ready_async_tasks` once its
+    /// awaited promise transitions out of the `Pending` state.
+    pub fn submit_async_task(&mut self, task: AsyncTask) {
+        self.pending_async_tasks.push(task);
+    }
+
+    /// Return all async tasks whose awaited promise has settled
+    /// (fulfilled or rejected), removing them from the pending list.
+    pub fn get_ready_async_tasks(&mut self) -> Vec<AsyncTask> {
+        let mut ready = Vec::new();
+        let mut still_pending = Vec::new();
+
+        for task in self.pending_async_tasks.drain(..) {
+            if task.awaiting.borrow().state != PromiseInternalState::Pending {
+                ready.push(task);
+            } else {
+                still_pending.push(task);
+            }
+        }
+
+        self.pending_async_tasks = still_pending;
+        ready
+    }
+
+    /// Return the number of pending async tasks.
+    pub fn pending_async_task_count(&self) -> usize {
+        self.pending_async_tasks.len()
+    }
+
+    /// Process microtasks with VM integration (stub).
+    ///
+    /// This is a placeholder for future VM-integrated microtask
+    /// processing where each microtask callback is executed through
+    /// the VM rather than being tracked as a simple value.
+    pub fn process_microtasks_with_vm(&mut self) -> usize {
+        let count = self.microtask_queue.len();
+        self.microtask_queue.clear();
+        count
+    }
 }
 
 /// Result of Promise.withResolvers() — ES2024
@@ -680,6 +827,28 @@ impl AsyncFunctionState {
             stack_snapshot: Vec::new(),
         }
     }
+}
+
+/// An async task represents a pending async operation that will resume
+/// when its awaited promise settles.
+#[derive(Clone)]
+pub struct AsyncTask {
+    /// Unique task ID
+    pub id: u64,
+    /// The function bytecode to resume
+    pub function: Value,
+    /// Saved instruction pointer
+    pub saved_ip: usize,
+    /// Saved local variables
+    pub saved_locals: Vec<Value>,
+    /// Saved stack snapshot
+    pub saved_stack: Vec<Value>,
+    /// The promise this task is waiting on
+    pub awaiting: Rc<RefCell<PromiseInternal>>,
+    /// The result promise for this async function
+    pub result_promise: Rc<RefCell<PromiseInternal>>,
+    /// Base pointer for frame restoration
+    pub saved_bp: usize,
 }
 
 #[cfg(test)]
@@ -902,5 +1071,335 @@ mod tests {
         // The rejection reason should be an AggregateError-like object
         let reason = result.borrow().result.clone().unwrap();
         assert!(matches!(reason, Value::Object(_)));
+    }
+
+    // ── queueMicrotask tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_queue_microtask_fn_enqueues_task() {
+        let mut el = EventLoop::new();
+        assert!(!el.has_pending_microtasks());
+
+        el.queue_microtask_fn(Value::String("callback".to_string()));
+        assert!(el.has_pending_microtasks());
+
+        let task = el.dequeue_microtask().unwrap();
+        assert!(matches!(task.callback, Value::String(ref s) if s == "callback"));
+        assert!(task.args.is_empty());
+        assert!(task.settle_promise.is_none());
+    }
+
+    #[test]
+    fn test_queue_microtask_fn_multiple() {
+        let mut el = EventLoop::new();
+        el.queue_microtask_fn(Value::Number(1.0));
+        el.queue_microtask_fn(Value::Number(2.0));
+        el.queue_microtask_fn(Value::Number(3.0));
+
+        // Should be FIFO
+        let t1 = el.dequeue_microtask().unwrap();
+        assert!(matches!(t1.callback, Value::Number(n) if n == 1.0));
+        let t2 = el.dequeue_microtask().unwrap();
+        assert!(matches!(t2.callback, Value::Number(n) if n == 2.0));
+        let t3 = el.dequeue_microtask().unwrap();
+        assert!(matches!(t3.callback, Value::Number(n) if n == 3.0));
+        assert!(el.dequeue_microtask().is_none());
+    }
+
+    // ── drain_microtasks tests ────────────────────────────────────────
+
+    #[test]
+    fn test_drain_microtasks_empty() {
+        let mut el = EventLoop::new();
+        let drained = el.drain_microtasks();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn test_drain_microtasks_returns_all() {
+        let mut el = EventLoop::new();
+        el.queue_microtask(Value::Number(1.0), vec![Value::String("a".to_string())]);
+        el.queue_microtask(Value::Number(2.0), vec![]);
+        el.queue_microtask(Value::Number(3.0), vec![Value::Boolean(true)]);
+
+        let drained = el.drain_microtasks();
+        assert_eq!(drained.len(), 3);
+        assert!(matches!(drained[0].0, Value::Number(n) if n == 1.0));
+        assert_eq!(drained[0].1.len(), 1);
+        assert!(matches!(drained[1].0, Value::Number(n) if n == 2.0));
+        assert!(drained[1].1.is_empty());
+        assert!(matches!(drained[2].0, Value::Number(n) if n == 3.0));
+        assert!(!el.has_pending_microtasks());
+    }
+
+    #[test]
+    fn test_drain_microtasks_clears_queue() {
+        let mut el = EventLoop::new();
+        el.queue_microtask_fn(Value::Undefined);
+        el.queue_microtask_fn(Value::Undefined);
+
+        let drained = el.drain_microtasks();
+        assert_eq!(drained.len(), 2);
+        assert!(!el.has_pending_microtasks());
+
+        // Draining again should return empty
+        let drained2 = el.drain_microtasks();
+        assert!(drained2.is_empty());
+    }
+
+    // ── run_to_completion tests ───────────────────────────────────────
+
+    #[test]
+    fn test_run_to_completion_empty() {
+        let mut el = EventLoop::new();
+        let result = el.run_to_completion();
+        assert_eq!(result.microtasks_processed, 0);
+        assert_eq!(result.macrotasks_processed, 0);
+        assert_eq!(result.iterations, 0);
+        assert_eq!(result.final_time, 0);
+    }
+
+    #[test]
+    fn test_run_to_completion_microtasks_only() {
+        let mut el = EventLoop::new();
+        el.queue_microtask_fn(Value::Number(1.0));
+        el.queue_microtask_fn(Value::Number(2.0));
+        el.queue_microtask_fn(Value::Number(3.0));
+
+        let result = el.run_to_completion();
+        assert_eq!(result.microtasks_processed, 3);
+        assert_eq!(result.macrotasks_processed, 0);
+        assert!(!el.has_pending_work());
+    }
+
+    #[test]
+    fn test_run_to_completion_macrotasks_only() {
+        let mut el = EventLoop::new();
+        el.schedule_timer(Value::Number(1.0), 100, vec![], false);
+        el.schedule_timer(Value::Number(2.0), 200, vec![], false);
+
+        let result = el.run_to_completion();
+        assert_eq!(result.macrotasks_processed, 2);
+        assert_eq!(result.microtasks_processed, 0);
+        assert!(!el.has_pending_work());
+        // Time should have advanced to at least 200
+        assert!(result.final_time >= 200);
+    }
+
+    #[test]
+    fn test_run_to_completion_mixed() {
+        let mut el = EventLoop::new();
+        // Microtasks first
+        el.queue_microtask_fn(Value::Number(1.0));
+        el.queue_microtask_fn(Value::Number(2.0));
+        // Then macrotasks
+        el.schedule_timer(Value::Number(10.0), 50, vec![], false);
+        el.schedule_timer(Value::Number(20.0), 100, vec![], false);
+
+        let result = el.run_to_completion();
+        assert_eq!(result.microtasks_processed, 2);
+        assert_eq!(result.macrotasks_processed, 2);
+        assert!(!el.has_pending_work());
+    }
+
+    #[test]
+    fn test_run_to_completion_advances_time() {
+        let mut el = EventLoop::new();
+        el.schedule_timer(Value::Undefined, 500, vec![], false);
+
+        let result = el.run_to_completion();
+        assert_eq!(result.macrotasks_processed, 1);
+        assert_eq!(result.final_time, 500);
+    }
+
+    // ── setImmediate tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_set_immediate_schedules_at_current_time() {
+        let mut el = EventLoop::new();
+        let id = el.set_immediate(Value::String("imm".to_string()), vec![]);
+        assert!(id > 0);
+        assert!(el.has_pending_macrotasks());
+
+        // Should be immediately ready (0ms delay at current time)
+        let task = el.get_next_ready_macrotask();
+        assert!(task.is_some());
+        let task = task.unwrap();
+        assert!(matches!(task.callback, Value::String(ref s) if s == "imm"));
+        assert_eq!(task.delay, 0);
+        assert!(!task.repeating);
+    }
+
+    #[test]
+    fn test_set_immediate_with_args() {
+        let mut el = EventLoop::new();
+        let args = vec![Value::Number(1.0), Value::String("hello".to_string())];
+        el.set_immediate(Value::Undefined, args);
+
+        let task = el.get_next_ready_macrotask().unwrap();
+        assert_eq!(task.args.len(), 2);
+    }
+
+    #[test]
+    fn test_set_immediate_fires_before_delayed_timer() {
+        let mut el = EventLoop::new();
+        // Schedule a delayed timer first
+        el.schedule_timer(Value::String("delayed".to_string()), 100, vec![], false);
+        // Then schedule setImmediate
+        el.set_immediate(Value::String("immediate".to_string()), vec![]);
+
+        // The immediate task should fire first (at time 0)
+        let task = el.get_next_ready_macrotask().unwrap();
+        assert!(matches!(task.callback, Value::String(ref s) if s == "immediate"));
+    }
+
+    #[test]
+    fn test_set_immediate_processed_by_run_to_completion() {
+        let mut el = EventLoop::new();
+        el.set_immediate(Value::Number(1.0), vec![]);
+        el.set_immediate(Value::Number(2.0), vec![]);
+
+        let result = el.run_to_completion();
+        assert_eq!(result.macrotasks_processed, 2);
+        // Time should not advance for immediate tasks
+        assert_eq!(result.final_time, 0);
+        assert!(!el.has_pending_work());
+    }
+
+    #[test]
+    fn test_async_task_submission() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+        let result_promise = el.create_promise();
+
+        let task = AsyncTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting,
+            result_promise,
+            saved_bp: 0,
+        };
+
+        el.submit_async_task(task);
+        assert_eq!(el.pending_async_task_count(), 1);
+    }
+
+    #[test]
+    fn test_async_task_ready_when_promise_fulfilled() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+        let result_promise = el.create_promise();
+
+        let task = AsyncTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 10,
+            saved_locals: vec![Value::Number(1.0)],
+            saved_stack: vec![],
+            awaiting: awaiting.clone(),
+            result_promise,
+            saved_bp: 0,
+        };
+
+        el.submit_async_task(task);
+        assert_eq!(el.pending_async_task_count(), 1);
+
+        // Fulfill the awaited promise
+        el.fulfill_promise(&awaiting, Value::Number(42.0));
+
+        let ready = el.get_ready_async_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(ready[0].saved_ip, 10);
+        assert_eq!(el.pending_async_task_count(), 0);
+    }
+
+    #[test]
+    fn test_async_task_ready_when_promise_rejected() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+        let result_promise = el.create_promise();
+
+        let task = AsyncTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 5,
+            saved_locals: vec![],
+            saved_stack: vec![Value::Boolean(true)],
+            awaiting: awaiting.clone(),
+            result_promise,
+            saved_bp: 0,
+        };
+
+        el.submit_async_task(task);
+
+        // Reject the awaited promise
+        el.reject_promise(&awaiting, Value::String("error".to_string()));
+
+        let ready = el.get_ready_async_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(el.pending_async_task_count(), 0);
+    }
+
+    #[test]
+    fn test_async_task_not_ready_when_pending() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+        let result_promise = el.create_promise();
+
+        let task = AsyncTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting,
+            result_promise,
+            saved_bp: 0,
+        };
+
+        el.submit_async_task(task);
+
+        // Promise is still pending — no tasks should be ready
+        let ready = el.get_ready_async_tasks();
+        assert_eq!(ready.len(), 0);
+        assert_eq!(el.pending_async_task_count(), 1);
+    }
+
+    #[test]
+    fn test_async_task_count() {
+        let mut el = EventLoop::new();
+
+        assert_eq!(el.pending_async_task_count(), 0);
+
+        for i in 0..3 {
+            let awaiting = el.create_promise();
+            let result_promise = el.create_promise();
+            let task = AsyncTask {
+                id: i,
+                function: Value::Undefined,
+                saved_ip: 0,
+                saved_locals: vec![],
+                saved_stack: vec![],
+                awaiting,
+                result_promise,
+                saved_bp: 0,
+            };
+            el.submit_async_task(task);
+        }
+
+        assert_eq!(el.pending_async_task_count(), 3);
+
+        // Fulfill the first task's awaited promise
+        let first_awaiting = el.pending_async_tasks[0].awaiting.clone();
+        el.fulfill_promise(&first_awaiting, Value::Undefined);
+
+        let ready = el.get_ready_async_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(el.pending_async_task_count(), 2);
     }
 }
