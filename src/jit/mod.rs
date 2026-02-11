@@ -751,6 +751,286 @@ pub fn collect_optimization_hints(profiler: &TypeProfiler) -> Vec<OptimizationHi
     hints
 }
 
+// ==================== Baseline Compiler ====================
+
+/// IR instruction for the baseline compiler. These represent type-specialized
+/// operations that can be executed more efficiently than generic bytecode.
+#[derive(Debug, Clone)]
+pub enum IrInstruction {
+    /// Load a 64-bit float constant
+    LoadFloat(f64),
+    /// Load a 32-bit integer constant
+    LoadInt(i32),
+    /// Load a string constant
+    LoadString(String),
+    /// Load a local variable by slot index
+    LoadLocal(u16),
+    /// Store to a local variable by slot index
+    StoreLocal(u16),
+    /// Integer add (both operands guaranteed Int32)
+    IAdd,
+    /// Float add (both operands guaranteed Float64)
+    FAdd,
+    /// Integer subtract
+    ISub,
+    /// Float subtract
+    FSub,
+    /// Integer multiply
+    IMul,
+    /// Float multiply
+    FMul,
+    /// Integer divide (with zero-check guard)
+    IDiv,
+    /// Float divide
+    FDiv,
+    /// Integer comparison (less than)
+    ILessThan,
+    /// Float comparison (less than)
+    FLessThan,
+    /// Integer equality
+    IEqual,
+    /// String concatenation
+    StringConcat,
+    /// Type guard: check that top-of-stack matches expected type, deopt if not
+    Guard(ObservedType),
+    /// Unconditional jump to IR offset
+    Jump(usize),
+    /// Conditional jump (pop boolean, jump if false)
+    JumpIfFalse(usize),
+    /// Return the top-of-stack value
+    Return,
+    /// Deoptimize: fall back to interpreter at the given bytecode IP
+    Deoptimize(usize),
+    /// Increment an integer local in-place
+    IncrementLocal(u16),
+    /// Decrement an integer local in-place
+    DecrementLocal(u16),
+    /// No-op (placeholder)
+    Nop,
+}
+
+/// A compiled IR function produced by the baseline compiler.
+#[derive(Debug, Clone)]
+pub struct CompiledFunction {
+    /// The original bytecode chunk ID this was compiled from
+    pub chunk_id: u64,
+    /// IR instruction stream
+    pub instructions: Vec<IrInstruction>,
+    /// Number of local slots needed
+    pub local_count: u16,
+    /// Type assumptions for parameters (guards inserted at entry)
+    pub param_guards: Vec<ObservedType>,
+    /// Bytecode IP to resume at if deoptimization occurs
+    pub deopt_ip: usize,
+    /// Compilation tier
+    pub tier: CompilationTier,
+}
+
+/// The baseline compiler translates profiled bytecode into type-specialized IR.
+pub struct BaselineCompiler {
+    /// Compiled functions keyed by chunk_id
+    compiled: HashMap<u64, CompiledFunction>,
+}
+
+impl BaselineCompiler {
+    pub fn new() -> Self {
+        Self {
+            compiled: HashMap::default(),
+        }
+    }
+
+    /// Compile a function's fast path based on type profile data.
+    /// Returns None if the function can't be profitably compiled.
+    pub fn compile(
+        &mut self,
+        chunk_id: u64,
+        chunk: &Chunk,
+        profiler: &TypeProfiler,
+    ) -> Option<&CompiledFunction> {
+        if profiler.get_tier(chunk_id) < CompilationTier::Baseline {
+            return None;
+        }
+
+        let blocks = profiler.get_compiled_blocks(chunk_id)?;
+        let mut instructions = Vec::new();
+
+        // Emit entry guards for parameter types
+        let mut param_guards = Vec::new();
+        if let Some(first_block) = blocks.first() {
+            for guard in &first_block.guards {
+                param_guards.push(guard.expected_type);
+                instructions.push(IrInstruction::LoadLocal(guard.stack_index as u16));
+                instructions.push(IrInstruction::Guard(guard.expected_type));
+            }
+        }
+
+        // Translate each compiled block's specialized ops to IR
+        for block in blocks {
+            for op in &block.ops {
+                match op {
+                    SpecializedOp::IntAdd => instructions.push(IrInstruction::IAdd),
+                    SpecializedOp::FloatAdd => instructions.push(IrInstruction::FAdd),
+                    SpecializedOp::IntSub => instructions.push(IrInstruction::ISub),
+                    SpecializedOp::FloatSub => instructions.push(IrInstruction::FSub),
+                    SpecializedOp::IntMul => instructions.push(IrInstruction::IMul),
+                    SpecializedOp::FloatMul => instructions.push(IrInstruction::FMul),
+                    SpecializedOp::IntLt => instructions.push(IrInstruction::ILessThan),
+                    SpecializedOp::IntEq => instructions.push(IrInstruction::IEqual),
+                    SpecializedOp::StringConcat => instructions.push(IrInstruction::StringConcat),
+                    SpecializedOp::StringEq => instructions.push(IrInstruction::IEqual),
+                    SpecializedOp::IntIncrement => {
+                        instructions.push(IrInstruction::LoadInt(1));
+                        instructions.push(IrInstruction::IAdd);
+                    }
+                    SpecializedOp::IntDecrement => {
+                        instructions.push(IrInstruction::LoadInt(1));
+                        instructions.push(IrInstruction::ISub);
+                    }
+                    _ => {
+                        // Non-specializable ops trigger deopt
+                        instructions.push(IrInstruction::Deoptimize(block.end_offset));
+                    }
+                }
+            }
+        }
+
+        instructions.push(IrInstruction::Return);
+
+        let local_count = chunk.code.first().copied().unwrap_or(0) as u16;
+        let compiled = CompiledFunction {
+            chunk_id,
+            instructions,
+            local_count,
+            param_guards,
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+
+        self.compiled.insert(chunk_id, compiled);
+        self.compiled.get(&chunk_id)
+    }
+
+    /// Get a previously compiled function
+    pub fn get_compiled(&self, chunk_id: u64) -> Option<&CompiledFunction> {
+        self.compiled.get(&chunk_id)
+    }
+
+    /// Invalidate a compiled function (after deopt threshold exceeded)
+    pub fn invalidate(&mut self, chunk_id: u64) {
+        self.compiled.remove(&chunk_id);
+    }
+
+    /// Count of compiled functions
+    pub fn compiled_count(&self) -> usize {
+        self.compiled.len()
+    }
+}
+
+impl Default for BaselineCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Execute a compiled IR function on a simple register-like stack machine.
+/// Returns the result value or None if deoptimization was triggered.
+pub fn execute_ir(compiled: &CompiledFunction, args: &[f64]) -> Option<f64> {
+    let mut stack: Vec<f64> = Vec::with_capacity(16);
+    let mut locals: Vec<f64> = vec![0.0; compiled.local_count as usize];
+
+    // Initialize locals from arguments
+    for (i, &arg) in args.iter().enumerate() {
+        if i < locals.len() {
+            locals[i] = arg;
+        }
+    }
+
+    let mut ip = 0;
+    let instructions = &compiled.instructions;
+    let max_iterations = 100_000;
+    let mut iterations = 0;
+
+    while ip < instructions.len() && iterations < max_iterations {
+        iterations += 1;
+        match &instructions[ip] {
+            IrInstruction::LoadFloat(f) => stack.push(*f),
+            IrInstruction::LoadInt(i) => stack.push(*i as f64),
+            IrInstruction::LoadLocal(slot) => {
+                stack.push(locals.get(*slot as usize).copied().unwrap_or(0.0));
+            }
+            IrInstruction::StoreLocal(slot) => {
+                let val = stack.pop().unwrap_or(0.0);
+                if (*slot as usize) < locals.len() {
+                    locals[*slot as usize] = val;
+                }
+            }
+            IrInstruction::IAdd | IrInstruction::FAdd => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                stack.push(a + b);
+            }
+            IrInstruction::ISub | IrInstruction::FSub => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                stack.push(a - b);
+            }
+            IrInstruction::IMul | IrInstruction::FMul => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                stack.push(a * b);
+            }
+            IrInstruction::IDiv | IrInstruction::FDiv => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                if b == 0.0 {
+                    return None; // Deopt on division by zero
+                }
+                stack.push(a / b);
+            }
+            IrInstruction::ILessThan | IrInstruction::FLessThan => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                stack.push(if a < b { 1.0 } else { 0.0 });
+            }
+            IrInstruction::IEqual => {
+                let b = stack.pop().unwrap_or(0.0);
+                let a = stack.pop().unwrap_or(0.0);
+                stack.push(if (a - b).abs() < f64::EPSILON { 1.0 } else { 0.0 });
+            }
+            IrInstruction::Jump(target) => {
+                ip = *target;
+                continue;
+            }
+            IrInstruction::JumpIfFalse(target) => {
+                let cond = stack.pop().unwrap_or(0.0);
+                if cond == 0.0 {
+                    ip = *target;
+                    continue;
+                }
+            }
+            IrInstruction::IncrementLocal(slot) => {
+                if (*slot as usize) < locals.len() {
+                    locals[*slot as usize] += 1.0;
+                }
+            }
+            IrInstruction::DecrementLocal(slot) => {
+                if (*slot as usize) < locals.len() {
+                    locals[*slot as usize] -= 1.0;
+                }
+            }
+            IrInstruction::Return => {
+                return stack.pop().or(Some(0.0));
+            }
+            IrInstruction::Deoptimize(_) => return None,
+            IrInstruction::Guard(_) | IrInstruction::Nop | IrInstruction::StringConcat
+            | IrInstruction::LoadString(_) => {}
+        }
+        ip += 1;
+    }
+
+    stack.pop().or(Some(0.0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -926,5 +1206,125 @@ mod tests {
         assert!(summary.compiled_blocks > 0);
         let formatted = format!("{}", summary);
         assert!(formatted.contains("JIT Compilation Summary"));
+    }
+
+    #[test]
+    fn test_baseline_compiler_new() {
+        let compiler = BaselineCompiler::new();
+        assert_eq!(compiler.compiled_count(), 0);
+    }
+
+    #[test]
+    fn test_execute_ir_simple_add() {
+        let compiled = CompiledFunction {
+            chunk_id: 0,
+            instructions: vec![
+                IrInstruction::LoadLocal(0),
+                IrInstruction::LoadLocal(1),
+                IrInstruction::IAdd,
+                IrInstruction::Return,
+            ],
+            local_count: 2,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+        let result = execute_ir(&compiled, &[10.0, 32.0]);
+        assert_eq!(result, Some(42.0));
+    }
+
+    #[test]
+    fn test_execute_ir_arithmetic_chain() {
+        let compiled = CompiledFunction {
+            chunk_id: 0,
+            instructions: vec![
+                IrInstruction::LoadLocal(0),
+                IrInstruction::LoadLocal(1),
+                IrInstruction::IMul,
+                IrInstruction::LoadInt(1),
+                IrInstruction::IAdd,
+                IrInstruction::Return,
+            ],
+            local_count: 2,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+        // (5 * 8) + 1 = 41
+        let result = execute_ir(&compiled, &[5.0, 8.0]);
+        assert_eq!(result, Some(41.0));
+    }
+
+    #[test]
+    fn test_execute_ir_division_by_zero_deopts() {
+        let compiled = CompiledFunction {
+            chunk_id: 0,
+            instructions: vec![
+                IrInstruction::LoadLocal(0),
+                IrInstruction::LoadLocal(1),
+                IrInstruction::IDiv,
+                IrInstruction::Return,
+            ],
+            local_count: 2,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+        let result = execute_ir(&compiled, &[10.0, 0.0]);
+        assert_eq!(result, None); // Deopt on div by zero
+    }
+
+    #[test]
+    fn test_execute_ir_comparison() {
+        let compiled = CompiledFunction {
+            chunk_id: 0,
+            instructions: vec![
+                IrInstruction::LoadLocal(0),
+                IrInstruction::LoadLocal(1),
+                IrInstruction::ILessThan,
+                IrInstruction::Return,
+            ],
+            local_count: 2,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+        assert_eq!(execute_ir(&compiled, &[3.0, 5.0]), Some(1.0)); // 3 < 5 = true
+        assert_eq!(execute_ir(&compiled, &[5.0, 3.0]), Some(0.0)); // 5 < 3 = false
+    }
+
+    #[test]
+    fn test_execute_ir_increment_local() {
+        let compiled = CompiledFunction {
+            chunk_id: 0,
+            instructions: vec![
+                IrInstruction::IncrementLocal(0),
+                IrInstruction::IncrementLocal(0),
+                IrInstruction::IncrementLocal(0),
+                IrInstruction::LoadLocal(0),
+                IrInstruction::Return,
+            ],
+            local_count: 1,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        };
+        assert_eq!(execute_ir(&compiled, &[0.0]), Some(3.0));
+    }
+
+    #[test]
+    fn test_baseline_compiler_invalidate() {
+        let mut compiler = BaselineCompiler::new();
+        compiler.compiled.insert(42, CompiledFunction {
+            chunk_id: 42,
+            instructions: vec![IrInstruction::Return],
+            local_count: 0,
+            param_guards: vec![],
+            deopt_ip: 0,
+            tier: CompilationTier::Baseline,
+        });
+        assert_eq!(compiler.compiled_count(), 1);
+        compiler.invalidate(42);
+        assert_eq!(compiler.compiled_count(), 0);
     }
 }
