@@ -726,6 +726,69 @@ impl ModuleLoader {
 
         exports
     }
+
+    /// List all loaded modules with their status and export counts
+    pub fn list_modules(&self) -> Vec<ModuleSummary> {
+        let modules = self.modules.read().unwrap();
+        modules.values().map(|m| ModuleSummary {
+            id: m.id.clone(),
+            path: m.path.clone(),
+            status: m.status.clone(),
+            export_count: m.exports.len(),
+            has_default: m.default_export.is_some(),
+            re_export_count: m.re_exports.len(),
+        }).collect()
+    }
+
+    /// Build a dependency graph from loaded modules by analyzing import statements
+    pub fn dependency_graph(&self) -> HashMap<String, Vec<String>> {
+        let modules = self.modules.read().unwrap();
+        let mut graph = HashMap::default();
+        for module in modules.values() {
+            let mut deps = Vec::new();
+            for stmt in &module.program.body {
+                if let Statement::Import(import) = stmt {
+                    deps.push(import.source.clone());
+                }
+            }
+            graph.insert(module.id.clone(), deps);
+        }
+        graph
+    }
+
+    /// Check if a module has been loaded
+    pub fn is_loaded(&self, specifier: &str, referrer: Option<&Path>) -> bool {
+        if let Ok(path) = self.resolve(specifier, referrer) {
+            let id = path.to_string_lossy().to_string();
+            let modules = self.modules.read().unwrap();
+            modules.contains_key(&id)
+        } else {
+            false
+        }
+    }
+
+    /// Invalidate (unload) a module from the cache
+    pub fn invalidate(&self, id: &str) -> bool {
+        let mut modules = self.modules.write().unwrap();
+        modules.remove(id).is_some()
+    }
+}
+
+/// Summary of a loaded module
+#[derive(Debug, Clone)]
+pub struct ModuleSummary {
+    /// Module identifier
+    pub id: String,
+    /// File path
+    pub path: PathBuf,
+    /// Current loading status
+    pub status: ModuleStatus,
+    /// Number of named exports
+    pub export_count: usize,
+    /// Whether a default export exists
+    pub has_default: bool,
+    /// Number of re-exports
+    pub re_export_count: usize,
 }
 
 impl Default for ModuleLoader {
@@ -1464,5 +1527,63 @@ mod tests {
         assert!(meta.main);
         let meta = registry.import_meta_for(&dep);
         assert!(!meta.main);
+    }
+
+    #[test]
+    fn test_list_modules_empty() {
+        let loader = ModuleLoader::new();
+        let modules = loader.list_modules();
+        assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn test_list_modules_after_load() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.js"), "export const x = 1;").unwrap();
+        fs::write(dir.path().join("b.js"), "export const y = 2;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.load("./a.js", None).unwrap();
+        loader.load("./b.js", None).unwrap();
+
+        let modules = loader.list_modules();
+        assert_eq!(modules.len(), 2);
+    }
+
+    #[test]
+    fn test_is_loaded() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("check.js"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        assert!(!loader.is_loaded("./check.js", None));
+
+        loader.load("./check.js", None).unwrap();
+        assert!(loader.is_loaded("./check.js", None));
+    }
+
+    #[test]
+    fn test_invalidate_module() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("inv.js"), "export const x = 1;").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        let module = loader.load("./inv.js", None).unwrap();
+
+        assert!(loader.invalidate(&module.id));
+        assert!(!loader.is_loaded("./inv.js", None));
+    }
+
+    #[test]
+    fn test_dependency_graph() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("utils.js"), "export const x = 1;").unwrap();
+        fs::write(dir.path().join("main.js"), "import { x } from './utils.js';\nconsole.log(x);").unwrap();
+
+        let loader = ModuleLoader::with_base_dir(dir.path().to_path_buf());
+        loader.load("./main.js", None).unwrap();
+
+        let graph = loader.dependency_graph();
+        assert!(!graph.is_empty());
     }
 }
