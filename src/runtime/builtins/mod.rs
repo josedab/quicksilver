@@ -1126,11 +1126,12 @@ fn register_promise(vm: &mut VM) {
 
     // Promise constructor
     vm.register_native("Promise_constructor", |args| {
-        // The executor function is passed as first argument
-        let _executor = args.first().cloned().unwrap_or(Value::Undefined);
+        let executor = args.first().cloned().unwrap_or(Value::Undefined);
 
-        // Create a pending promise
-        // In a full implementation, we'd call the executor with resolve/reject functions
+        // Create a pending promise with shared state
+        let promise_state: Rc<RefCell<(super::value::PromiseState, Option<Box<Value>>)>> =
+            Rc::new(RefCell::new((super::value::PromiseState::Pending, None)));
+
         let obj = Rc::new(RefCell::new(super::value::Object {
             kind: super::value::ObjectKind::Promise {
                 state: super::value::PromiseState::Pending,
@@ -1142,6 +1143,88 @@ fn register_promise(vm: &mut VM) {
             private_fields: HashMap::default(),
             prototype: None, cached_shape_id: None,
         }));
+
+        // Create resolve native function that settles the promise
+        let obj_resolve = obj.clone();
+        let state_resolve = promise_state.clone();
+        let resolve_fn: super::value::NativeFn = Rc::new(move |args: &[Value]| -> Result<Value> {
+            let val = args.first().cloned().unwrap_or(Value::Undefined);
+            let mut state = state_resolve.borrow_mut();
+            if state.0 == super::value::PromiseState::Pending {
+                state.0 = super::value::PromiseState::Fulfilled;
+                state.1 = Some(Box::new(val.clone()));
+                let mut obj_mut = obj_resolve.borrow_mut();
+                obj_mut.kind = super::value::ObjectKind::Promise {
+                    state: super::value::PromiseState::Fulfilled,
+                    value: Some(Box::new(val)),
+                    on_fulfilled: Vec::new(),
+                    on_rejected: Vec::new(),
+                };
+            }
+            Ok(Value::Undefined)
+        });
+
+        // Create reject native function that settles the promise
+        let obj_reject = obj.clone();
+        let state_reject = promise_state.clone();
+        let reject_fn: super::value::NativeFn = Rc::new(move |args: &[Value]| -> Result<Value> {
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let mut state = state_reject.borrow_mut();
+            if state.0 == super::value::PromiseState::Pending {
+                state.0 = super::value::PromiseState::Rejected;
+                state.1 = Some(Box::new(reason.clone()));
+                let mut obj_mut = obj_reject.borrow_mut();
+                obj_mut.kind = super::value::ObjectKind::Promise {
+                    state: super::value::PromiseState::Rejected,
+                    value: Some(Box::new(reason)),
+                    on_fulfilled: Vec::new(),
+                    on_rejected: Vec::new(),
+                };
+            }
+            Ok(Value::Undefined)
+        });
+
+        let resolve_value = Value::Object(Rc::new(RefCell::new(super::value::Object {
+            kind: super::value::ObjectKind::NativeFunction { name: "resolve".to_string(), func: resolve_fn },
+            properties: std::collections::HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })));
+
+        let reject_value = Value::Object(Rc::new(RefCell::new(super::value::Object {
+            kind: super::value::ObjectKind::NativeFunction { name: "reject".to_string(), func: reject_fn },
+            properties: std::collections::HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })));
+
+        // Call the executor with (resolve, reject) if it is a native function
+        if let Value::Object(exec_obj) = &executor {
+            let exec_ref = exec_obj.borrow();
+            if let super::value::ObjectKind::NativeFunction { func, .. } = &exec_ref.kind {
+                let func = func.clone();
+                drop(exec_ref);
+                match func(&[resolve_value, reject_value]) {
+                    Ok(_) => {}
+                    Err(_e) => {
+                        // If executor throws, reject the promise
+                        let mut ps = promise_state.borrow_mut();
+                        if ps.0 == super::value::PromiseState::Pending {
+                            let err_val = Value::String(format!("{}", _e));
+                            ps.0 = super::value::PromiseState::Rejected;
+                            ps.1 = Some(Box::new(err_val.clone()));
+                            let mut obj_mut = obj.borrow_mut();
+                            obj_mut.kind = super::value::ObjectKind::Promise {
+                                state: super::value::PromiseState::Rejected,
+                                value: Some(Box::new(err_val)),
+                                on_fulfilled: Vec::new(),
+                                on_rejected: Vec::new(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
 
         let promise = Value::Object(obj.clone());
         add_promise_methods(&promise, obj);
@@ -1387,6 +1470,85 @@ fn register_promise(vm: &mut VM) {
         }
     });
 
+    // Promise.withResolvers - creates a promise with external resolve/reject
+    vm.register_native("Promise_withResolvers", |_args| {
+        let promise_state: Rc<RefCell<(super::value::PromiseState, Option<Box<Value>>)>> =
+            Rc::new(RefCell::new((super::value::PromiseState::Pending, None)));
+
+        let obj = Rc::new(RefCell::new(super::value::Object {
+            kind: super::value::ObjectKind::Promise {
+                state: super::value::PromiseState::Pending,
+                value: None,
+                on_fulfilled: Vec::new(),
+                on_rejected: Vec::new(),
+            },
+            properties: std::collections::HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        }));
+
+        let obj_resolve = obj.clone();
+        let state_resolve = promise_state.clone();
+        let resolve_fn: super::value::NativeFn = Rc::new(move |args: &[Value]| -> Result<Value> {
+            let val = args.first().cloned().unwrap_or(Value::Undefined);
+            let mut state = state_resolve.borrow_mut();
+            if state.0 == super::value::PromiseState::Pending {
+                state.0 = super::value::PromiseState::Fulfilled;
+                state.1 = Some(Box::new(val.clone()));
+                let mut obj_mut = obj_resolve.borrow_mut();
+                obj_mut.kind = super::value::ObjectKind::Promise {
+                    state: super::value::PromiseState::Fulfilled,
+                    value: Some(Box::new(val)),
+                    on_fulfilled: Vec::new(),
+                    on_rejected: Vec::new(),
+                };
+            }
+            Ok(Value::Undefined)
+        });
+
+        let obj_reject = obj.clone();
+        let state_reject = promise_state;
+        let reject_fn: super::value::NativeFn = Rc::new(move |args: &[Value]| -> Result<Value> {
+            let reason = args.first().cloned().unwrap_or(Value::Undefined);
+            let mut state = state_reject.borrow_mut();
+            if state.0 == super::value::PromiseState::Pending {
+                state.0 = super::value::PromiseState::Rejected;
+                state.1 = Some(Box::new(reason.clone()));
+                let mut obj_mut = obj_reject.borrow_mut();
+                obj_mut.kind = super::value::ObjectKind::Promise {
+                    state: super::value::PromiseState::Rejected,
+                    value: Some(Box::new(reason)),
+                    on_fulfilled: Vec::new(),
+                    on_rejected: Vec::new(),
+                };
+            }
+            Ok(Value::Undefined)
+        });
+
+        let promise_value = Value::Object(obj.clone());
+        add_promise_methods(&promise_value, obj);
+
+        let resolve_value = Value::Object(Rc::new(RefCell::new(super::value::Object {
+            kind: super::value::ObjectKind::NativeFunction { name: "resolve".to_string(), func: resolve_fn },
+            properties: std::collections::HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })));
+
+        let reject_value = Value::Object(Rc::new(RefCell::new(super::value::Object {
+            kind: super::value::ObjectKind::NativeFunction { name: "reject".to_string(), func: reject_fn },
+            properties: std::collections::HashMap::default(),
+            private_fields: HashMap::default(),
+            prototype: None, cached_shape_id: None,
+        })));
+
+        let result = Value::new_object();
+        result.set_property("promise", promise_value);
+        result.set_property("resolve", resolve_value);
+        result.set_property("reject", reject_value);
+        Ok(result)
+    });
+
     // Create Promise object
     let promise = Value::new_object();
     promise.set_property("resolve", vm.get_global("Promise_resolve").unwrap_or(Value::Undefined));
@@ -1395,6 +1557,7 @@ fn register_promise(vm: &mut VM) {
     promise.set_property("race", vm.get_global("Promise_race").unwrap_or(Value::Undefined));
     promise.set_property("allSettled", vm.get_global("Promise_allSettled").unwrap_or(Value::Undefined));
     promise.set_property("any", vm.get_global("Promise_any").unwrap_or(Value::Undefined));
+    promise.set_property("withResolvers", vm.get_global("Promise_withResolvers").unwrap_or(Value::Undefined));
 
     vm.set_global("Promise", promise);
     vm.set_global("__Promise_constructor", vm.get_global("Promise_constructor").unwrap_or(Value::Undefined));
@@ -2472,10 +2635,10 @@ fn extract_host_from_url(url: &str) -> String {
     let url = url.trim();
 
     // Handle common schemes
-    let rest = if url.starts_with("https://") {
-        &url[8..]
-    } else if url.starts_with("http://") {
-        &url[7..]
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else if let Some(r) = url.strip_prefix("http://") {
+        r
     } else if url.starts_with("mock://") {
         return "mock".to_string(); // Mock URLs don't need network permission
     } else {
@@ -2599,10 +2762,10 @@ fn register_global_functions(vm: &mut VM) {
         }
 
         let text = text.trim();
-        let (text, negative) = if text.starts_with('-') {
-            (&text[1..], true)
-        } else if text.starts_with('+') {
-            (&text[1..], false)
+        let (text, negative) = if let Some(t) = text.strip_prefix('-') {
+            (t, true)
+        } else if let Some(t) = text.strip_prefix('+') {
+            (t, false)
         } else {
             (text, false)
         };
