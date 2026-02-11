@@ -202,7 +202,21 @@ impl GeneratorProtocol {
                 drop(borrowed);
                 Self::next(iterator, None)
             }
-            _ => Ok(create_iterator_result(Value::Undefined, true)),
+            _ => {
+                // Check for .next() method on ordinary objects (from_fn iterators)
+                if let Some(next_fn) = borrowed.properties.get("next").cloned() {
+                    drop(borrowed);
+                    if let Value::Object(fn_obj) = &next_fn {
+                        let fn_ref = fn_obj.borrow();
+                        if let ObjectKind::NativeFunction { func, .. } = &fn_ref.kind {
+                                let f = func.clone();
+                                drop(fn_ref);
+                                return f(&[]);
+                        }
+                    }
+                }
+                Ok(create_iterator_result(Value::Undefined, true))
+            }
         }
     }
 
@@ -266,13 +280,13 @@ impl GeneratorProtocol {
 
     /// Create a generator-like object from a closure producing values on demand
     /// Useful for implementing lazy iterators
-    pub fn from_fn<F>(mut producer: F) -> Value
+    pub fn from_fn<F>(producer: F) -> Value
     where
         F: FnMut() -> Option<Value> + 'static,
     {
         let done = Rc::new(RefCell::new(false));
         let done_clone = Rc::clone(&done);
-        let producer = Rc::new(RefCell::new(move || producer()));
+        let producer = Rc::new(RefCell::new(producer));
 
         let next_fn: crate::runtime::value::NativeFn = {
             let producer = Rc::clone(&producer);
@@ -315,6 +329,114 @@ impl GeneratorProtocol {
                 Some(Value::Number(val as f64))
             } else {
                 None
+            }
+        })
+    }
+
+    /// Map an iterator, transforming each value with a closure
+    pub fn map_iterator<F>(source: Value, transform: F) -> Value
+    where
+        F: Fn(Value) -> Value + 'static,
+    {
+        let source = Rc::new(RefCell::new(source));
+        Self::from_fn(move || {
+            let next_result = Self::iterator_next(&source.borrow());
+            match next_result {
+                Ok(result) => {
+                    if Self::is_done(&result) {
+                        None
+                    } else {
+                        Some(transform(Self::get_value(&result)))
+                    }
+                }
+                Err(_) => None,
+            }
+        })
+    }
+
+    /// Filter an iterator, keeping only values matching a predicate
+    pub fn filter_iterator<F>(source: Value, predicate: F) -> Value
+    where
+        F: Fn(&Value) -> bool + 'static,
+    {
+        let source = Rc::new(RefCell::new(source));
+        Self::from_fn(move || {
+            loop {
+                let next_result = Self::iterator_next(&source.borrow());
+                match next_result {
+                    Ok(result) => {
+                        if Self::is_done(&result) {
+                            return None;
+                        }
+                        let val = Self::get_value(&result);
+                        if predicate(&val) {
+                            return Some(val);
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+        })
+    }
+
+    /// Take the first n values from an iterator
+    pub fn take_iterator(source: Value, n: usize) -> Value {
+        let source = Rc::new(RefCell::new(source));
+        let count = Rc::new(RefCell::new(0usize));
+        Self::from_fn(move || {
+            let mut c = count.borrow_mut();
+            if *c >= n {
+                return None;
+            }
+            *c += 1;
+            drop(c);
+            let next_result = Self::iterator_next(&source.borrow());
+            match next_result {
+                Ok(result) => {
+                    if Self::is_done(&result) {
+                        None
+                    } else {
+                        Some(Self::get_value(&result))
+                    }
+                }
+                Err(_) => None,
+            }
+        })
+    }
+
+    /// Zip two iterators together into pairs
+    pub fn zip_iterators(a: Value, b: Value) -> Value {
+        let a = Rc::new(RefCell::new(a));
+        let b = Rc::new(RefCell::new(b));
+        Self::from_fn(move || {
+            let ra = Self::iterator_next(&a.borrow()).ok()?;
+            let rb = Self::iterator_next(&b.borrow()).ok()?;
+            if Self::is_done(&ra) || Self::is_done(&rb) {
+                None
+            } else {
+                Some(Value::new_array(vec![
+                    Self::get_value(&ra),
+                    Self::get_value(&rb),
+                ]))
+            }
+        })
+    }
+
+    /// Enumerate an iterator, producing [index, value] pairs
+    pub fn enumerate_iterator(source: Value) -> Value {
+        let source = Rc::new(RefCell::new(source));
+        let idx = Rc::new(RefCell::new(0usize));
+        Self::from_fn(move || {
+            let next_result = Self::iterator_next(&source.borrow()).ok()?;
+            if Self::is_done(&next_result) {
+                None
+            } else {
+                let i = *idx.borrow();
+                *idx.borrow_mut() += 1;
+                Some(Value::new_array(vec![
+                    Value::Number(i as f64),
+                    Self::get_value(&next_result),
+                ]))
             }
         })
     }
@@ -587,5 +709,65 @@ mod tests {
         if let Ok(Value::Boolean(b)) = result {
             assert!(b);
         }
+    }
+
+    #[test]
+    fn test_map_iterator_transform() {
+        let arr = Value::new_array(vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]);
+        let iter = GeneratorProtocol::get_iterator(&arr).unwrap();
+        let mapped = GeneratorProtocol::map_iterator(iter, |v| {
+            if let Value::Number(n) = v { Value::Number(n * 10.0) } else { v }
+        });
+        let collected = GeneratorProtocol::collect_iterator(&mapped).unwrap();
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0], Value::Number(10.0));
+        assert_eq!(collected[2], Value::Number(30.0));
+    }
+
+    #[test]
+    fn test_filter_iterator() {
+        let arr = Value::new_array(vec![
+            Value::Number(1.0), Value::Number(2.0),
+            Value::Number(3.0), Value::Number(4.0),
+        ]);
+        let iter = GeneratorProtocol::get_iterator(&arr).unwrap();
+        let filtered = GeneratorProtocol::filter_iterator(iter, |v| {
+            if let Value::Number(n) = v { *n > 2.0 } else { false }
+        });
+        let collected = GeneratorProtocol::collect_iterator(&filtered).unwrap();
+        assert_eq!(collected.len(), 2);
+        assert_eq!(collected[0], Value::Number(3.0));
+    }
+
+    #[test]
+    fn test_take_iterator() {
+        let range = GeneratorProtocol::range(0, 100, 1);
+        let taken = GeneratorProtocol::take_iterator(range, 5);
+        let collected = GeneratorProtocol::collect_iterator(&taken).unwrap();
+        assert_eq!(collected.len(), 5);
+        assert_eq!(collected[4], Value::Number(4.0));
+    }
+
+    #[test]
+    fn test_zip_iterators() {
+        let a = Value::new_array(vec![Value::Number(1.0), Value::Number(2.0)]);
+        let b = Value::new_array(vec![Value::String("a".to_string()), Value::String("b".to_string())]);
+        let ia = GeneratorProtocol::get_iterator(&a).unwrap();
+        let ib = GeneratorProtocol::get_iterator(&b).unwrap();
+        let zipped = GeneratorProtocol::zip_iterators(ia, ib);
+        let collected = GeneratorProtocol::collect_iterator(&zipped).unwrap();
+        assert_eq!(collected.len(), 2);
+    }
+
+    #[test]
+    fn test_enumerate_iterator() {
+        let arr = Value::new_array(vec![
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+        ]);
+        let iter = GeneratorProtocol::get_iterator(&arr).unwrap();
+        let enumerated = GeneratorProtocol::enumerate_iterator(iter);
+        let collected = GeneratorProtocol::collect_iterator(&enumerated).unwrap();
+        assert_eq!(collected.len(), 2);
     }
 }
