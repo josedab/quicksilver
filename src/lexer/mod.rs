@@ -216,6 +216,8 @@ impl<'src> Lexer<'src> {
             "set" => TokenKind::Keyword(Keyword::Set),
             "target" => TokenKind::Keyword(Keyword::Target),
             "perform" => TokenKind::Keyword(Keyword::Perform),
+            "match" => TokenKind::Keyword(Keyword::Match),
+            "when" => TokenKind::Keyword(Keyword::When),
             // Identifier
             _ => TokenKind::Identifier,
         };

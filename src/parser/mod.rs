@@ -1760,6 +1760,12 @@ impl<'src> Parser<'src> {
             })));
         }
 
+        // Match expression: match(expr) { when pattern => body, ... }
+        if self.peek() == TokenKind::Keyword(Keyword::Match) {
+            self.advance();
+            return self.parse_match_expression(start);
+        }
+
         // Perform expression: perform Effect.operation(args)
         if self.peek() == TokenKind::Keyword(Keyword::Perform) {
             self.advance();
@@ -2253,6 +2259,86 @@ impl<'src> Parser<'src> {
             method: false,
             span: Span::new(start, self.location()),
         })
+    }
+
+    /// Parse match expression: match(expr) { when pat => body, ... }
+    fn parse_match_expression(&mut self, start: SourceLocation) -> Result<Expression> {
+        use crate::ast::{MatchExpression, MatchArm, MatchPattern};
+
+        self.expect(TokenKind::LeftParen)?;
+        let discriminant = self.parse_expression()?;
+        self.expect(TokenKind::RightParen)?;
+        self.expect(TokenKind::LeftBrace)?;
+
+        let mut arms = Vec::new();
+
+        while self.peek() != TokenKind::RightBrace && self.peek() != TokenKind::Eof {
+            let arm_start = self.location();
+
+            self.expect(TokenKind::Keyword(Keyword::When))?;
+
+            // Parse pattern
+            let pattern = if self.peek() == TokenKind::Identifier && self.current().text == "_" {
+                let span = Span::new(self.location(), self.location());
+                self.advance();
+                MatchPattern::Wildcard(span)
+            } else if matches!(self.peek(), TokenKind::NumberLiteral | TokenKind::StringLiteral) {
+                let lit_expr = self.parse_primary_expression()?;
+                match lit_expr {
+                    Expression::Literal(lit) => MatchPattern::Literal(lit),
+                    _ => return Err(self.error("Expected pattern", arm_start)),
+                }
+            } else if self.peek() == TokenKind::Keyword(Keyword::True) {
+                self.advance();
+                MatchPattern::Literal(crate::ast::Literal {
+                    value: crate::ast::LiteralValue::Boolean(true),
+                    raw: "true".to_string(),
+                    span: Span::new(arm_start, self.location()),
+                })
+            } else if self.peek() == TokenKind::Keyword(Keyword::False) {
+                self.advance();
+                MatchPattern::Literal(crate::ast::Literal {
+                    value: crate::ast::LiteralValue::Boolean(false),
+                    raw: "false".to_string(),
+                    span: Span::new(arm_start, self.location()),
+                })
+            } else if self.peek() == TokenKind::Keyword(Keyword::Null) {
+                self.advance();
+                MatchPattern::Literal(crate::ast::Literal {
+                    value: crate::ast::LiteralValue::Null,
+                    raw: "null".to_string(),
+                    span: Span::new(arm_start, self.location()),
+                })
+            } else {
+                let id = self.parse_identifier()?;
+                MatchPattern::Identifier(id)
+            };
+
+            // Expect =>
+            self.expect(TokenKind::Arrow)?;
+
+            // Parse body expression
+            let body = self.parse_expression()?;
+
+            arms.push(MatchArm {
+                pattern,
+                body,
+                span: Span::new(arm_start, self.location()),
+            });
+
+            // Optional comma between arms
+            if self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+
+        self.expect(TokenKind::RightBrace)?;
+
+        Ok(Expression::Match(Box::new(MatchExpression {
+            discriminant,
+            arms,
+            span: Span::new(start, self.location()),
+        })))
     }
 
     fn parse_template_literal(&mut self) -> Result<Expression> {
@@ -2901,5 +2987,17 @@ mod tests {
             Statement::For(_) => {}
             _ => panic!("Expected for statement"),
         }
+    }
+
+    #[test]
+    fn test_parse_match_expression() {
+        let program = parse("let r = match(x) { when 1 => \"one\", when _ => \"other\" };").unwrap();
+        assert_eq!(program.body.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_match_with_bool_null() {
+        let program = parse("match(v) { when true => 1, when false => 2, when null => 3 }").unwrap();
+        assert_eq!(program.body.len(), 1);
     }
 }

@@ -231,6 +231,10 @@ pub enum Keyword {
 
     // Algebraic effects keyword
     Perform,
+
+    // Pattern matching keywords
+    Match,
+    When,
 }
 
 impl Keyword {
@@ -245,6 +249,8 @@ impl Keyword {
                 | Keyword::Of
                 | Keyword::Set
                 | Keyword::Target
+                | Keyword::Match
+                | Keyword::When
         )
     }
 
@@ -299,6 +305,8 @@ impl Keyword {
             Keyword::Set => "set",
             Keyword::Target => "target",
             Keyword::Perform => "perform",
+            Keyword::Match => "match",
+            Keyword::When => "when",
         }
     }
 }

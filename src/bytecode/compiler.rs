@@ -1529,6 +1529,61 @@ impl Compiler {
         Ok(())
     }
 
+    fn compile_match_expr(&mut self, match_expr: &crate::ast::MatchExpression) -> Result<()> {
+        use crate::ast::MatchPattern;
+
+        // Compile discriminant - leave on stack
+        self.compile_expr(&match_expr.discriminant)?;
+
+        let mut end_jumps = Vec::new();
+
+        for arm in &match_expr.arms {
+            match &arm.pattern {
+                MatchPattern::Wildcard(_) => {
+                    // Default arm: pop discriminant, compile body
+                    self.emit(Opcode::Pop);
+                    self.compile_expr(&arm.body)?;
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                }
+                MatchPattern::Literal(lit) => {
+                    self.emit(Opcode::Dup);
+                    self.compile_literal(lit)?;
+                    self.emit(Opcode::StrictEq);
+                    let skip = self.emit_jump(Opcode::JumpIfFalse);
+                    self.emit(Opcode::Pop); // pop bool
+                    self.emit(Opcode::Pop); // pop discriminant
+                    self.compile_expr(&arm.body)?;
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                    self.patch_jump(skip);
+                    self.emit(Opcode::Pop); // pop false
+                }
+                MatchPattern::Identifier(id) => {
+                    // Compare against variable value
+                    self.emit(Opcode::Dup);
+                    self.compile_identifier(id)?;
+                    self.emit(Opcode::StrictEq);
+                    let skip = self.emit_jump(Opcode::JumpIfFalse);
+                    self.emit(Opcode::Pop); // pop bool
+                    self.emit(Opcode::Pop); // pop discriminant
+                    self.compile_expr(&arm.body)?;
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                    self.patch_jump(skip);
+                    self.emit(Opcode::Pop); // pop false
+                }
+            }
+        }
+
+        // If no arm matched, result is undefined
+        self.emit(Opcode::Pop); // pop discriminant
+        self.emit(Opcode::Undefined);
+
+        for jump in end_jumps {
+            self.patch_jump(jump);
+        }
+
+        Ok(())
+    }
+
     fn compile_class_decl(&mut self, class: &Class) -> Result<()> {
         let name = class.id.as_ref().map(|id| id.name.clone());
 
@@ -1790,6 +1845,9 @@ impl Compiler {
                 self.emit_u16(operation_index);
                 self.emit_byte(perform_expr.arguments.len() as u8);
                 Ok(())
+            }
+            Expression::Match(match_expr) => {
+                self.compile_match_expr(match_expr)
             }
             _ => {
                 // Fallback for unimplemented expression types (e.g., MetaProperty, JSX)

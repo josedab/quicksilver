@@ -38,7 +38,7 @@ pub enum Expression {
     /// super expression (in method calls)
     Super(Span),
 
-    /// Member expression obj.prop or obj[prop]
+    /// Member expression `obj.prop` or `obj[prop]`
     Member(Box<MemberExpression>),
 
     /// Optional member expression obj?.prop
@@ -94,6 +94,9 @@ pub enum Expression {
 
     /// Parenthesized expression (for preserving parens)
     Parenthesized(Box<Expression>),
+
+    /// Pattern matching expression: match(expr) { when ... => ... }
+    Match(Box<MatchExpression>),
 }
 
 impl Expression {
@@ -130,6 +133,7 @@ impl Expression {
             Expression::Import(i) => i.span,
             Expression::Perform(p) => p.span,
             Expression::Parenthesized(e) => e.span(),
+            Expression::Match(m) => m.span,
         }
     }
 
@@ -197,7 +201,7 @@ pub struct TaggedTemplate {
 /// Array expression
 #[derive(Debug, Clone)]
 pub struct ArrayExpression {
-    /// Array elements (None for holes like [1,,3])
+    /// Array elements (None for holes like `[1,,3]`)
     pub elements: Vec<Option<Expression>>,
     /// Span in source
     pub span: Span,
@@ -237,7 +241,7 @@ pub struct MemberExpression {
     pub object: Expression,
     /// Property being accessed
     pub property: MemberProperty,
-    /// Is this a computed property access? (obj[prop])
+    /// Is this a computed property access? (`obj[prop]`)
     pub computed: bool,
     /// Span in source
     pub span: Span,
@@ -246,11 +250,11 @@ pub struct MemberExpression {
 /// Member property (can be identifier or computed)
 #[derive(Debug, Clone)]
 pub enum MemberProperty {
-    /// obj.prop
+    /// Named property access (`obj.prop`)
     Identifier(Identifier),
-    /// obj[expr]
+    /// Computed expression (`obj[x]`)
     Expression(Box<Expression>),
-    /// obj.#privateProp
+    /// Private field access (`obj.#privateProp`)
     PrivateName(String),
 }
 
@@ -555,4 +559,38 @@ pub struct PerformExpression {
     pub arguments: Vec<Expression>,
     /// Span in source
     pub span: Span,
+}
+
+/// Pattern matching expression
+/// match(expr) { when value => result, when _ => default }
+#[derive(Debug, Clone)]
+pub struct MatchExpression {
+    /// The expression being matched
+    pub discriminant: Expression,
+    /// The match arms
+    pub arms: Vec<MatchArm>,
+    /// Span in source
+    pub span: Span,
+}
+
+/// A single arm in a match expression
+#[derive(Debug, Clone)]
+pub struct MatchArm {
+    /// Pattern to match against (None = wildcard/default)
+    pub pattern: MatchPattern,
+    /// The body expression to evaluate if matched
+    pub body: Expression,
+    /// Span in source
+    pub span: Span,
+}
+
+/// A pattern in a match arm
+#[derive(Debug, Clone)]
+pub enum MatchPattern {
+    /// A literal value (number, string, boolean, null)
+    Literal(Literal),
+    /// An identifier pattern (binds or compares)
+    Identifier(Identifier),
+    /// Wildcard pattern (_) - matches anything
+    Wildcard(Span),
 }
