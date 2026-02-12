@@ -445,6 +445,175 @@ pub fn compile_to_wasi(bytecode: &[u8], name: &str) -> Result<WasiModule> {
 }
 
 // ---------------------------------------------------------------------------
+// WASI Preview 2 Component Model
+// ---------------------------------------------------------------------------
+
+/// WASI Preview 2 Component Model interface definition
+#[derive(Debug, Clone)]
+pub struct WitInterface {
+    /// Interface name (e.g., "wasi:io/streams@0.2.0")
+    pub name: String,
+    /// Functions exported by this interface
+    pub functions: Vec<WitFunction>,
+    /// Types defined by this interface
+    pub types: Vec<WitType>,
+}
+
+/// A function in a WIT interface
+#[derive(Debug, Clone)]
+pub struct WitFunction {
+    /// Function name
+    pub name: String,
+    /// Parameter names and types
+    pub params: Vec<(String, WitValueType)>,
+    /// Return type
+    pub results: Vec<WitValueType>,
+}
+
+/// WIT value types for the Component Model
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WitValueType {
+    Bool,
+    U8, U16, U32, U64,
+    S8, S16, S32, S64,
+    F32, F64,
+    Char,
+    String,
+    List(Box<WitValueType>),
+    Option(Box<WitValueType>),
+    Result { ok: Box<WitValueType>, err: Box<WitValueType> },
+    Handle(String),
+}
+
+/// A type definition in a WIT interface
+#[derive(Debug, Clone)]
+pub struct WitType {
+    /// Type name
+    pub name: String,
+    /// Type kind
+    pub kind: WitTypeKind,
+}
+
+/// Kind of WIT type
+#[derive(Debug, Clone)]
+pub enum WitTypeKind {
+    Record(Vec<(String, WitValueType)>),
+    Enum(Vec<String>),
+    Flags(Vec<String>),
+    Variant(Vec<(String, Option<WitValueType>)>),
+    Alias(WitValueType),
+}
+
+/// WASI Preview 2 Component descriptor
+#[derive(Debug, Clone)]
+pub struct WasiComponent {
+    /// Component name
+    pub name: String,
+    /// Interfaces this component imports
+    pub imports: Vec<WitInterface>,
+    /// Interfaces this component exports
+    pub exports: Vec<WitInterface>,
+    /// Required WASI capabilities
+    pub capabilities: Vec<WasiCapability>,
+}
+
+/// WASI capabilities that a component may require
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WasiCapability {
+    Stdin,
+    Stdout,
+    Stderr,
+    FilesystemRead,
+    FilesystemWrite,
+    RandomGet,
+    Clocks,
+    HttpOutgoing,
+    Sockets,
+}
+
+impl WasiComponent {
+    /// Create a minimal component for a JS runtime
+    pub fn js_runtime(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            imports: vec![
+                WitInterface {
+                    name: "wasi:io/streams@0.2.0".to_string(),
+                    functions: vec![],
+                    types: vec![],
+                },
+                WitInterface {
+                    name: "wasi:cli/stdout@0.2.0".to_string(),
+                    functions: vec![WitFunction {
+                        name: "get-stdout".to_string(),
+                        params: vec![],
+                        results: vec![WitValueType::Handle("output-stream".to_string())],
+                    }],
+                    types: vec![],
+                },
+                WitInterface {
+                    name: "wasi:clocks/wall-clock@0.2.0".to_string(),
+                    functions: vec![WitFunction {
+                        name: "now".to_string(),
+                        params: vec![],
+                        results: vec![WitValueType::U64],
+                    }],
+                    types: vec![],
+                },
+                WitInterface {
+                    name: "wasi:random/random@0.2.0".to_string(),
+                    functions: vec![WitFunction {
+                        name: "get-random-u64".to_string(),
+                        params: vec![],
+                        results: vec![WitValueType::U64],
+                    }],
+                    types: vec![],
+                },
+            ],
+            exports: vec![WitInterface {
+                name: "wasi:cli/run@0.2.0".to_string(),
+                functions: vec![WitFunction {
+                    name: "run".to_string(),
+                    params: vec![],
+                    results: vec![WitValueType::Result {
+                        ok: Box::new(WitValueType::Bool),
+                        err: Box::new(WitValueType::Bool),
+                    }],
+                }],
+                types: vec![],
+            }],
+            capabilities: vec![
+                WasiCapability::Stdout,
+                WasiCapability::Stderr,
+                WasiCapability::RandomGet,
+                WasiCapability::Clocks,
+            ],
+        }
+    }
+
+    /// Generate a WIT (WebAssembly Interface Types) description
+    pub fn to_wit(&self) -> String {
+        let mut s = format!("package quicksilver:{};\n\n", self.name);
+
+        s.push_str("world quicksilver-runtime {\n");
+        for imp in &self.imports {
+            s.push_str(&format!("  import {};\n", imp.name));
+        }
+        for exp in &self.exports {
+            s.push_str(&format!("  export {};\n", exp.name));
+        }
+        s.push_str("}\n");
+
+        s
+    }
+
+    /// List all required WASI capabilities
+    pub fn required_capabilities(&self) -> &[WasiCapability] {
+        &self.capabilities
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WasiRuntime
 // ---------------------------------------------------------------------------
 
@@ -736,5 +905,65 @@ mod tests {
         } else {
             panic!("Expected object");
         }
+    }
+
+    #[test]
+    fn test_wasi_component_js_runtime() {
+        let component = WasiComponent::js_runtime("test-app");
+        assert_eq!(component.name, "test-app");
+        assert!(!component.imports.is_empty());
+        assert!(!component.exports.is_empty());
+        assert!(component.capabilities.contains(&WasiCapability::Stdout));
+        assert!(component.capabilities.contains(&WasiCapability::Clocks));
+    }
+
+    #[test]
+    fn test_wasi_component_to_wit() {
+        let component = WasiComponent::js_runtime("my-runtime");
+        let wit = component.to_wit();
+        assert!(wit.contains("package quicksilver:my-runtime"));
+        assert!(wit.contains("import"));
+        assert!(wit.contains("export"));
+        assert!(wit.contains("wasi:cli/run@0.2.0"));
+    }
+
+    #[test]
+    fn test_wit_value_types() {
+        let result_type = WitValueType::Result {
+            ok: Box::new(WitValueType::String),
+            err: Box::new(WitValueType::String),
+        };
+        assert!(matches!(result_type, WitValueType::Result { .. }));
+
+        let list_type = WitValueType::List(Box::new(WitValueType::U8));
+        assert!(matches!(list_type, WitValueType::List(_)));
+    }
+
+    #[test]
+    fn test_wit_interface() {
+        let iface = WitInterface {
+            name: "test:iface@1.0.0".to_string(),
+            functions: vec![WitFunction {
+                name: "greet".to_string(),
+                params: vec![("name".to_string(), WitValueType::String)],
+                results: vec![WitValueType::String],
+            }],
+            types: vec![WitType {
+                name: "greeting".to_string(),
+                kind: WitTypeKind::Record(vec![
+                    ("message".to_string(), WitValueType::String),
+                    ("count".to_string(), WitValueType::U32),
+                ]),
+            }],
+        };
+        assert_eq!(iface.functions.len(), 1);
+        assert_eq!(iface.types.len(), 1);
+    }
+
+    #[test]
+    fn test_wasi_capabilities() {
+        let component = WasiComponent::js_runtime("test");
+        let caps = component.required_capabilities();
+        assert!(caps.contains(&WasiCapability::RandomGet));
     }
 }
