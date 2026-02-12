@@ -1321,7 +1321,9 @@ impl CommonJsRuntime {
             "util" => Ok(self.build_util_module()),
             "process" => Ok(self.build_process_module()),
             "os" => Ok(self.build_os_module()),
-            "url" | "buffer" | "events" | "crypto" | "fs" | "http" | "https" | "stream" | "net" | "child_process" => {
+            "buffer" => Ok(self.build_buffer_module()),
+            "events" => Ok(self.build_events_module()),
+            "url" | "crypto" | "fs" | "http" | "https" | "stream" | "net" | "child_process" => {
                 // Return a stub object with the module name
                 let mut props = rustc_hash::FxHashMap::default();
                 props.insert("__module__".to_string(), Value::String(name.to_string()));
@@ -1333,30 +1335,30 @@ impl CommonJsRuntime {
 
     fn build_path_module(&self) -> Value {
         let mut props = rustc_hash::FxHashMap::default();
-        props.insert("join".to_string(), Value::make_native_fn("join", |args| node_path::join(args)));
-        props.insert("resolve".to_string(), Value::make_native_fn("resolve", |args| node_path::resolve(args)));
-        props.insert("dirname".to_string(), Value::make_native_fn("dirname", |args| node_path::dirname(args)));
-        props.insert("basename".to_string(), Value::make_native_fn("basename", |args| node_path::basename(args)));
-        props.insert("extname".to_string(), Value::make_native_fn("extname", |args| node_path::extname(args)));
-        props.insert("isAbsolute".to_string(), Value::make_native_fn("isAbsolute", |args| node_path::is_absolute(args)));
-        props.insert("normalize".to_string(), Value::make_native_fn("normalize", |args| node_path::normalize(args)));
-        props.insert("parse".to_string(), Value::make_native_fn("parse", |args| node_path::parse_path(args)));
+        props.insert("join".to_string(), Value::make_native_fn("join", node_path::join));
+        props.insert("resolve".to_string(), Value::make_native_fn("resolve", node_path::resolve));
+        props.insert("dirname".to_string(), Value::make_native_fn("dirname", node_path::dirname));
+        props.insert("basename".to_string(), Value::make_native_fn("basename", node_path::basename));
+        props.insert("extname".to_string(), Value::make_native_fn("extname", node_path::extname));
+        props.insert("isAbsolute".to_string(), Value::make_native_fn("isAbsolute", node_path::is_absolute));
+        props.insert("normalize".to_string(), Value::make_native_fn("normalize", node_path::normalize));
+        props.insert("parse".to_string(), Value::make_native_fn("parse", node_path::parse_path));
         props.insert("sep".to_string(), node_path::sep());
         Value::new_object_with_properties(props)
     }
 
     fn build_assert_module(&self) -> Value {
         let mut props = rustc_hash::FxHashMap::default();
-        props.insert("ok".to_string(), Value::make_native_fn("ok", |args| node_assert::ok(args)));
-        props.insert("strictEqual".to_string(), Value::make_native_fn("strictEqual", |args| node_assert::strict_equal(args)));
-        props.insert("deepStrictEqual".to_string(), Value::make_native_fn("deepStrictEqual", |args| node_assert::deep_strict_equal(args)));
+        props.insert("ok".to_string(), Value::make_native_fn("ok", node_assert::ok));
+        props.insert("strictEqual".to_string(), Value::make_native_fn("strictEqual", node_assert::strict_equal));
+        props.insert("deepStrictEqual".to_string(), Value::make_native_fn("deepStrictEqual", node_assert::deep_strict_equal));
         Value::new_object_with_properties(props)
     }
 
     fn build_util_module(&self) -> Value {
         let mut props = rustc_hash::FxHashMap::default();
-        props.insert("inspect".to_string(), Value::make_native_fn("inspect", |args| node_util::inspect(args)));
-        props.insert("format".to_string(), Value::make_native_fn("format", |args| node_util::format(args)));
+        props.insert("inspect".to_string(), Value::make_native_fn("inspect", node_util::inspect));
+        props.insert("format".to_string(), Value::make_native_fn("format", node_util::format));
         Value::new_object_with_properties(props)
     }
 
@@ -1434,6 +1436,136 @@ impl CommonJsRuntime {
         props.insert("cpus".to_string(), Value::make_native_fn("cpus", |_args| {
             Ok(Value::new_array(vec![]))
         }));
+        Value::new_object_with_properties(props)
+    }
+
+    fn build_buffer_module(&self) -> Value {
+        let mut props = rustc_hash::FxHashMap::default();
+
+        // Buffer.from(data, encoding?)
+        props.insert("Buffer".to_string(), {
+            let buffer_obj = Value::new_object();
+
+            buffer_obj.set_property("from", Value::make_native_fn("from", |args| {
+                let data = args.first().cloned().unwrap_or(Value::Undefined);
+                match data {
+                    Value::String(s) => {
+                        let bytes: Vec<Value> = s.bytes().map(|b| Value::Number(b as f64)).collect();
+                        let buf = Value::new_array(bytes.clone());
+                        buf.set_property("length", Value::Number(bytes.len() as f64));
+                        buf.set_property("type", Value::String("Buffer".to_string()));
+                        Ok(buf)
+                    }
+                    Value::Object(obj) => {
+                        let borrowed = obj.borrow();
+                        if let crate::ObjectKind::Array(arr) = &borrowed.kind {
+                            let buf = Value::new_array(arr.clone());
+                            buf.set_property("length", Value::Number(arr.len() as f64));
+                            buf.set_property("type", Value::String("Buffer".to_string()));
+                            Ok(buf)
+                        } else {
+                            Ok(Value::new_array(vec![]))
+                        }
+                    }
+                    _ => Ok(Value::new_array(vec![])),
+                }
+            }));
+
+            // Buffer.alloc(size, fill?)
+            buffer_obj.set_property("alloc", Value::make_native_fn("alloc", |args| {
+                let size = args.first()
+                    .and_then(|v| if let Value::Number(n) = v { Some(*n as usize) } else { None })
+                    .unwrap_or(0);
+                let fill = args.get(1)
+                    .and_then(|v| if let Value::Number(n) = v { Some(*n) } else { None })
+                    .unwrap_or(0.0);
+                let bytes: Vec<Value> = vec![Value::Number(fill); size];
+                let buf = Value::new_array(bytes);
+                buf.set_property("length", Value::Number(size as f64));
+                buf.set_property("type", Value::String("Buffer".to_string()));
+                Ok(buf)
+            }));
+
+            // Buffer.isBuffer(obj)
+            buffer_obj.set_property("isBuffer", Value::make_native_fn("isBuffer", |args| {
+                let val = args.first().cloned().unwrap_or(Value::Undefined);
+                let is_buf = val.get_property("type")
+                    .map(|t| t == Value::String("Buffer".to_string()))
+                    .unwrap_or(false);
+                Ok(Value::Boolean(is_buf))
+            }));
+
+            // Buffer.concat(list)
+            buffer_obj.set_property("concat", Value::make_native_fn("concat", |args| {
+                let list = args.first().cloned().unwrap_or(Value::Undefined);
+                if let Value::Object(obj) = &list {
+                    let borrowed = obj.borrow();
+                    if let crate::ObjectKind::Array(bufs) = &borrowed.kind {
+                        let mut all = Vec::new();
+                        for buf in bufs {
+                            if let Value::Object(buf_obj) = buf {
+                                let buf_ref = buf_obj.borrow();
+                                if let crate::ObjectKind::Array(bytes) = &buf_ref.kind {
+                                    all.extend(bytes.clone());
+                                }
+                            }
+                        }
+                        let result = Value::new_array(all.clone());
+                        result.set_property("length", Value::Number(all.len() as f64));
+                        result.set_property("type", Value::String("Buffer".to_string()));
+                        return Ok(result);
+                    }
+                }
+                Ok(Value::new_array(vec![]))
+            }));
+
+            buffer_obj
+        });
+
+        Value::new_object_with_properties(props)
+    }
+
+    fn build_events_module(&self) -> Value {
+        let mut props = rustc_hash::FxHashMap::default();
+
+        // EventEmitter constructor (returns object with on/emit/removeListener)
+        props.insert("EventEmitter".to_string(), Value::make_native_fn("EventEmitter", |_args| {
+            let emitter = Value::new_object();
+
+            // Internal listeners storage
+            let listeners = Value::new_object();
+            emitter.set_property("_listeners", listeners);
+
+            // on(event, listener) — register a listener
+            emitter.set_property("on", Value::make_native_fn("on", |_args| {
+                // In a full implementation, this would store the callback
+                // For now, return `this` for chaining
+                Ok(Value::Undefined)
+            }));
+
+            // emit(event, ...args) — emit an event
+            emitter.set_property("emit", Value::make_native_fn("emit", |_args| {
+                Ok(Value::Boolean(false))
+            }));
+
+            // removeListener(event, listener)
+            emitter.set_property("removeListener", Value::make_native_fn("removeListener", |_args| {
+                Ok(Value::Undefined)
+            }));
+
+            // removeAllListeners(event?)
+            emitter.set_property("removeAllListeners", Value::make_native_fn("removeAllListeners", |_args| {
+                Ok(Value::Undefined)
+            }));
+
+            // listenerCount(event)
+            emitter.set_property("listenerCount", Value::make_native_fn("listenerCount", |_args| {
+                Ok(Value::Number(0.0))
+            }));
+
+            Ok(emitter)
+        }));
+
         Value::new_object_with_properties(props)
     }
 }
@@ -1758,5 +1890,39 @@ mod tests {
         assert!(resolver.is_core_module("os"));
         let core = resolver.get_core_module("os").unwrap();
         assert!(!core.exports.is_empty());
+    }
+
+    #[test]
+    fn test_commonjs_runtime_require_buffer() {
+        let mut rt = CommonJsRuntime::new();
+        let result = rt.require("buffer", Path::new("."));
+        assert!(result.is_ok());
+        let module = result.unwrap();
+        assert!(module.get_property("Buffer").is_some());
+    }
+
+    #[test]
+    fn test_buffer_from_string() {
+        let rt = CommonJsRuntime::new();
+        let buf_mod = rt.build_buffer_module();
+        let buffer_ctor = buf_mod.get_property("Buffer").unwrap();
+        let from_fn = buffer_ctor.get_property("from").unwrap();
+        if let Value::Object(obj) = &from_fn {
+            let borrowed = obj.borrow();
+            if let crate::ObjectKind::NativeFunction { func, .. } = &borrowed.kind {
+                let result = func(&[Value::String("hi".to_string())]).unwrap();
+                let typ = result.get_property("type").unwrap();
+                assert_eq!(typ, Value::String("Buffer".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_commonjs_runtime_require_events() {
+        let mut rt = CommonJsRuntime::new();
+        let result = rt.require("events", Path::new("."));
+        assert!(result.is_ok());
+        let module = result.unwrap();
+        assert!(module.get_property("EventEmitter").is_some());
     }
 }
