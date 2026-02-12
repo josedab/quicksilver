@@ -605,6 +605,181 @@ impl DiagnosticRenderer {
 }
 
 // ---------------------------------------------------------------------------
+// Code Frame Builder
+// ---------------------------------------------------------------------------
+
+/// Builds a code frame showing source context around an error location.
+/// Similar to Babel's `@babel/code-frame` output.
+pub struct CodeFrame<'a> {
+    source: &'a str,
+    line: usize,
+    column: usize,
+    length: usize,
+    context_lines: usize,
+}
+
+impl<'a> CodeFrame<'a> {
+    /// Create a new code frame for the given source location.
+    /// `line` and `column` are 1-based.
+    pub fn new(source: &'a str, line: usize, column: usize, length: usize) -> Self {
+        Self {
+            source,
+            line,
+            column,
+            length,
+            context_lines: 2,
+        }
+    }
+
+    /// Set the number of context lines to show above and below the error line.
+    pub fn with_context(mut self, lines: usize) -> Self {
+        self.context_lines = lines;
+        self
+    }
+
+    /// Render the code frame as a string.
+    pub fn render(&self) -> String {
+        let lines: Vec<&str> = self.source.lines().collect();
+        let line_idx = self.line.saturating_sub(1);
+        let start = line_idx.saturating_sub(self.context_lines);
+        let end = (line_idx + self.context_lines + 1).min(lines.len());
+        let max_line_num = end;
+        let width = format!("{}", max_line_num).len().max(2);
+
+        let mut out = String::new();
+
+        for i in start..end {
+            let line_num = i + 1;
+            let marker = if i == line_idx { ">" } else { " " };
+            out.push_str(&format!(
+                "{} {:>width$} | {}\n",
+                marker,
+                line_num,
+                lines[i],
+                width = width
+            ));
+
+            // Add underline on the error line
+            if i == line_idx {
+                let padding = " ".repeat(self.column.saturating_sub(1));
+                let carets = "^".repeat(if self.length > 0 { self.length } else { 1 });
+                out.push_str(&format!(
+                    "  {:>width$} | {}{}\n",
+                    "",
+                    padding,
+                    carets,
+                    width = width
+                ));
+            }
+        }
+
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error Suggestions
+// ---------------------------------------------------------------------------
+
+/// Provides intelligent suggestions for common JavaScript errors.
+pub struct ErrorSuggestion {
+    pub suggestion: String,
+    pub confidence: f64,
+}
+
+impl ErrorSuggestion {
+    /// Generate suggestions for a given error message and source context.
+    pub fn suggest(error_msg: &str, source_context: &str) -> Vec<ErrorSuggestion> {
+        let mut suggestions = Vec::new();
+        let msg_lower = error_msg.to_lowercase();
+
+        // Typo detection for common globals
+        let common_globals = [
+            "console", "Math", "JSON", "Date", "Array", "Object", "String",
+            "Number", "Boolean", "Map", "Set", "Promise", "Error", "RegExp",
+            "parseInt", "parseFloat", "isNaN", "isFinite", "undefined", "null",
+            "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+        ];
+
+        if msg_lower.contains("is not defined") {
+            // Extract the undefined identifier
+            let parts: Vec<&str> = error_msg.split(' ').collect();
+            if let Some(ident) = parts.first() {
+                for &global in &common_globals {
+                    if levenshtein_distance(ident, global) <= 2 && *ident != global {
+                        suggestions.push(ErrorSuggestion {
+                            suggestion: format!("Did you mean '{}'?", global),
+                            confidence: 0.9,
+                        });
+                    }
+                }
+            }
+        }
+
+        if msg_lower.contains("is not a function") {
+            suggestions.push(ErrorSuggestion {
+                suggestion: "Check that the value is a function before calling it".to_string(),
+                confidence: 0.7,
+            });
+            // Check for common method name typos
+            if source_context.contains(".forEeach") || source_context.contains(".foreEach") {
+                suggestions.push(ErrorSuggestion {
+                    suggestion: "Did you mean '.forEach()'?".to_string(),
+                    confidence: 0.95,
+                });
+            }
+        }
+
+        if msg_lower.contains("cannot read propert") {
+            suggestions.push(ErrorSuggestion {
+                suggestion: "Use optional chaining (?.) to safely access nested properties".to_string(),
+                confidence: 0.8,
+            });
+        }
+
+        if msg_lower.contains("cannot assign to const") {
+            suggestions.push(ErrorSuggestion {
+                suggestion: "Use 'let' instead of 'const' if the variable needs to be reassigned".to_string(),
+                confidence: 0.95,
+            });
+        }
+
+        if msg_lower.contains("unexpected token") {
+            suggestions.push(ErrorSuggestion {
+                suggestion: "Check for missing semicolons, brackets, or parentheses".to_string(),
+                confidence: 0.6,
+            });
+        }
+
+        suggestions
+    }
+}
+
+/// Simple Levenshtein distance for typo detection.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_len = a.len();
+    let b_len = b.len();
+    if a_len == 0 { return b_len; }
+    if b_len == 0 { return a_len; }
+
+    let mut prev: Vec<usize> = (0..=b_len).collect();
+    let mut curr = vec![0; b_len + 1];
+
+    for (i, ca) in a.chars().enumerate() {
+        curr[0] = i + 1;
+        for (j, cb) in b.chars().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            curr[j + 1] = (prev[j + 1] + 1)
+                .min(curr[j] + 1)
+                .min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+
+    prev[b_len]
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -785,5 +960,50 @@ mod tests {
         });
         let rendered = DiagnosticRenderer::render(&diag);
         assert!(rendered.starts_with("error:"));
+    }
+
+    // -- Code frame builder tests -------------------------------------------
+
+    #[test]
+    fn test_code_frame_single_line() {
+        let frame = CodeFrame::new("let x = 42;\nlet y = x + 1;\nconsole.log(y);", 2, 9, 5);
+        let output = frame.render();
+        assert!(output.contains("1 | let x = 42;"));
+        assert!(output.contains("2 | let y = x + 1;"));
+        assert!(output.contains("3 | console.log(y);"));
+        assert!(output.contains("^^^^^"));
+    }
+
+    #[test]
+    fn test_code_frame_first_line() {
+        let frame = CodeFrame::new("let x = 42;", 1, 1, 3);
+        let output = frame.render();
+        assert!(output.contains("1 | let x = 42;"));
+        assert!(output.contains("^^^"));
+    }
+
+    #[test]
+    fn test_code_frame_context_lines() {
+        let source = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
+        let frame = CodeFrame::new(source, 4, 1, 5);
+        let output = frame.render();
+        // Should show lines 2-6 (2 lines context around line 4)
+        assert!(output.contains("line3"));
+        assert!(output.contains("line4"));
+        assert!(output.contains("line5"));
+    }
+
+    #[test]
+    fn test_error_suggestion_basic() {
+        let suggestions = ErrorSuggestion::suggest("undefined is not a function", "foo()");
+        assert!(!suggestions.is_empty());
+    }
+
+    #[test]
+    fn test_error_suggestion_typo() {
+        let suggestions = ErrorSuggestion::suggest("consle is not defined", "consle.log('hello')");
+        // Should suggest console
+        let has_console_suggestion = suggestions.iter().any(|s| s.suggestion.contains("console"));
+        assert!(has_console_suggestion);
     }
 }
