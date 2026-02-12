@@ -181,6 +181,98 @@ impl Request {
             self.url
         ))
     }
+
+    /// Parse the URL into its components (WinterCG URL API)
+    pub fn parse_url(&self) -> UrlInfo {
+        UrlInfo::parse(&self.url)
+    }
+}
+
+/// Parsed URL components (WinterCG-compatible)
+#[derive(Debug, Clone)]
+pub struct UrlInfo {
+    /// Full URL string
+    pub href: String,
+    /// Protocol (e.g., "https:")
+    pub protocol: String,
+    /// Hostname without port
+    pub hostname: String,
+    /// Port string (empty if default)
+    pub port: String,
+    /// Path component
+    pub pathname: String,
+    /// Query string including '?'
+    pub search: String,
+    /// Parsed query parameters
+    pub search_params: HashMap<String, String>,
+    /// Hash/fragment
+    pub hash: String,
+}
+
+impl UrlInfo {
+    /// Parse a URL string into components
+    pub fn parse(url: &str) -> Self {
+        let mut protocol = String::new();
+        let hostname;
+        let mut port = String::new();
+        let pathname;
+        let mut search = String::new();
+        let mut hash = String::new();
+        let mut search_params = HashMap::default();
+
+        let mut remaining = url;
+
+        // Extract protocol
+        if let Some(idx) = remaining.find("://") {
+            protocol = format!("{}:", &remaining[..idx]);
+            remaining = &remaining[idx + 3..];
+        }
+
+        // Extract hash
+        if let Some(idx) = remaining.find('#') {
+            hash = remaining[idx..].to_string();
+            remaining = &remaining[..idx];
+        }
+
+        // Extract query string
+        if let Some(idx) = remaining.find('?') {
+            search = remaining[idx..].to_string();
+            let query_str = &remaining[idx + 1..];
+            for param in query_str.split('&') {
+                if let Some((key, value)) = param.split_once('=') {
+                    search_params.insert(key.to_string(), value.to_string());
+                }
+            }
+            remaining = &remaining[..idx];
+        }
+
+        // Extract hostname and port from path
+        if let Some(idx) = remaining.find('/') {
+            pathname = remaining[idx..].to_string();
+            remaining = &remaining[..idx];
+        } else {
+            pathname = "/".to_string();
+        }
+
+        // Extract hostname:port
+        if let Some(idx) = remaining.find(':') {
+            hostname = remaining[..idx].to_string();
+            port = remaining[idx + 1..].to_string();
+        } else {
+            hostname = remaining.to_string();
+        }
+
+        Self {
+            href: url.to_string(),
+            protocol,
+            hostname,
+            port,
+            pathname,
+            search,
+            search_params,
+            hash,
+        }
+    }
 }
 
 /// Workers-compatible Response object
@@ -250,6 +342,39 @@ impl Response {
             self.status,
             self.body.len()
         ))
+    }
+
+    /// Create an HTML response with appropriate Content-Type
+    pub fn html(body: &str) -> Self {
+        let mut headers = Headers::new();
+        headers.set("content-type", "text/html; charset=utf-8");
+        Self {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers,
+            body: body.to_string(),
+        }
+    }
+
+    /// Create a plain text response with appropriate Content-Type
+    pub fn text(body: &str) -> Self {
+        let mut headers = Headers::new();
+        headers.set("content-type", "text/plain; charset=utf-8");
+        Self {
+            status: 200,
+            status_text: "OK".to_string(),
+            headers,
+            body: body.to_string(),
+        }
+    }
+
+    /// Add CORS headers to the response (returns a new Response)
+    pub fn with_cors(mut self, origin: &str) -> Self {
+        self.headers.set("access-control-allow-origin", origin);
+        self.headers.set("access-control-allow-methods", "GET, POST, PUT, DELETE, OPTIONS");
+        self.headers.set("access-control-allow-headers", "Content-Type, Authorization");
+        self.headers.set("access-control-max-age", "86400");
+        self
     }
 }
 
@@ -859,5 +984,70 @@ mod tests {
         assert_eq!(config.max_body_size, 512);
         assert_eq!(config.timeout, Duration::from_secs(5));
         assert_eq!(config.max_cache_entries, 256);
+    }
+
+    #[test]
+    fn test_response_html() {
+        let resp = Response::html("<h1>Hello</h1>");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("content-type"), Some("text/html; charset=utf-8"));
+        assert_eq!(resp.body, "<h1>Hello</h1>");
+    }
+
+    #[test]
+    fn test_response_text() {
+        let resp = Response::text("plain text");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.headers.get("content-type"), Some("text/plain; charset=utf-8"));
+    }
+
+    #[test]
+    fn test_response_cors() {
+        let resp = Response::json("{}").with_cors("https://example.com");
+        assert_eq!(resp.headers.get("access-control-allow-origin"), Some("https://example.com"));
+        assert!(resp.headers.has("access-control-allow-methods"));
+    }
+
+    #[test]
+    fn test_request_url_parsing() {
+        let req = Request::new("https://api.example.com:8080/v1/users?page=2&limit=10");
+        let url_info = req.parse_url();
+        assert_eq!(url_info.pathname, "/v1/users");
+        assert_eq!(url_info.hostname, "api.example.com");
+        assert_eq!(url_info.search_params.get("page"), Some(&"2".to_string()));
+        assert_eq!(url_info.search_params.get("limit"), Some(&"10".to_string()));
+    }
+
+    #[test]
+    fn test_request_url_parsing_no_query() {
+        let req = Request::new("https://example.com/path");
+        let url_info = req.parse_url();
+        assert_eq!(url_info.pathname, "/path");
+        assert!(url_info.search_params.is_empty());
+    }
+
+    #[test]
+    fn test_edge_runtime_caching_integration() {
+        let config = EdgeConfig::new();
+        let mut runtime = EdgeRuntime::new(config);
+
+        runtime.on_fetch(|event| {
+            event.respond_with(Response::json(r#"{"data":"fresh"}"#));
+            Ok(())
+        });
+
+        // First request: cache miss
+        let req = Request::new("https://example.com/api/data");
+        let resp = runtime.handle_request(req).unwrap();
+        assert_eq!(resp.status, 200);
+
+        // Cache the response manually
+        let req2 = Request::new("https://example.com/api/data");
+        runtime.cache_mut().put(&req2, Response::json(r#"{"data":"cached"}"#), None);
+
+        // Second request: cache hit
+        let req3 = Request::new("https://example.com/api/data");
+        let resp2 = runtime.handle_request(req3).unwrap();
+        assert_eq!(resp2.body, r#"{"data":"cached"}"#);
     }
 }
