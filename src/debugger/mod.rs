@@ -36,6 +36,7 @@
 //! - Variable inspection at any point in time
 //! - Find when variables changed
 
+//!
 //! **Status:** ✅ Complete — Time-travel debugger with DAP protocol and TUI
 
 pub mod dap;
@@ -888,6 +889,175 @@ pub struct DebuggerStats {
     pub watch_count: usize,
 }
 
+/// TUI panel layout for the debugger dashboard
+#[derive(Debug, Clone)]
+pub struct TuiPanel {
+    /// Panel title
+    pub title: String,
+    /// Lines of content
+    pub lines: Vec<String>,
+    /// Whether this panel is focused
+    pub focused: bool,
+}
+
+impl TimeTravelDebugger {
+    /// Render the source code panel with current line highlighted
+    pub fn render_source_panel(&self, context_lines: usize) -> TuiPanel {
+        let mut lines = Vec::new();
+        if let Some(record) = self.current() {
+            let current_line = record.line as usize;
+
+            if !self.source_lines.is_empty() {
+                let start = current_line.saturating_sub(context_lines + 1);
+                let end = (current_line + context_lines).min(self.source_lines.len());
+
+                for i in start..end {
+                    let marker = if i + 1 == current_line { "▶" } else { " " };
+                    lines.push(format!("{} {:>4} │ {}", marker,
+                        i + 1,
+                        self.source_lines.get(i).map(|s| s.as_str()).unwrap_or("")));
+                }
+            } else {
+                lines.push("  (no source loaded)".to_string());
+            }
+        } else {
+            lines.push("  (not started)".to_string());
+        }
+
+        TuiPanel { title: "Source".to_string(), lines, focused: true }
+    }
+
+    /// Render the variables panel showing current local variables
+    pub fn render_variables_panel(&self) -> TuiPanel {
+        let mut lines = Vec::new();
+        if let Some(record) = self.current() {
+            let mut sorted: Vec<_> = record.locals.iter().collect();
+            sorted.sort_by_key(|(k, _)| (*k).clone());
+            for (name, value) in sorted {
+                lines.push(format!("  {} = {}", name, value.to_js_string()));
+            }
+            if lines.is_empty() {
+                lines.push("  (no local variables)".to_string());
+            }
+        } else {
+            lines.push("  (not running)".to_string());
+        }
+        TuiPanel { title: "Variables".to_string(), lines, focused: false }
+    }
+
+    /// Render the call stack panel
+    pub fn render_stack_panel(&self) -> TuiPanel {
+        let mut lines = Vec::new();
+        if let Some(record) = self.current() {
+            let stack = &record.stack_top;
+            let start = stack.len().saturating_sub(10);
+            for (i, val) in stack[start..].iter().enumerate().rev() {
+                lines.push(format!("  [{}] {}", start + i, val.to_js_string()));
+            }
+            if lines.is_empty() {
+                lines.push("  (empty stack)".to_string());
+            }
+        } else {
+            lines.push("  (not running)".to_string());
+        }
+        TuiPanel { title: "Stack".to_string(), lines, focused: false }
+    }
+
+    /// Render the timeline panel showing execution progress
+    pub fn render_timeline_panel(&self) -> TuiPanel {
+        let mut lines = Vec::new();
+        let total = self.history.len();
+        let current = self.current_position;
+
+        if total > 0 {
+            let progress = if total > 1 { current as f64 / (total - 1) as f64 } else { 1.0 };
+            let bar_width: usize = 40;
+            let filled = (progress * bar_width as f64) as usize;
+            let empty = bar_width - filled;
+            let bar = format!("{}{}",
+                "█".repeat(filled),
+                "░".repeat(empty)
+            );
+            lines.push(format!("  Step {}/{} [{}]", current + 1, total, bar));
+
+            let mut bp_marks = Vec::new();
+            for bp in self.breakpoints.values() {
+                bp_marks.push(format!("  ● Line {} {}", bp.line,
+                    if bp.enabled { "(enabled)" } else { "(disabled)" }));
+            }
+            if !bp_marks.is_empty() {
+                lines.push(String::new());
+                lines.push("  Breakpoints:".to_string());
+                lines.extend(bp_marks);
+            }
+        } else {
+            lines.push("  (no history)".to_string());
+        }
+
+        TuiPanel { title: "Timeline".to_string(), lines, focused: false }
+    }
+
+    /// Render a complete TUI dashboard as a string
+    pub fn render_dashboard(&self) -> String {
+        let source = self.render_source_panel(5);
+        let vars = self.render_variables_panel();
+        let _stack = self.render_stack_panel();
+        let timeline = self.render_timeline_panel();
+        let stats = self.stats();
+
+        let width = 70;
+        let bar = "─".repeat(width);
+        let dbar = "═".repeat(width);
+
+        // Char-safe truncation helper
+        let trunc = |s: &str, max: usize| -> String {
+            let chars: Vec<char> = s.chars().collect();
+            if chars.len() > max {
+                chars[..max].iter().collect()
+            } else {
+                s.to_string()
+            }
+        };
+
+        let mut s = String::new();
+        s.push_str(&format!("╔{}╗\n", dbar));
+        s.push_str(&format!("║{:^70}║\n", "QUICKSILVER TIME-TRAVEL DEBUGGER"));
+        s.push_str(&format!("╠{}╣\n", dbar));
+
+        // Source panel
+        s.push_str(&format!("║ {:<68} ║\n", format!("Source: {}", self.current_file)));
+        s.push_str(&format!("╟{}╢\n", bar));
+        for line in &source.lines {
+            s.push_str(&format!("║ {:<68} ║\n", trunc(line, 68)));
+        }
+
+        // Variables panel
+        s.push_str(&format!("╟{}╢\n", bar));
+        s.push_str(&format!("║ {:<68} ║\n", "Variables"));
+        s.push_str(&format!("╟{}╢\n", bar));
+        for line in &vars.lines {
+            s.push_str(&format!("║ {:<68} ║\n", trunc(line, 68)));
+        }
+
+        // Timeline
+        s.push_str(&format!("╟{}╢\n", bar));
+        s.push_str(&format!("║ {:<68} ║\n", "Timeline"));
+        s.push_str(&format!("╟{}╢\n", bar));
+        for line in &timeline.lines {
+            s.push_str(&format!("║ {:<68} ║\n", trunc(line, 68)));
+        }
+
+        // Stats bar
+        s.push_str(&format!("╟{}╢\n", bar));
+        s.push_str(&format!(
+            "║ Steps: {:<6} Breakpoints: {:<6} Watches: {:<22} ║\n",
+            stats.total_steps, stats.breakpoint_count, stats.watch_count));
+        s.push_str(&format!("╚{}╝\n", dbar));
+
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1131,55 @@ mod tests {
 
         let changes = debugger.find_variable_changes("x");
         assert_eq!(changes.len(), 3); // Initial, 1->2, 2->5
+    }
+
+    #[test]
+    fn test_tui_source_panel() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.load_source("test.js", "let x = 1;\nlet y = 2;\nlet z = 3;\n");
+        debugger.record_step(None, 0, 2, &[], &HashMap::default(), "");
+        let panel = debugger.render_source_panel(1);
+        assert_eq!(panel.title, "Source");
+        assert!(!panel.lines.is_empty());
+    }
+
+    #[test]
+    fn test_tui_variables_panel() {
+        let mut debugger = TimeTravelDebugger::new();
+        let mut locals = HashMap::default();
+        locals.insert("x".to_string(), Value::Number(42.0));
+        debugger.record_step(None, 0, 1, &[], &locals, "");
+        let panel = debugger.render_variables_panel();
+        assert_eq!(panel.title, "Variables");
+        assert!(panel.lines.iter().any(|l| l.contains("x") && l.contains("42")));
+    }
+
+    #[test]
+    fn test_tui_timeline_panel() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.record_step(None, 0, 1, &[], &HashMap::default(), "");
+        debugger.record_step(None, 1, 2, &[], &HashMap::default(), "");
+        let panel = debugger.render_timeline_panel();
+        assert!(panel.lines.iter().any(|l| l.contains("Step")));
+    }
+
+    #[test]
+    fn test_tui_dashboard() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.load_source("test.js", "let x = 1;\nconsole.log(x);\n");
+        let mut locals = HashMap::default();
+        locals.insert("x".to_string(), Value::Number(1.0));
+        debugger.record_step(None, 0, 1, &[], &locals, "");
+        let dashboard = debugger.render_dashboard();
+        assert!(dashboard.contains("TIME-TRAVEL DEBUGGER"));
+        assert!(dashboard.contains("Source"));
+        assert!(dashboard.contains("Variables"));
+    }
+
+    #[test]
+    fn test_tui_empty_state() {
+        let debugger = TimeTravelDebugger::new();
+        let dashboard = debugger.render_dashboard();
+        assert!(dashboard.contains("not started"));
     }
 }
