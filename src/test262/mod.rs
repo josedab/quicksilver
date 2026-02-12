@@ -457,6 +457,176 @@ impl ConformanceReport {
             .filter(|t| matches!(t.outcome, TestOutcome::Fail | TestOutcome::Error))
             .collect()
     }
+
+    /// Compare with a previous report to detect regressions and improvements
+    pub fn compare(&self, previous: &ConformanceReport) -> RegressionReport {
+        let current_passing: std::collections::HashSet<&str> = self.chapters.values()
+            .flat_map(|ch| ch.tests.iter())
+            .filter(|t| t.outcome == TestOutcome::Pass)
+            .map(|t| t.path.as_str())
+            .collect();
+
+        let previous_passing: std::collections::HashSet<&str> = previous.chapters.values()
+            .flat_map(|ch| ch.tests.iter())
+            .filter(|t| t.outcome == TestOutcome::Pass)
+            .map(|t| t.path.as_str())
+            .collect();
+
+        let regressions: Vec<String> = previous_passing.difference(&current_passing)
+            .map(|s| s.to_string())
+            .collect();
+        let improvements: Vec<String> = current_passing.difference(&previous_passing)
+            .map(|s| s.to_string())
+            .collect();
+
+        RegressionReport {
+            previous_pass_rate: previous.pass_rate(),
+            current_pass_rate: self.pass_rate(),
+            regressions,
+            improvements,
+            delta_passed: self.passed as i64 - previous.passed as i64,
+            delta_total: self.total as i64 - previous.total as i64,
+        }
+    }
+
+    /// Generate a per-feature coverage summary
+    pub fn feature_coverage(&self) -> BTreeMap<String, FeatureCoverage> {
+        let mut features: BTreeMap<String, FeatureCoverage> = BTreeMap::new();
+
+        for chapter in self.chapters.values() {
+            for test in &chapter.tests {
+                for feature in &test.features {
+                    let entry = features.entry(feature.clone()).or_insert_with(|| FeatureCoverage {
+                        feature: feature.clone(),
+                        total: 0,
+                        passed: 0,
+                        failed: 0,
+                        skipped: 0,
+                    });
+                    entry.total += 1;
+                    match test.outcome {
+                        TestOutcome::Pass => entry.passed += 1,
+                        TestOutcome::Skip => entry.skipped += 1,
+                        _ => entry.failed += 1,
+                    }
+                }
+            }
+        }
+
+        features
+    }
+
+    /// Generate a dashboard string suitable for terminal display
+    pub fn format_dashboard(&self) -> String {
+        let mut s = String::new();
+        let bar = "━".repeat(60);
+
+        s.push_str(&format!("\n┌{}┐\n", "─".repeat(60)));
+        s.push_str(&format!("│{:^60}│\n", "QUICKSILVER TEST262 CONFORMANCE DASHBOARD"));
+        s.push_str(&format!("├{}┤\n", "─".repeat(60)));
+
+        let rate = self.pass_rate();
+        let filled = (rate / 100.0 * 40.0) as usize;
+        let empty = 40 - filled;
+        let bar_viz = format!("{}{}",
+            "█".repeat(filled),
+            "░".repeat(empty)
+        );
+
+        s.push_str(&format!("│ Conformance: {:.1}% {} │\n", rate, bar_viz));
+        s.push_str(&format!("│ Passed: {:>5} / {:<5} (Skipped: {}, Errors: {})     │\n",
+            self.passed, self.total - self.skipped, self.skipped, self.errors));
+        s.push_str(&format!("│ Duration: {:>8.1}s                                   │\n",
+            self.total_time.as_secs_f64()));
+        s.push_str(&format!("├{}┤\n", "─".repeat(60)));
+
+        s.push_str(&format!("│ {:<28} {:>6} {:>6} {:>6} {:>7} │\n",
+            "Chapter", "Total", "Pass", "Fail", "Rate"));
+        s.push_str(&format!("│ {} │\n", bar));
+
+        for chapter in self.chapters.values() {
+            let name = if chapter.name.len() > 28 {
+                &chapter.name[..28]
+            } else {
+                &chapter.name
+            };
+            s.push_str(&format!("│ {:<28} {:>6} {:>6} {:>6} {:>6.1}% │\n",
+                name, chapter.total, chapter.passed, chapter.failed, chapter.pass_rate()));
+        }
+
+        s.push_str(&format!("└{}┘\n", "─".repeat(60)));
+        s
+    }
+}
+
+/// Report of regressions between two conformance runs
+#[derive(Debug, Clone)]
+pub struct RegressionReport {
+    /// Previous pass rate
+    pub previous_pass_rate: f64,
+    /// Current pass rate
+    pub current_pass_rate: f64,
+    /// Tests that were passing but now fail
+    pub regressions: Vec<String>,
+    /// Tests that were failing but now pass
+    pub improvements: Vec<String>,
+    /// Delta in passed count
+    pub delta_passed: i64,
+    /// Delta in total count
+    pub delta_total: i64,
+}
+
+impl RegressionReport {
+    /// Check if there are any regressions
+    pub fn has_regressions(&self) -> bool {
+        !self.regressions.is_empty()
+    }
+
+    /// Format for CI output
+    pub fn format_ci(&self) -> String {
+        let mut s = String::new();
+        let delta_sign = if self.delta_passed > 0 { "+" } else { "" };
+        s.push_str(&format!("Pass rate: {:.1}% → {:.1}% ({}{} tests)\n",
+            self.previous_pass_rate, self.current_pass_rate,
+            delta_sign, self.delta_passed));
+
+        if !self.regressions.is_empty() {
+            s.push_str(&format!("\n⚠️  {} REGRESSIONS:\n", self.regressions.len()));
+            for r in &self.regressions {
+                s.push_str(&format!("  - {}\n", r));
+            }
+        }
+        if !self.improvements.is_empty() {
+            s.push_str(&format!("\n✅ {} IMPROVEMENTS:\n", self.improvements.len()));
+            for i in &self.improvements {
+                s.push_str(&format!("  + {}\n", i));
+            }
+        }
+        s
+    }
+}
+
+/// Coverage information for a single feature
+#[derive(Debug, Clone)]
+pub struct FeatureCoverage {
+    /// Feature name
+    pub feature: String,
+    /// Total tests for this feature
+    pub total: usize,
+    /// Passing tests
+    pub passed: usize,
+    /// Failing tests
+    pub failed: usize,
+    /// Skipped tests
+    pub skipped: usize,
+}
+
+impl FeatureCoverage {
+    /// Pass rate for this feature
+    pub fn pass_rate(&self) -> f64 {
+        let runnable = self.total - self.skipped;
+        if runnable == 0 { 0.0 } else { self.passed as f64 / runnable as f64 * 100.0 }
+    }
 }
 
 /// The test runner executes Test262 tests
@@ -1003,5 +1173,123 @@ var 123abc = 1;
         let failures = report.failing_tests();
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].path, "fail.js");
+    }
+
+    #[test]
+    fn test_regression_report_no_regressions() {
+        let mut prev = ConformanceReport::default();
+        let mut curr = ConformanceReport::default();
+
+        prev.add_result(TestResult {
+            path: "test1.js".to_string(),
+            description: "t1".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+        curr.add_result(TestResult {
+            path: "test1.js".to_string(),
+            description: "t1".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+        curr.add_result(TestResult {
+            path: "test2.js".to_string(),
+            description: "t2".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+
+        let regression = curr.compare(&prev);
+        assert!(!regression.has_regressions());
+        assert_eq!(regression.improvements.len(), 1);
+        assert_eq!(regression.delta_passed, 1);
+    }
+
+    #[test]
+    fn test_regression_report_with_regressions() {
+        let mut prev = ConformanceReport::default();
+        let mut curr = ConformanceReport::default();
+
+        prev.add_result(TestResult {
+            path: "test1.js".to_string(),
+            description: "t1".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+        curr.add_result(TestResult {
+            path: "test1.js".to_string(),
+            description: "t1".to_string(),
+            outcome: TestOutcome::Fail,
+            duration: Duration::ZERO,
+            error: Some("broke".to_string()), expected_error: None, features: vec![],
+        });
+
+        let regression = curr.compare(&prev);
+        assert!(regression.has_regressions());
+        assert_eq!(regression.regressions.len(), 1);
+    }
+
+    #[test]
+    fn test_feature_coverage() {
+        let mut report = ConformanceReport::default();
+        report.add_result(TestResult {
+            path: "test1.js".to_string(),
+            description: "t1".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::ZERO,
+            error: None, expected_error: None,
+            features: vec!["arrow-function".to_string()],
+        });
+        report.add_result(TestResult {
+            path: "test2.js".to_string(),
+            description: "t2".to_string(),
+            outcome: TestOutcome::Fail,
+            duration: Duration::ZERO,
+            error: Some("err".to_string()), expected_error: None,
+            features: vec!["arrow-function".to_string()],
+        });
+
+        let coverage = report.feature_coverage();
+        let arrow = coverage.get("arrow-function").unwrap();
+        assert_eq!(arrow.total, 2);
+        assert_eq!(arrow.passed, 1);
+        assert_eq!(arrow.pass_rate(), 50.0);
+    }
+
+    #[test]
+    fn test_format_dashboard() {
+        let mut report = ConformanceReport::default();
+        report.add_result(TestResult {
+            path: "language/test.js".to_string(),
+            description: "t".to_string(),
+            outcome: TestOutcome::Pass,
+            duration: Duration::from_millis(5),
+            error: None, expected_error: None, features: vec![],
+        });
+        let dashboard = report.format_dashboard();
+        assert!(dashboard.contains("QUICKSILVER TEST262 CONFORMANCE DASHBOARD"));
+        assert!(dashboard.contains("100.0%"));
+    }
+
+    #[test]
+    fn test_regression_format_ci() {
+        let mut prev = ConformanceReport::default();
+        let mut curr = ConformanceReport::default();
+        prev.add_result(TestResult {
+            path: "a.js".to_string(), description: "a".to_string(),
+            outcome: TestOutcome::Pass, duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+        curr.add_result(TestResult {
+            path: "a.js".to_string(), description: "a".to_string(),
+            outcome: TestOutcome::Pass, duration: Duration::ZERO,
+            error: None, expected_error: None, features: vec![],
+        });
+        let ci = curr.compare(&prev).format_ci();
+        assert!(ci.contains("Pass rate:"));
     }
 }
