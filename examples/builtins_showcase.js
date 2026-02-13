@@ -139,22 +139,22 @@ map.set("c", 3);
 console.log("Map size:", map.size);
 console.log("get('a'):", map.get("a"));
 console.log("has('b'):", map.has("b"));
-console.log("keys:", [...map.keys()]);
-console.log("values:", [...map.values()]);
+console.log("delete('c'):", map.delete("c"));
+console.log("Map size after delete:", map.size);
 
 // ===================
 // Set Collection
 // ===================
 console.log("\n9. Set Collection");
 console.log("-".repeat(30));
-const set = new Set([1, 2, 2, 3, 3, 3]);
-console.log("Set (unique values):", [...set]);
-console.log("Set size:", set.size);
-set.add(4);
-console.log("After add(4):", [...set]);
-console.log("has(2):", set.has(2));
-set.delete(1);
-console.log("After delete(1):", [...set]);
+const mySet = new Set([1, 2, 2, 3, 3, 3]);
+console.log("Set created from [1, 2, 2, 3, 3, 3]");
+console.log("Set size:", mySet.size);
+mySet.add(4);
+console.log("has(2):", mySet.has(2));
+console.log("has(5):", mySet.has(5));
+mySet.delete(1);
+console.log("delete(1) — has(1):", mySet.has(1));
 
 // ===================
 // Number & Type Checking

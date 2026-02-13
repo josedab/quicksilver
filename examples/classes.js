@@ -1,18 +1,21 @@
 // ES6 Classes Demonstration
-// Shows class syntax, inheritance, and design patterns
+// Shows class syntax, inheritance, and common patterns
 // Run with: cargo run -- examples/classes.js
 
 console.log("ES6 Classes Demonstration\n");
 
-// Basic Class
+// ===========================
+// 1. Basic Class
+// ===========================
 class Animal {
   constructor(name, species) {
     this.name = name;
     this.species = species;
+    this.sound = "...";
   }
 
   speak() {
-    console.log(`${this.name} makes a sound`);
+    console.log(`${this.name} says ${this.sound}`);
   }
 
   describe() {
@@ -20,19 +23,23 @@ class Animal {
   }
 }
 
-// Inheritance
+console.log("1. Basic Class:");
+const animal = new Animal("Buddy", "Dog");
+animal.speak();
+console.log(animal.describe());
+
+// ===========================
+// 2. Inheritance with super()
+// ===========================
 class Dog extends Animal {
   constructor(name, breed) {
     super(name, "Dog");
     this.breed = breed;
-  }
-
-  speak() {
-    console.log(`${this.name} barks!`);
+    this.sound = "Woof!";
   }
 
   fetch() {
-    console.log(`${this.name} fetches the ball`);
+    console.log(`${this.name} the ${this.breed} fetches the ball`);
   }
 }
 
@@ -40,191 +47,134 @@ class Cat extends Animal {
   constructor(name, color) {
     super(name, "Cat");
     this.color = color;
+    this.sound = "Meow!";
   }
 
-  speak() {
-    console.log(`${this.name} meows!`);
-  }
-
-  climb() {
-    console.log(`${this.name} climbs the tree`);
+  describe() {
+    return `${this.name} is a ${this.color} cat`;
   }
 }
 
-// Test basic classes
-console.log("1. Basic Inheritance:");
+console.log("\n2. Inheritance:");
 const dog = new Dog("Rex", "German Shepherd");
-const cat = new Cat("Whiskers", "Orange");
+const cat = new Cat("Whiskers", "orange");
 
 dog.speak();
 cat.speak();
 dog.fetch();
-cat.climb();
 console.log(dog.describe());
 console.log(cat.describe());
 
-// Builder Pattern
-class QueryBuilder {
-  constructor() {
-    this.query = { select: "*", from: "", where: [], orderBy: "" };
+// instanceof checks
+console.log("dog instanceof Dog:", dog instanceof Dog);
+console.log("dog instanceof Animal:", dog instanceof Animal);
+console.log("cat instanceof Dog:", cat instanceof Dog);
+
+// ===========================
+// 3. Class with computed values
+// ===========================
+class Rectangle {
+  constructor(width, height) {
+    this.width = width;
+    this.height = height;
   }
 
-  select(fields) {
-    this.query.select = fields;
-    return this;
+  area() {
+    return this.width * this.height;
   }
 
-  from(table) {
-    this.query.from = table;
-    return this;
+  perimeter() {
+    return 2 * (this.width + this.height);
   }
 
-  where(condition) {
-    this.query.where.push(condition);
-    return this;
-  }
-
-  orderBy(field) {
-    this.query.orderBy = field;
-    return this;
-  }
-
-  build() {
-    let sql = `SELECT ${this.query.select} FROM ${this.query.from}`;
-    if (this.query.where.length > 0) {
-      sql += ` WHERE ${this.query.where.join(" AND ")}`;
-    }
-    if (this.query.orderBy) {
-      sql += ` ORDER BY ${this.query.orderBy}`;
-    }
-    return sql;
+  describe() {
+    return `Rectangle(${this.width}x${this.height}), area=${this.area()}, perimeter=${this.perimeter()}`;
   }
 }
 
-console.log("\n2. Builder Pattern:");
-const query = new QueryBuilder()
-  .select("id, name, email")
-  .from("users")
-  .where("active = true")
-  .where("role = 'admin'")
-  .orderBy("name")
-  .build();
-console.log("Generated SQL:", query);
+console.log("\n3. Computed Values:");
+const rect = new Rectangle(5, 3);
+console.log(rect.describe());
+console.log("Area:", rect.area());
 
-// State Machine
-class TrafficLight {
-  constructor() {
-    this.states = ["red", "yellow", "green"];
-    this.currentIndex = 0;
+// ===========================
+// 4. Class hierarchy depth
+// ===========================
+class Shape {
+  constructor(type) {
+    this.type = type;
   }
 
-  get current() {
-    return this.states[this.currentIndex];
-  }
-
-  next() {
-    this.currentIndex = (this.currentIndex + 1) % this.states.length;
-    return this.current;
-  }
-
-  reset() {
-    this.currentIndex = 0;
-    return this.current;
+  toString() {
+    return `[Shape: ${this.type}]`;
   }
 }
 
-console.log("\n3. State Machine:");
-const light = new TrafficLight();
-console.log("Current:", light.current);
-console.log("Next:", light.next());
-console.log("Next:", light.next());
-console.log("Next:", light.next());
-console.log("Reset:", light.reset());
-
-// Observable Pattern
-class EventEmitter {
-  constructor() {
-    this.events = {};
+class Circle extends Shape {
+  constructor(radius) {
+    super("circle");
+    this.radius = radius;
   }
 
-  on(event, listener) {
-    if (!this.events[event]) {
-      this.events[event] = [];
-    }
-    this.events[event].push(listener);
-    return this;
+  area() {
+    return Math.PI * this.radius * this.radius;
   }
 
-  emit(event, data) {
-    const listeners = this.events[event];
-    if (listeners) {
-      for (const listener of listeners) {
-        listener(data);
-      }
-    }
-    return this;
-  }
-
-  off(event, listener) {
-    const listeners = this.events[event];
-    if (listeners) {
-      const index = listeners.indexOf(listener);
-      if (index > -1) {
-        listeners.splice(index, 1);
-      }
-    }
-    return this;
+  toString() {
+    return `Circle(r=${this.radius})`;
   }
 }
 
-console.log("\n4. Event Emitter:");
-const emitter = new EventEmitter();
+console.log("\n4. Shape Hierarchy:");
+const circle = new Circle(5);
+console.log(circle.toString());
+console.log("Area:", circle.area());
+console.log("Type:", circle.type);
+console.log("instanceof Shape:", circle instanceof Shape);
 
-emitter.on("data", (data) => {
-  console.log("Received:", data);
-});
-
-emitter.on("data", (data) => {
-  console.log("Also received:", data.toUpperCase());
-});
-
-emitter.emit("data", "hello world");
-
-// Collection Class
-class Stack {
-  constructor() {
-    this.items = [];
+// ===========================
+// 5. Data classes
+// ===========================
+class Point {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
   }
 
-  push(item) {
-    this.items.push(item);
-    return this;
+  distanceTo(other) {
+    const dx = this.x - other.x;
+    const dy = this.y - other.y;
+    return Math.sqrt(dx * dx + dy * dy);
   }
 
-  pop() {
-    return this.items.pop();
-  }
-
-  peek() {
-    return this.items[this.items.length - 1];
-  }
-
-  isEmpty() {
-    return this.items.length === 0;
-  }
-
-  size() {
-    return this.items.length;
+  toString() {
+    return `(${this.x}, ${this.y})`;
   }
 }
 
-console.log("\n5. Stack Data Structure:");
-const stack = new Stack();
-stack.push(1).push(2).push(3);
-console.log("Size:", stack.size());
-console.log("Peek:", stack.peek());
-console.log("Pop:", stack.pop());
-console.log("Pop:", stack.pop());
-console.log("Size after pops:", stack.size());
+console.log("\n5. Data Classes:");
+const p1 = new Point(0, 0);
+const p2 = new Point(3, 4);
+console.log(`Distance from ${p1.toString()} to ${p2.toString()}: ${p1.distanceTo(p2)}`);
+
+// ===========================
+// 6. Error subclassing
+// ===========================
+class ValidationError extends Error {
+  constructor(field, message) {
+    super(message);
+    this.field = field;
+  }
+}
+
+console.log("\n6. Custom Errors:");
+try {
+  throw new ValidationError("email", "Invalid email format");
+} catch (e) {
+  console.log("Caught:", e.message);
+  console.log("Field:", e.field);
+  console.log("Is Error:", e instanceof Error);
+}
 
 console.log("\n✅ All class examples completed!");
+
