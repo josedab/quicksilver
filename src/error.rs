@@ -115,7 +115,7 @@ pub fn format_error_context(source: &str, location: &SourceLocation) -> String {
 /// A single frame in a JavaScript stack trace
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackFrame {
-    /// Function name (or "<anonymous>" for anonymous functions)
+    /// Function name (or `"<anonymous>"` for anonymous functions)
     pub function_name: String,
     /// Source file name (if known)
     pub file_name: Option<String>,

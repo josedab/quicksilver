@@ -381,10 +381,10 @@ impl HttpClient {
         // Simple URL parsing (in production, use a proper URL parser)
         let url = url.trim();
 
-        let (scheme, rest) = if url.starts_with("https://") {
-            ("https", &url[8..])
-        } else if url.starts_with("http://") {
-            ("http", &url[7..])
+        let (scheme, rest) = if let Some(r) = url.strip_prefix("https://") {
+            ("https", r)
+        } else if let Some(r) = url.strip_prefix("http://") {
+            ("http", r)
         } else {
             return Err(HttpError::InvalidUrl(url.to_string()));
         };

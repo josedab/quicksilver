@@ -393,7 +393,7 @@ fn run_file(path: &PathBuf, profile: bool, script_args: &[String]) {
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{}", e.with_source_context(&source));
             std::process::exit(1);
         }
     }
@@ -593,7 +593,7 @@ fn eval_code(code: &str) {
             }
         }
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{}", e.with_source_context(code));
             std::process::exit(1);
         }
     }
