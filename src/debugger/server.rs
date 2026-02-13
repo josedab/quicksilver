@@ -3,7 +3,7 @@
 //! This module provides a lightweight HTTP server that exposes the debugger
 //! functionality via a REST API. The server is single-threaded to maintain
 //! compatibility with the non-Send TimeTravelDebugger (which contains Value
-//! types that use Rc<RefCell>).
+//! types that use `Rc<RefCell>`).
 
 use super::TimeTravelDebugger;
 use serde::{Deserialize, Serialize};
@@ -119,7 +119,7 @@ pub struct SourceInfo {
 /// HTTP Debugger Server (single-threaded)
 ///
 /// This server handles connections sequentially rather than spawning threads,
-/// because TimeTravelDebugger contains Value types that use Rc<RefCell> and
+/// because TimeTravelDebugger contains Value types that use `Rc<RefCell>` and
 /// cannot be sent between threads.
 pub struct DebugServer {
     debugger: Rc<RefCell<TimeTravelDebugger>>,

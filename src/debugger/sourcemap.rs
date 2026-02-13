@@ -4,7 +4,7 @@
 //! JavaScript back to original source locations. Essential for IDE debugging.
 //!
 //! # Spec Reference
-//! https://sourcemaps.info/spec.html
+//! <https://sourcemaps.info/spec.html>
 
 use rustc_hash::FxHashMap as HashMap;
 use std::path::Path;
@@ -24,7 +24,7 @@ pub struct SourceMap {
     pub sources_content: Vec<Option<String>>,
     /// Symbolic names referenced in mappings
     pub names: Vec<String>,
-    /// Decoded mappings: generated_line → Vec<Mapping>
+    /// Decoded mappings: `generated_line → Vec<Mapping>`
     pub mappings: Vec<Vec<Mapping>>,
 }
 

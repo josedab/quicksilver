@@ -244,7 +244,7 @@ pub enum PropertyKey {
     String(String),
     /// Number literal key
     Number(f64),
-    /// Computed key [expr]
+    /// Computed key (`[expression]`)
     Computed(Box<Expression>),
     /// Private name (#name)
     PrivateName(String),

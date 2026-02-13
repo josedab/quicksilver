@@ -3,7 +3,7 @@
 //! This module implements the Debug Adapter Protocol, enabling integration
 //! with VS Code and other DAP-compatible IDEs for time-travel debugging.
 //!
-//! Reference: https://microsoft.github.io/debug-adapter-protocol/
+//! Reference: <https://microsoft.github.io/debug-adapter-protocol/>
 
 use super::TimeTravelDebugger;
 use rustc_hash::FxHashMap as HashMap;

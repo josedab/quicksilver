@@ -8,11 +8,11 @@
 pub enum TypeAnnotation {
     /// Primitive types: string, number, boolean, etc.
     Primitive(PrimitiveType),
-    /// Array type: T[]
+    /// Array type: `T[]`
     Array(Box<TypeAnnotation>),
-    /// Generic array: Array<T>
+    /// Generic array: `Array<T>`
     GenericArray(Box<TypeAnnotation>),
-    /// Tuple type: [T, U, V]
+    /// Tuple type: `[T, U, V]`
     Tuple(Vec<TypeAnnotation>),
     /// Union type: T | U
     Union(Vec<TypeAnnotation>),
@@ -22,21 +22,21 @@ pub enum TypeAnnotation {
     Object(Vec<TypeMember>),
     /// Function type: (args) => ReturnType
     Function(FunctionType),
-    /// Type reference: SomeType or Generic<T>
+    /// Type reference: `SomeType` or `Generic<T>`
     Reference(TypeReference),
     /// Literal type: "hello" | 42 | true
     Literal(LiteralType),
-    /// Conditional type: T extends U ? X : Y
+    /// Conditional type: `T extends U ? X : Y`
     Conditional(Box<ConditionalType>),
-    /// Indexed access: T[K]
+    /// Indexed access: `T[K]`
     IndexedAccess(Box<IndexedAccessType>),
-    /// Mapped type: { [K in keyof T]: T[K] }
+    /// Mapped type: `{ [K in keyof T]: T[K] }`
     Mapped(Box<MappedType>),
-    /// Template literal type: `${T}`
+    /// Template literal type: `` `${T}` ``
     TemplateLiteral(Vec<TemplateLiteralSpan>),
     /// Infer type: infer U
     Infer(String),
-    /// Keyof type: keyof T
+    /// Keyof type: `keyof T`
     Keyof(Box<TypeAnnotation>),
     /// Typeof type: typeof x
     Typeof(String),
@@ -93,9 +93,9 @@ pub struct TypeMember {
 pub enum TypeMemberName {
     /// Named property
     Identifier(String),
-    /// Computed property [expr]
+    /// Computed property (`[expr]`)
     Computed(String),
-    /// Index signature [key: Type]
+    /// Index signature (`[key: Type]`)
     IndexSignature(TypeAnnotation),
 }
 
@@ -151,14 +151,14 @@ pub struct ConditionalType {
     pub false_type: TypeAnnotation,
 }
 
-/// Indexed access type: T[K]
+/// Indexed access type: `T[K]`
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexedAccessType {
     pub object_type: TypeAnnotation,
     pub index_type: TypeAnnotation,
 }
 
-/// Mapped type: { [K in keyof T]: T[K] }
+/// Mapped type: `{ [K in keyof T]: T[K] }`
 #[derive(Debug, Clone, PartialEq)]
 pub struct MappedType {
     pub type_param: TypeParameter,

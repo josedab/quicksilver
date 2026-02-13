@@ -8,11 +8,11 @@
 //! # Features
 //!
 //! - **Memory Safety**: Pure Rust implementation eliminates 70% of security vulnerability classes
-//! - **Small Footprint**: <10MB binary for embedding in resource-constrained environments
-//! - **Fast Cold Starts**: <10ms startup time for serverless and edge deployments
-//! - **ES2020 Compliance**: Target 95%+ Test262 conformance
+//! - **Small Footprint**: ~4MB binary for embedding in resource-constrained environments
+//! - **Fast Cold Starts**: Snapshot serialization enables instant cold starts
+//! - **ES2020 Support**: Classes, arrow functions, destructuring, async/await, generators
 //!
-//! # Example
+//! # Quick Start
 //!
 //! ```no_run
 //! use quicksilver::{Runtime, Value};
@@ -24,6 +24,21 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Module Overview
+//!
+//! The interpreter pipeline flows: Source → [`lexer`] → [`parser`] → [`ast`] → [`bytecode`] → [`runtime`] → Result
+//!
+//! | Category | Modules |
+//! |----------|---------|
+//! | **Core** | [`lexer`], [`parser`], [`ast`], [`bytecode`], [`runtime`], [`error`](Error) |
+//! | **Runtime** | [`gc`], [`event_loop`], [`snapshot`], [`modules`], [`npm`], [`typescript`] |
+//! | **Security** | [`security`], [`sandbox`] |
+//! | **Tooling** | [`debugger`], [`diagnostics`], [`profiler`], [`repl`], [`test_runner`] |
+//! | **Platform** | [`native`], [`edge`], [`wasm`], [`workers`], [`concurrency`] |
+//! | **Embedding** | [`c_api`], [`ffi`], [`bindings`], [`playground`] |
+//! | **Advanced** | [`jit`], [`effects`], [`distributed`], [`reactive`], [`hmr`], [`plugins`] |
+//! | **AI** | [`ai`], [`agent`] |
 // Clippy configuration for the Quicksilver runtime.
 //
 // These suppressions exist because:

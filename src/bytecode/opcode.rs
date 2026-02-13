@@ -204,7 +204,7 @@ pub enum Opcode {
     CreateClosure = 0xA5,
     /// Call a method on an object
     /// Operands: name_index (u16), arg_count (u8)
-    /// Stack: [receiver, args...] -> [result]
+    /// Stack: \[receiver, args...\] -> \[result\]
     CallMethod = 0xA6,
 
     // ========== Objects ==========
@@ -224,11 +224,11 @@ pub enum Opcode {
     /// new.target
     NewTarget = 0xB5,
     /// Set superclass for class inheritance
-    /// Stack: [class, super_class] -> [class]
+    /// Stack: \[class, super_class\] -> \[class\]
     SetSuperClass = 0xB6,
     /// Call super constructor
     /// Operands: arg_count (u8)
-    /// Stack: [args...] -> [result]
+    /// Stack: \[args...\] -> \[result\]
     SuperCall = 0xB7,
     /// Get property from super
     /// Operands: name_index (u16)
@@ -281,13 +281,13 @@ pub enum Opcode {
     ExportValue = 0xFB,
     /// Re-export all from a module (module on stack)
     ExportAll = 0xFC,
-    /// Dynamic import - import(source) returns Promise<Module>
+    /// Dynamic import - `import(source)` returns `Promise<Module>`
     DynamicImport = 0xFD,
 
     // ========== Algebraic Effects ==========
     /// Perform an effect operation
     /// Operands: effect_type_index (u16), operation_index (u16), arg_count (u8)
-    /// Stack: [args...] -> [result]
+    /// Stack: \[args...\] -> \[result\]
     Perform = 0xFE,
 }
 
