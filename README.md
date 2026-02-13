@@ -51,11 +51,11 @@ Quicksilver is a JavaScript engine designed for embedded use cases, edge computi
 - Time-Travel Debugger with record/replay
 - Hot Module Reloading (HMR) with state preservation
 
-### Not Yet Implemented
-- Generators (`yield`)
-- ES Modules (`import`/`export`)
-- Full `async`/`await` with event loop
-- `Proxy` traps
+### Experimental / Partial
+- Generators (`function*`, `yield`) — eager collection model
+- `Proxy` — constructor only, limited trap support
+- ES Modules — `import`/`export` with import maps, `import.meta`
+- `async`/`await` — with Promise/A+ event loop and microtask queue
 
 ## Installation
 
@@ -77,6 +77,31 @@ git clone https://github.com/anthropics/quicksilver.git
 cd quicksilver
 cargo build --release
 ```
+
+### Verify Setup
+
+After building, verify everything works:
+```bash
+# Quick test
+cargo run -- -e "console.log('Hello, Quicksilver!')"
+
+# Run an example
+cargo run -- examples/hello_world.js
+
+# Start the REPL
+cargo run -- repl
+```
+
+See the [`examples/`](examples/) directory for more usage examples.
+
+### Developer Setup (Optional)
+
+For contributors, install dev tools and pre-commit hooks:
+```bash
+./scripts/setup_dev_env.sh
+```
+
+This installs `just`, `cargo-deny`, and sets up a pre-commit hook that runs `cargo fmt` and `cargo clippy` automatically. See [CONTRIBUTING.md](CONTRIBUTING.md) for full contributor guidelines.
 
 ## Usage
 
@@ -189,9 +214,9 @@ Quicksilver uses a bytecode compilation and interpretation approach:
 
 ```bash
 # Development workflow
-cargo check                   # Fast syntax check (~3s)
-cargo build                   # Debug build (~15s)
-cargo test                    # Run all 700+ tests (~6s)
+cargo check                   # Fast syntax check (~15-20s cold, ~3s warm)
+cargo build                   # Debug build (~25s incremental, ~75s clean)
+cargo test                    # Run all 800+ tests (~10s)
 cargo clippy                  # Lints
 cargo fmt                     # Format code
 cargo run -- script.js        # Run a script
@@ -203,7 +228,7 @@ cargo test arrow_functions    # By name/module
 cargo test --lib              # Unit tests only
 cargo test --test '*'         # Integration tests only
 
-# Release build (slow: ~100s, uses LTO)
+# Release build (slow: ~80s, uses LTO)
 cargo build --release
 
 # Benchmarks

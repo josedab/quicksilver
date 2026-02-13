@@ -44,10 +44,10 @@ This will:
 
 ```bash
 # Core workflow
-cargo check                   # Fast syntax check (~3s)
-cargo build                   # Debug build (~15s)
-cargo test                    # Run all 700+ tests (~6s)
-cargo clippy                  # Lint check
+cargo check                   # Fast syntax check (~15-20s cold, ~3s warm)
+cargo build                   # Debug build (~25s incremental)
+cargo test                    # Run all 800+ tests (~10s)
+cargo clippy                  # Lint check (must be zero warnings)
 cargo fmt                     # Format code
 
 # Running JavaScript
@@ -58,7 +58,7 @@ cargo run -- repl             # Interactive REPL
 # Targeted testing
 cargo test arrow_functions    # Run tests matching a name
 cargo test --lib              # Unit tests only
-cargo test --test '*'         # Integration tests only
+cargo test --test core_language_tests  # Specific test file
 cargo test -- --nocapture     # Show stdout from tests
 
 # With just (if installed)
@@ -95,19 +95,57 @@ cargo fmt
 
 ```
 src/
-├── main.rs           # CLI entry point
-├── lib.rs            # Library exports
-├── error.rs          # Error types
-├── lexer/            # Tokenization
-├── parser/           # AST generation
-├── ast/              # AST node definitions
-├── bytecode/         # Bytecode compiler
-├── runtime/          # VM and value types
-├── gc/               # Garbage collection
-└── ...               # Feature modules
+├── main.rs           # CLI entry point (REPL, run, debug, test commands)
+├── lib.rs            # Library exports and module declarations
+├── error.rs          # Error types (Error, Result, StackTrace)
+├── prelude.rs        # Convenience re-exports for library users
+├── lexer/            # Tokenization (source → tokens)
+├── parser/           # Recursive descent parser (tokens → AST)
+├── ast/              # AST node definitions (Expression, Statement)
+├── bytecode/         # Bytecode compiler and opcodes (AST → Chunk)
+├── runtime/          # VM, value types, builtins (Chunk → Result)
+├── gc/               # Mark-and-sweep garbage collection
+├── event_loop/       # Promise/A+ event loop, microtask queue
+├── modules/          # ES Module loader (import/export, import maps)
+├── npm/              # CommonJS/npm compatibility (require, path, util)
+├── typescript/       # TypeScript type stripping
+├── native/           # Native APIs (HTTP server/client, WebSocket, timers)
+├── edge/             # Edge computing (Cloudflare Workers-compatible API)
+├── wasm/             # WebAssembly module parsing and execution
+├── workers/          # Worker threads, SharedArrayBuffer, Atomics
+├── security/         # Capability-based permission system
+├── sandbox/          # Sandbox configuration and enforcement
+├── debugger/         # Time-travel debugger (DAP protocol, TUI, source maps)
+├── diagnostics/      # Language diagnostics, error suggestions
+├── profiler/         # CPU/memory profiling
+├── repl/             # Interactive REPL with completion and highlighting
+├── test_runner/      # Built-in JavaScript test framework
+├── test262/          # Test262 conformance harness
+├── c_api/            # C FFI API for embedding
+├── ffi/              # Foreign function interface
+├── bindings/         # Multi-language SDK bindings (C, Python, Go)
+├── ai/               # AI-native runtime (JSDoc → tool schemas)
+├── agent/            # AI agent execution sandbox
+├── jit/              # JIT compilation (experimental)
+├── effects/          # Algebraic effects system (experimental)
+├── distributed/      # Distributed runtime primitives (experimental)
+├── hmr/              # Hot module reloading
+├── plugins/          # Plugin system
+├── reactive/         # Reactive state management
+├── concurrency/      # Channels, structured concurrency
+├── snapshot/         # Snapshot serialization (cold starts)
+├── observability/    # OpenTelemetry-compatible tracing/metrics
+├── durable/          # Durable objects (experimental)
+└── playground/       # Web playground bridge
 ```
 
-See `CLAUDE.md` for detailed architecture documentation.
+### Pipeline Architecture
+
+```
+Source Code → Lexer → Parser → AST → Compiler → Bytecode → VM → Result
+```
+
+See `CLAUDE.md` for detailed type documentation and implementation guide.
 
 ## Making Changes
 
@@ -123,9 +161,16 @@ See `CLAUDE.md` for detailed architecture documentation.
 
 - Add tests for new features
 - Ensure existing tests pass
-- Integration tests go in `tests/` — use for full JavaScript feature validation
-- Unit tests go in the same file as the code (in a `#[cfg(test)]` module) — use for pure functions, value conversions, individual opcode behavior
-- Doc tests go in `///` doc comments — use for public API examples that should always compile
+- **Integration tests** go in `tests/` — organized by feature area:
+  - `core_language_tests.rs` — arrow functions, operators, control flow
+  - `data_structures_tests.rs` — arrays, objects, destructuring, symbols
+  - `oop_tests.rs` — classes, inheritance
+  - `error_control_tests.rs` — try/catch, error handling, recursion
+  - `collections_types_tests.rs` — WeakMap/Set, Proxy
+  - `async_modules_tests.rs` — promises, async/await, ES modules, generators
+  - `modern_features_tests.rs` — structuredClone, advanced features
+- **Unit tests** go in the same file as the code (in a `#[cfg(test)]` module) — use for pure functions, value conversions, individual opcode behavior
+- **Doc tests** go in `///` doc comments — use for public API examples that should always compile
 
 ### Commit Messages
 
@@ -163,10 +208,11 @@ Use clear, descriptive commit messages:
 
 ### Larger Projects
 
-- Implementing generators (`yield`)
-- Adding ES Module support
-- Improving garbage collection
-- Performance optimizations
+- Performance optimizations (VM dispatch, object property lookup)
+- Improving garbage collection (generational GC)
+- Expanding Test262 conformance coverage
+- JIT compilation improvements
+- WebAssembly interop enhancements
 
 ## Reporting Bugs
 
