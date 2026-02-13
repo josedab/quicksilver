@@ -667,8 +667,7 @@ impl AgentRuntime {
 
     /// Execute with tool call tracking
     pub fn execute_with_tools(&mut self, code: &str) -> AgentOutput {
-        let output = self.execute(code);
-        output
+        self.execute(code)
     }
 
     /// Get the tool schemas in OpenAI function calling format
@@ -696,6 +695,118 @@ impl AgentRuntime {
     pub fn stats(&self) -> &BudgetUsage {
         &self.context.usage
     }
+
+    /// Add a message to the conversation history
+    pub fn add_message(&mut self, role: &str, content: &str) {
+        self.context.add_message(role, content);
+    }
+
+    /// Reset the agent for a new conversation
+    pub fn reset(&mut self) {
+        self.context.conversation.clear();
+        self.context.tool_calls.clear();
+        self.context.console_output.clear();
+        self.context.usage = BudgetUsage::default();
+    }
+
+    /// Execute a multi-turn agent loop: run code, check for tool calls, process results.
+    /// Returns a `AgentTurnResult` for each turn until completion or budget exhaustion.
+    pub fn run_agent_loop(&mut self, initial_code: &str, max_turns: usize) -> AgentLoopResult {
+        let mut turns = Vec::new();
+        let mut code = initial_code.to_string();
+
+        for turn_idx in 0..max_turns {
+            // Check budget before each turn
+            if let Some(violation) = self.check_budget() {
+                return AgentLoopResult {
+                    turns,
+                    final_result: Value::Undefined,
+                    completed: false,
+                    budget_exceeded: Some(violation),
+                    total_tool_calls: self.context.tool_calls.len(),
+                };
+            }
+
+            let output = self.execute(&code);
+            let tool_calls_this_turn = output.tool_calls.len();
+
+            turns.push(AgentTurn {
+                turn: turn_idx,
+                code: code.clone(),
+                result: output.result.clone(),
+                success: output.success,
+                tool_calls: tool_calls_this_turn,
+                error: output.error.clone(),
+            });
+
+            if !output.success || output.tool_calls.is_empty() {
+                // No more tool calls or error — agent loop complete
+                return AgentLoopResult {
+                    final_result: output.result,
+                    completed: output.success,
+                    budget_exceeded: None,
+                    total_tool_calls: self.context.tool_calls.len(),
+                    turns,
+                };
+            }
+
+            // Build continuation code from tool call results
+            let mut continuation = String::new();
+            for tc in &output.tool_calls {
+                continuation.push_str(&format!(
+                    "var __tool_result_{} = {};\n",
+                    tc.tool_name,
+                    match &tc.result {
+                        Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+                        Value::Number(n) => n.to_string(),
+                        Value::Boolean(b) => b.to_string(),
+                        _ => "undefined".to_string(),
+                    }
+                ));
+            }
+            code = continuation;
+        }
+
+        AgentLoopResult {
+            turns,
+            final_result: Value::Undefined,
+            completed: false,
+            budget_exceeded: None,
+            total_tool_calls: self.context.tool_calls.len(),
+        }
+    }
+}
+
+/// Result of a single turn in the agent loop
+#[derive(Debug, Clone)]
+pub struct AgentTurn {
+    /// Turn number (0-indexed)
+    pub turn: usize,
+    /// Code executed this turn
+    pub code: String,
+    /// Result of execution
+    pub result: Value,
+    /// Whether execution succeeded
+    pub success: bool,
+    /// Number of tool calls made
+    pub tool_calls: usize,
+    /// Error message if any
+    pub error: Option<String>,
+}
+
+/// Result of the full agent loop
+#[derive(Debug, Clone)]
+pub struct AgentLoopResult {
+    /// All turns executed
+    pub turns: Vec<AgentTurn>,
+    /// Final result value
+    pub final_result: Value,
+    /// Whether the loop completed successfully
+    pub completed: bool,
+    /// Budget violation if loop was stopped
+    pub budget_exceeded: Option<BudgetViolation>,
+    /// Total tool calls across all turns
+    pub total_tool_calls: usize,
 }
 
 #[cfg(test)]
@@ -881,8 +992,47 @@ mod tests {
     #[test]
     fn test_agent_runtime_panic_safety() {
         let mut rt = AgentRuntime::new("test", AgentRuntimeConfig::strict());
-        // Even if the runtime panics internally, the agent should handle it gracefully
         let output = rt.execute("let x = 1; x + 2");
         assert!(output.success);
+    }
+
+    #[test]
+    fn test_agent_loop_simple() {
+        let mut rt = AgentRuntime::new("test", AgentRuntimeConfig::strict());
+        let result = rt.run_agent_loop("1 + 2 + 3", 5);
+        assert!(result.completed);
+        assert_eq!(result.turns.len(), 1);
+        assert_eq!(result.final_result, Value::Number(6.0));
+    }
+
+    #[test]
+    fn test_agent_loop_max_turns() {
+        let mut rt = AgentRuntime::new("test", AgentRuntimeConfig::strict());
+        let result = rt.run_agent_loop("1 + 1", 1);
+        assert!(result.completed);
+        assert_eq!(result.turns.len(), 1);
+    }
+
+    #[test]
+    fn test_agent_reset() {
+        let mut rt = AgentRuntime::new("test", AgentRuntimeConfig::strict());
+        rt.execute("1 + 1");
+        rt.add_message("user", "hello");
+        rt.reset();
+        assert!(rt.context.conversation.is_empty());
+    }
+
+    #[test]
+    fn test_agent_turn_struct() {
+        let turn = AgentTurn {
+            turn: 0,
+            code: "test".to_string(),
+            result: Value::Number(42.0),
+            success: true,
+            tool_calls: 0,
+            error: None,
+        };
+        assert_eq!(turn.turn, 0);
+        assert!(turn.success);
     }
 }
