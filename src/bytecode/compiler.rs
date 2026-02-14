@@ -1541,44 +1541,340 @@ impl Compiler {
             match &arm.pattern {
                 MatchPattern::Wildcard(_) => {
                     // Default arm: pop discriminant, compile body
-                    self.emit(Opcode::Pop);
+                    self.emit(Opcode::MatchEnd);
                     self.compile_expr(&arm.body)?;
                     end_jumps.push(self.emit_jump(Opcode::Jump));
                 }
                 MatchPattern::Literal(lit) => {
                     self.emit(Opcode::Dup);
                     self.compile_literal(lit)?;
-                    self.emit(Opcode::StrictEq);
+                    self.emit(Opcode::MatchPattern);
                     let skip = self.emit_jump(Opcode::JumpIfFalse);
-                    self.emit(Opcode::Pop); // pop bool
-                    self.emit(Opcode::Pop); // pop discriminant
-                    self.compile_expr(&arm.body)?;
-                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                    self.emit(Opcode::Pop); // pop true
+
+                    if let Some(guard) = &arm.guard {
+                        self.compile_expr(guard)?;
+                        let guard_skip = self.emit_jump(Opcode::JumpIfFalse);
+                        self.emit(Opcode::Pop); // pop true
+                        self.emit(Opcode::MatchEnd); // pop discriminant
+                        self.compile_expr(&arm.body)?;
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                        self.patch_jump(guard_skip);
+                        self.emit(Opcode::Pop); // pop false
+                    } else {
+                        self.emit(Opcode::MatchEnd); // pop discriminant
+                        self.compile_expr(&arm.body)?;
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                    }
+
                     self.patch_jump(skip);
                     self.emit(Opcode::Pop); // pop false
                 }
                 MatchPattern::Identifier(id) => {
-                    // Compare against variable value
-                    self.emit(Opcode::Dup);
-                    self.compile_identifier(id)?;
-                    self.emit(Opcode::StrictEq);
+                    // Identifier pattern: bind discriminant to a local
+                    let _slot = self.add_local(&id.name)?;
+
+                    if let Some(guard) = &arm.guard {
+                        // Guard can reference the bound variable
+                        self.compile_expr(guard)?;
+                        let guard_skip = self.emit_jump(Opcode::JumpIfFalse);
+                        self.emit(Opcode::Pop); // pop true
+
+                        // Compile body (can reference bound variable via GetLocal)
+                        self.compile_expr(&arm.body)?;
+                        // Stack: [..., disc(=x), body_result]
+                        // Swap result past disc, pop disc
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop);
+                        self.locals.pop();
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+
+                        self.patch_jump(guard_skip);
+                        self.emit(Opcode::Pop); // pop false
+                        self.locals.pop();
+                        // disc remains on stack for next arm
+                    } else {
+                        // Compile body (can reference bound variable via GetLocal)
+                        self.compile_expr(&arm.body)?;
+                        // Stack: [..., disc(=x), body_result]
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop);
+                        self.locals.pop();
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                    }
+                }
+                MatchPattern::Or(alternatives, _) => {
+                    // Try each alternative
+                    let mut or_end_jumps = Vec::new();
+                    for (i, alt) in alternatives.iter().enumerate() {
+                        if let MatchPattern::Literal(lit) = alt {
+                            self.emit(Opcode::Dup);
+                            self.compile_literal(lit)?;
+                            self.emit(Opcode::MatchPattern);
+                            if i < alternatives.len() - 1 {
+                                or_end_jumps.push(self.emit_jump(Opcode::JumpIfTrue));
+                                self.emit(Opcode::Pop); // pop false
+                            }
+                        } else if let MatchPattern::Wildcard(_) = alt {
+                            self.emit(Opcode::True);
+                            if i < alternatives.len() - 1 {
+                                or_end_jumps.push(self.emit_jump(Opcode::JumpIfTrue));
+                                self.emit(Opcode::Pop);
+                            }
+                        }
+                    }
+                    // Patch or-end jumps to here
                     let skip = self.emit_jump(Opcode::JumpIfFalse);
-                    self.emit(Opcode::Pop); // pop bool
-                    self.emit(Opcode::Pop); // pop discriminant
-                    self.compile_expr(&arm.body)?;
-                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                    self.emit(Opcode::Pop); // pop true
+                    for j in or_end_jumps {
+                        self.patch_jump(j);
+                        // The JumpIfTrue doesn't pop, so we need to pop the true
+                    }
+                    // Pop any remaining true values from or-short-circuit
+                    // Actually JumpIfTrue leaves the value on stack, so pop it
+                    self.emit(Opcode::Pop);
+
+                    if let Some(guard) = &arm.guard {
+                        self.compile_expr(guard)?;
+                        let guard_skip = self.emit_jump(Opcode::JumpIfFalse);
+                        self.emit(Opcode::Pop);
+                        self.emit(Opcode::MatchEnd);
+                        self.compile_expr(&arm.body)?;
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                        self.patch_jump(guard_skip);
+                        self.emit(Opcode::Pop);
+                    } else {
+                        self.emit(Opcode::MatchEnd);
+                        self.compile_expr(&arm.body)?;
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                    }
+
                     self.patch_jump(skip);
                     self.emit(Opcode::Pop); // pop false
+                }
+                MatchPattern::Array(elements, _) => {
+                    // Test array length
+                    self.emit(Opcode::Dup);
+                    let length_idx = self.chunk.add_constant(Value::String("length".to_string()));
+                    self.emit(Opcode::GetProperty);
+                    self.emit_u16(length_idx);
+                    let non_rest = elements.iter().filter(|e| !matches!(e, MatchPattern::Rest(_, _))).count();
+                    self.emit_constant(Value::Number(non_rest as f64));
+                    self.emit(Opcode::Ge);
+                    let length_fail = self.emit_jump(Opcode::JumpIfFalse);
+                    self.emit(Opcode::Pop); // pop true
+
+                    // Test each literal element
+                    let mut elem_fails = Vec::new();
+                    for (i, elem) in elements.iter().enumerate() {
+                        if let MatchPattern::Literal(lit) = elem {
+                            self.emit(Opcode::Dup);
+                            self.emit_constant(Value::Number(i as f64));
+                            self.emit(Opcode::GetElement);
+                            self.compile_literal(lit)?;
+                            self.emit(Opcode::MatchPattern);
+                            elem_fails.push(self.emit_jump(Opcode::JumpIfFalse));
+                            self.emit(Opcode::Pop); // pop true
+                        }
+                    }
+
+                    // All tests passed — bind variables
+                    let mut bindings_count = 0;
+                    for (i, elem) in elements.iter().enumerate() {
+                        if let MatchPattern::Identifier(id) = elem {
+                            self.emit(Opcode::Dup); // dup array
+                            self.emit_constant(Value::Number(i as f64));
+                            self.emit(Opcode::GetElement);
+                            let _slot = self.add_local(&id.name)?;
+                            bindings_count += 1;
+                        }
+                    }
+
+                    if let Some(guard) = &arm.guard {
+                        self.compile_expr(guard)?;
+                        let guard_skip = self.emit_jump(Opcode::JumpIfFalse);
+                        self.emit(Opcode::Pop);
+
+                        self.compile_expr(&arm.body)?;
+                        // Clean up: swap result past bindings and disc
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Swap);
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop); // pop disc
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+
+                        self.patch_jump(guard_skip);
+                        self.emit(Opcode::Pop);
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                    } else {
+                        self.compile_expr(&arm.body)?;
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Swap);
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop); // pop disc
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                    }
+
+                    // Jump target for failed element checks
+                    let skip_to = self.chunk.code.len();
+                    self.patch_jump(length_fail);
+                    for j in elem_fails {
+                        self.patch_jump(j);
+                    }
+                    // Pop false from the failed check
+                    self.emit(Opcode::Pop);
+                    let _ = skip_to;
+                }
+                MatchPattern::Object(props, _) => {
+                    // Test each property
+                    let mut prop_fails = Vec::new();
+                    for (key, value_pattern) in props {
+                        if let MatchPattern::Literal(lit) = value_pattern {
+                            self.emit(Opcode::Dup);
+                            let key_idx = self.chunk.add_constant(Value::String(key.clone()));
+                            self.emit(Opcode::GetProperty);
+                            self.emit_u16(key_idx);
+                            self.compile_literal(lit)?;
+                            self.emit(Opcode::MatchPattern);
+                            prop_fails.push(self.emit_jump(Opcode::JumpIfFalse));
+                            self.emit(Opcode::Pop); // pop true
+                        }
+                    }
+
+                    // All checks passed — bind variables
+                    let mut bindings_count = 0;
+                    for (key, value_pattern) in props {
+                        if let MatchPattern::Identifier(_id) = value_pattern {
+                            self.emit(Opcode::Dup); // dup object
+                            let key_idx = self.chunk.add_constant(Value::String(key.clone()));
+                            self.emit(Opcode::GetProperty);
+                            self.emit_u16(key_idx);
+                            let _slot = self.add_local(&_id.name)?;
+                            bindings_count += 1;
+                        }
+                    }
+
+                    if let Some(guard) = &arm.guard {
+                        self.compile_expr(guard)?;
+                        let guard_skip = self.emit_jump(Opcode::JumpIfFalse);
+                        self.emit(Opcode::Pop);
+
+                        self.compile_expr(&arm.body)?;
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Swap);
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop); // pop disc
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+
+                        self.patch_jump(guard_skip);
+                        self.emit(Opcode::Pop);
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                    } else {
+                        self.compile_expr(&arm.body)?;
+                        for _ in 0..bindings_count {
+                            self.emit(Opcode::Swap);
+                            self.emit(Opcode::Pop);
+                            self.locals.pop();
+                        }
+                        self.emit(Opcode::Swap);
+                        self.emit(Opcode::Pop); // pop disc
+                        end_jumps.push(self.emit_jump(Opcode::Jump));
+                    }
+
+                    // Failed property checks
+                    for j in prop_fails {
+                        self.patch_jump(j);
+                    }
+                    self.emit(Opcode::Pop); // pop false
+                }
+                MatchPattern::Binding { .. } => {
+                    // Test inner pattern first
+                    self.compile_match_arm_pattern_test(&arm.pattern, &mut end_jumps, &arm.guard, &arm.body)?;
+                }
+                MatchPattern::Rest(_, _) => {
+                    // Rest pattern always matches (like wildcard)
+                    self.emit(Opcode::MatchEnd);
+                    self.compile_expr(&arm.body)?;
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
                 }
             }
         }
 
         // If no arm matched, result is undefined
-        self.emit(Opcode::Pop); // pop discriminant
+        self.emit(Opcode::MatchEnd); // pop discriminant
         self.emit(Opcode::Undefined);
 
         for jump in end_jumps {
             self.patch_jump(jump);
+        }
+
+        Ok(())
+    }
+
+    /// Helper: compile a Binding pattern arm (name @ inner_pattern)
+    fn compile_match_arm_pattern_test(
+        &mut self,
+        pattern: &crate::ast::MatchPattern,
+        end_jumps: &mut Vec<usize>,
+        _guard: &Option<Box<Expression>>,
+        body: &Expression,
+    ) -> Result<()> {
+        use crate::ast::MatchPattern;
+
+        if let MatchPattern::Binding { name, pattern: inner, .. } = pattern {
+            // Register the binding
+            let slot = self.add_local(name)?;
+            let _ = slot;
+
+            match inner.as_ref() {
+                MatchPattern::Literal(lit) => {
+                    self.emit(Opcode::Dup);
+                    self.compile_literal(lit)?;
+                    self.emit(Opcode::MatchPattern);
+                    let skip = self.emit_jump(Opcode::JumpIfFalse);
+                    self.emit(Opcode::Pop); // pop true
+
+                    self.compile_expr(body)?;
+                    self.emit(Opcode::Swap);
+                    self.emit(Opcode::Pop);
+                    self.locals.pop();
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+
+                    self.patch_jump(skip);
+                    self.emit(Opcode::Pop); // pop false
+                    self.locals.pop();
+                }
+                MatchPattern::Wildcard(_) => {
+                    self.compile_expr(body)?;
+                    self.emit(Opcode::Swap);
+                    self.emit(Opcode::Pop);
+                    self.locals.pop();
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                }
+                _ => {
+                    // For other inner patterns, treat as wildcard binding
+                    self.compile_expr(body)?;
+                    self.emit(Opcode::Swap);
+                    self.emit(Opcode::Pop);
+                    self.locals.pop();
+                    end_jumps.push(self.emit_jump(Opcode::Jump));
+                }
+            }
         }
 
         Ok(())
@@ -1848,6 +2144,15 @@ impl Compiler {
             }
             Expression::Match(match_expr) => {
                 self.compile_match_expr(match_expr)
+            }
+            Expression::Pipeline { left, right } => {
+                // Desugar: expr |> func  →  func(expr)
+                self.compile_expr(left)?;
+                self.compile_expr(right)?;
+                self.emit(Opcode::Swap);
+                self.emit(Opcode::Call);
+                self.emit_byte(1);
+                Ok(())
             }
             _ => {
                 // Fallback for unimplemented expression types (e.g., MetaProperty, JSX)

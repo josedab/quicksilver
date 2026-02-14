@@ -440,7 +440,9 @@ impl Optimizer {
             | Opcode::LeaveTry
             | Opcode::LeaveWith
             | Opcode::SetSuperClass
-            | Opcode::DynamicImport => 1,
+            | Opcode::DynamicImport
+            | Opcode::MatchPattern
+            | Opcode::MatchEnd => 1,
 
             // 1-byte operand
             Opcode::LoadReg
@@ -452,7 +454,8 @@ impl Optimizer {
             | Opcode::CreateObject
             | Opcode::GetLocal
             | Opcode::SetLocal
-            | Opcode::SuperCall => 2,
+            | Opcode::SuperCall
+            | Opcode::MatchBind => 2,
 
             // 2-byte operand
             Opcode::Constant

@@ -289,6 +289,18 @@ pub enum Opcode {
     /// Operands: effect_type_index (u16), operation_index (u16), arg_count (u8)
     /// Stack: \[args...\] -> \[result\]
     Perform = 0xFE,
+
+    // ========== Pattern Matching ==========
+    /// Test if TOS matches a pattern (push bool)
+    /// Stack: \[value, pattern_value\] -> \[bool\]
+    MatchPattern = 0xE2,
+    /// Bind matched value to a local variable
+    /// Operands: local_index (u8)
+    /// Stack: \[value\] -> \[value\] (value stays on stack)
+    MatchBind = 0xE3,
+    /// End of match expression (cleanup discriminant)
+    /// Stack: \[discriminant\] -> \[\]
+    MatchEnd = 0xE4,
 }
 
 impl Opcode {
@@ -411,6 +423,9 @@ impl Opcode {
             0xFC => Some(Opcode::ExportAll),
             0xFD => Some(Opcode::DynamicImport),
             0xFE => Some(Opcode::Perform),
+            0xE2 => Some(Opcode::MatchPattern),
+            0xE3 => Some(Opcode::MatchBind),
+            0xE4 => Some(Opcode::MatchEnd),
 
             _ => None,
         }
@@ -477,7 +492,9 @@ impl Opcode {
             | Opcode::Yield
             | Opcode::Await
             | Opcode::ExportAll
-            | Opcode::DynamicImport => 1,
+            | Opcode::DynamicImport
+            | Opcode::MatchPattern
+            | Opcode::MatchEnd => 1,
 
             // 1-byte operand
             Opcode::GetLocal
@@ -489,6 +506,9 @@ impl Opcode {
             | Opcode::New
             | Opcode::CreateArray
             | Opcode::CreateObject => 2,
+
+            // 1-byte operand (u8) for MatchBind
+            Opcode::MatchBind => 2,
 
             // 2-byte operand
             Opcode::Constant

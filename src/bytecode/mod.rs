@@ -212,7 +212,9 @@ impl Chunk {
             | Opcode::Await
             | Opcode::ExportAll
             | Opcode::SetSuperClass
-            | Opcode::DynamicImport => ("".to_string(), 0),
+            | Opcode::DynamicImport
+            | Opcode::MatchPattern
+            | Opcode::MatchEnd => ("".to_string(), 0),
 
             // 1-byte operand (register or arg count)
             Opcode::LoadReg
@@ -222,7 +224,8 @@ impl Chunk {
             | Opcode::New
             | Opcode::CreateArray
             | Opcode::CreateObject
-            | Opcode::SuperCall => {
+            | Opcode::SuperCall
+            | Opcode::MatchBind => {
                 if offset < self.code.len() {
                     (format!("r{}", self.code[offset]), 1)
                 } else {
