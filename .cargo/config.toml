@@ -1,0 +1,4 @@
+[alias]
+check-all = "clippy --all-targets -- -D warnings"
+test-quick = "test --lib"
+dev = "run -- repl"
