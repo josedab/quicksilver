@@ -97,6 +97,12 @@ pub enum Expression {
 
     /// Pattern matching expression: match(expr) { when ... => ... }
     Match(Box<MatchExpression>),
+
+    /// Pipeline expression: `expr |> func`
+    Pipeline {
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
 }
 
 impl Expression {
@@ -134,6 +140,7 @@ impl Expression {
             Expression::Perform(p) => p.span,
             Expression::Parenthesized(e) => e.span(),
             Expression::Match(m) => m.span,
+            Expression::Pipeline { left, .. } => left.span(),
         }
     }
 
@@ -578,6 +585,8 @@ pub struct MatchExpression {
 pub struct MatchArm {
     /// Pattern to match against (None = wildcard/default)
     pub pattern: MatchPattern,
+    /// Optional guard expression
+    pub guard: Option<Box<Expression>>,
     /// The body expression to evaluate if matched
     pub body: Expression,
     /// Span in source
@@ -593,4 +602,18 @@ pub enum MatchPattern {
     Identifier(Identifier),
     /// Wildcard pattern (_) - matches anything
     Wildcard(Span),
+    /// Array destructuring pattern [a, b, c]
+    Array(Vec<MatchPattern>, Span),
+    /// Object destructuring pattern {key: pattern, ...}
+    Object(Vec<(String, MatchPattern)>, Span),
+    /// Rest pattern ...name
+    Rest(Box<MatchPattern>, Span),
+    /// Or pattern (pattern1 | pattern2)
+    Or(Vec<MatchPattern>, Span),
+    /// Binding pattern (name @ pattern)
+    Binding {
+        name: String,
+        pattern: Box<MatchPattern>,
+        span: Span,
+    },
 }

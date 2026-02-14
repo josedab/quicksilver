@@ -177,7 +177,19 @@ impl<'src> Parser<'src> {
 
     /// Parse a single expression
     pub fn parse_expression(&mut self) -> Result<Expression> {
-        self.parse_assignment_expression()
+        let mut left = self.parse_assignment_expression()?;
+
+        // Pipeline operator |> has lower precedence than assignment, left-associative
+        while self.peek() == TokenKind::PipelineRight {
+            self.advance();
+            let right = self.parse_assignment_expression()?;
+            left = Expression::Pipeline {
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
     }
 
     // ========== Token Access ==========
@@ -2263,7 +2275,7 @@ impl<'src> Parser<'src> {
 
     /// Parse match expression: match(expr) { when pat => body, ... }
     fn parse_match_expression(&mut self, start: SourceLocation) -> Result<Expression> {
-        use crate::ast::{MatchExpression, MatchArm, MatchPattern};
+        use crate::ast::{MatchExpression, MatchArm};
 
         self.expect(TokenKind::LeftParen)?;
         let discriminant = self.parse_expression()?;
@@ -2277,51 +2289,47 @@ impl<'src> Parser<'src> {
 
             self.expect(TokenKind::Keyword(Keyword::When))?;
 
-            // Parse pattern
-            let pattern = if self.peek() == TokenKind::Identifier && self.current().text == "_" {
-                let span = Span::new(self.location(), self.location());
+            // Parse pattern (optionally wrapped in parentheses)
+            let has_parens = self.peek() == TokenKind::LeftParen;
+            if has_parens {
                 self.advance();
-                MatchPattern::Wildcard(span)
-            } else if matches!(self.peek(), TokenKind::NumberLiteral | TokenKind::StringLiteral) {
-                let lit_expr = self.parse_primary_expression()?;
-                match lit_expr {
-                    Expression::Literal(lit) => MatchPattern::Literal(lit),
-                    _ => return Err(self.error("Expected pattern", arm_start)),
+            }
+
+            let pattern = self.parse_match_pattern()?;
+
+            if has_parens {
+                self.expect(TokenKind::RightParen)?;
+            }
+
+            // Parse optional guard: if (expr)
+            let guard = if self.peek() == TokenKind::Keyword(Keyword::If) {
+                self.advance();
+                let has_guard_parens = self.peek() == TokenKind::LeftParen;
+                if has_guard_parens {
+                    self.advance();
                 }
-            } else if self.peek() == TokenKind::Keyword(Keyword::True) {
-                self.advance();
-                MatchPattern::Literal(crate::ast::Literal {
-                    value: crate::ast::LiteralValue::Boolean(true),
-                    raw: "true".to_string(),
-                    span: Span::new(arm_start, self.location()),
-                })
-            } else if self.peek() == TokenKind::Keyword(Keyword::False) {
-                self.advance();
-                MatchPattern::Literal(crate::ast::Literal {
-                    value: crate::ast::LiteralValue::Boolean(false),
-                    raw: "false".to_string(),
-                    span: Span::new(arm_start, self.location()),
-                })
-            } else if self.peek() == TokenKind::Keyword(Keyword::Null) {
-                self.advance();
-                MatchPattern::Literal(crate::ast::Literal {
-                    value: crate::ast::LiteralValue::Null,
-                    raw: "null".to_string(),
-                    span: Span::new(arm_start, self.location()),
-                })
+                let guard_expr = self.parse_expression()?;
+                if has_guard_parens {
+                    self.expect(TokenKind::RightParen)?;
+                }
+                Some(Box::new(guard_expr))
             } else {
-                let id = self.parse_identifier()?;
-                MatchPattern::Identifier(id)
+                None
             };
 
-            // Expect =>
-            self.expect(TokenKind::Arrow)?;
+            // Expect -> or =>
+            if self.peek() == TokenKind::ThinArrow {
+                self.advance();
+            } else {
+                self.expect(TokenKind::Arrow)?;
+            }
 
             // Parse body expression
             let body = self.parse_expression()?;
 
             arms.push(MatchArm {
                 pattern,
+                guard,
                 body,
                 span: Span::new(arm_start, self.location()),
             });
@@ -2339,6 +2347,186 @@ impl<'src> Parser<'src> {
             arms,
             span: Span::new(start, self.location()),
         })))
+    }
+
+    /// Parse a match pattern
+    fn parse_match_pattern(&mut self) -> Result<MatchPattern> {
+        use crate::ast::MatchPattern;
+
+        let pattern = self.parse_match_pattern_primary()?;
+
+        // Check for Or pattern: pattern | pattern
+        if self.peek() == TokenKind::Pipe {
+            let mut alternatives = vec![pattern];
+            while self.peek() == TokenKind::Pipe {
+                self.advance();
+                alternatives.push(self.parse_match_pattern_primary()?);
+            }
+            let span = Span::new(self.location(), self.location());
+            return Ok(MatchPattern::Or(alternatives, span));
+        }
+
+        Ok(pattern)
+    }
+
+    /// Parse a primary match pattern (without Or)
+    fn parse_match_pattern_primary(&mut self) -> Result<MatchPattern> {
+        use crate::ast::MatchPattern;
+
+        let start = self.location();
+
+        // Wildcard: _
+        if self.peek() == TokenKind::Identifier && self.current().text == "_" {
+            let span = Span::new(self.location(), self.location());
+            self.advance();
+            return Ok(MatchPattern::Wildcard(span));
+        }
+
+        // Rest pattern: ...name
+        if self.peek() == TokenKind::DotDotDot {
+            self.advance();
+            let inner = self.parse_match_pattern_primary()?;
+            return Ok(MatchPattern::Rest(
+                Box::new(inner),
+                Span::new(start, self.location()),
+            ));
+        }
+
+        // Array pattern: [p1, p2, ...]
+        if self.peek() == TokenKind::LeftBracket {
+            self.advance();
+            let mut elements = Vec::new();
+            while self.peek() != TokenKind::RightBracket && self.peek() != TokenKind::Eof {
+                elements.push(self.parse_match_pattern()?);
+                if self.peek() == TokenKind::Comma {
+                    self.advance();
+                }
+            }
+            self.expect(TokenKind::RightBracket)?;
+            return Ok(MatchPattern::Array(
+                elements,
+                Span::new(start, self.location()),
+            ));
+        }
+
+        // Object pattern: {key: pattern, ...}
+        if self.peek() == TokenKind::LeftBrace {
+            self.advance();
+            let mut props = Vec::new();
+            while self.peek() != TokenKind::RightBrace && self.peek() != TokenKind::Eof {
+                let key = if self.peek() == TokenKind::Identifier
+                    || matches!(self.peek(), TokenKind::Keyword(_))
+                {
+                    let name = self.current().text.to_string();
+                    self.advance();
+                    name
+                } else if self.peek() == TokenKind::StringLiteral {
+                    let text = self.current().text;
+                    let name = text[1..text.len() - 1].to_string();
+                    self.advance();
+                    name
+                } else {
+                    let loc = self.location();
+                    return Err(self.error("Expected property name in object pattern", loc));
+                };
+
+                let pattern = if self.peek() == TokenKind::Colon {
+                    self.advance();
+                    self.parse_match_pattern()?
+                } else {
+                    // Shorthand: {x} means {x: x} — bind to identifier
+                    MatchPattern::Identifier(Identifier::new(key.clone(), Span::new(start, self.location())))
+                };
+                props.push((key, pattern));
+                if self.peek() == TokenKind::Comma {
+                    self.advance();
+                }
+            }
+            self.expect(TokenKind::RightBrace)?;
+            return Ok(MatchPattern::Object(
+                props,
+                Span::new(start, self.location()),
+            ));
+        }
+
+        // Literal patterns
+        if matches!(self.peek(), TokenKind::NumberLiteral | TokenKind::StringLiteral) {
+            let lit_expr = self.parse_primary_expression()?;
+            match lit_expr {
+                Expression::Literal(lit) => return Ok(MatchPattern::Literal(lit)),
+                _ => {
+                    return Err(self.error("Expected pattern", start));
+                }
+            }
+        }
+
+        // Boolean/null literals
+        if self.peek() == TokenKind::Keyword(Keyword::True) {
+            self.advance();
+            return Ok(MatchPattern::Literal(crate::ast::Literal {
+                value: crate::ast::LiteralValue::Boolean(true),
+                raw: "true".to_string(),
+                span: Span::new(start, self.location()),
+            }));
+        }
+        if self.peek() == TokenKind::Keyword(Keyword::False) {
+            self.advance();
+            return Ok(MatchPattern::Literal(crate::ast::Literal {
+                value: crate::ast::LiteralValue::Boolean(false),
+                raw: "false".to_string(),
+                span: Span::new(start, self.location()),
+            }));
+        }
+        if self.peek() == TokenKind::Keyword(Keyword::Null) {
+            self.advance();
+            return Ok(MatchPattern::Literal(crate::ast::Literal {
+                value: crate::ast::LiteralValue::Null,
+                raw: "null".to_string(),
+                span: Span::new(start, self.location()),
+            }));
+        }
+
+        // Negative number literal: -42
+        if self.peek() == TokenKind::Minus {
+            self.advance();
+            if self.peek() == TokenKind::NumberLiteral {
+                let lit_expr = self.parse_primary_expression()?;
+                match lit_expr {
+                    Expression::Literal(mut lit) => {
+                        if let crate::ast::LiteralValue::Number(n) = &mut lit.value {
+                            *n = -*n;
+                        }
+                        lit.raw = format!("-{}", lit.raw);
+                        return Ok(MatchPattern::Literal(lit));
+                    }
+                    _ => {
+                        return Err(self.error("Expected number after '-'", start));
+                    }
+                }
+            }
+            return Err(self.error("Expected number after '-'", start));
+        }
+
+        // Identifier pattern — check for binding pattern: name @ pattern
+        if self.peek() == TokenKind::Identifier || matches!(self.peek(), TokenKind::Keyword(k) if !k.is_reserved()) {
+            let id_text = self.current().text.to_string();
+            let id = self.parse_identifier()?;
+
+            // Check for binding: name @ pattern
+            if self.peek() == TokenKind::Identifier && self.current().text == "@" {
+                self.advance(); // consume @
+                let inner = self.parse_match_pattern_primary()?;
+                return Ok(MatchPattern::Binding {
+                    name: id_text,
+                    pattern: Box::new(inner),
+                    span: Span::new(start, self.location()),
+                });
+            }
+
+            return Ok(MatchPattern::Identifier(id));
+        }
+
+        Err(self.error("Expected pattern", start))
     }
 
     fn parse_template_literal(&mut self) -> Result<Expression> {
@@ -2999,5 +3187,93 @@ mod tests {
     fn test_parse_match_with_bool_null() {
         let program = parse("match(v) { when true => 1, when false => 2, when null => 3 }").unwrap();
         assert_eq!(program.body.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_simple_pipeline() {
+        let expr = parse_expression("x |> f").unwrap();
+        match expr {
+            Expression::Pipeline { left, right } => {
+                assert!(matches!(*left, Expression::Identifier(_)));
+                assert!(matches!(*right, Expression::Identifier(_)));
+            }
+            _ => panic!("Expected pipeline expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_chained_pipeline() {
+        let expr = parse_expression("x |> f |> g").unwrap();
+        match expr {
+            Expression::Pipeline { left, right } => {
+                // Right should be g (identifier)
+                assert!(matches!(*right, Expression::Identifier(_)));
+                // Left should be another Pipeline (x |> f)
+                match *left {
+                    Expression::Pipeline { left: inner_left, right: inner_right } => {
+                        assert!(matches!(*inner_left, Expression::Identifier(_)));
+                        assert!(matches!(*inner_right, Expression::Identifier(_)));
+                    }
+                    _ => panic!("Expected nested pipeline expression"),
+                }
+            }
+            _ => panic!("Expected pipeline expression"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_simple_execution() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("let double = (x) => x * 2; 5 |> double").unwrap();
+        assert_eq!(result, crate::Value::Number(10.0));
+    }
+
+    #[test]
+    fn test_pipeline_chained_execution() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("let add1 = (x) => x + 1; let double = (x) => x * 2; 3 |> add1 |> double").unwrap();
+        assert_eq!(result, crate::Value::Number(8.0));
+    }
+
+    #[test]
+    fn test_pipeline_with_string_length() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval(r#"let len = (s) => s.length; "hello" |> len"#).unwrap();
+        assert_eq!(result, crate::Value::Number(5.0));
+    }
+
+    #[test]
+    fn test_pipeline_with_literal_function() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("10 |> ((x) => x + 5)").unwrap();
+        assert_eq!(result, crate::Value::Number(15.0));
+    }
+
+    #[test]
+    fn test_pipeline_does_not_break_bitwise_or() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("5 | 3").unwrap();
+        assert_eq!(result, crate::Value::Number(7.0));
+    }
+
+    #[test]
+    fn test_pipeline_does_not_break_logical_or() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("false || true").unwrap();
+        assert_eq!(result, crate::Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_pipeline_with_named_function() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("function square(x) { return x * x; } 4 |> square").unwrap();
+        assert_eq!(result, crate::Value::Number(16.0));
+    }
+
+    #[test]
+    fn test_pipeline_with_number_literal() {
+        let mut runtime = crate::Runtime::new();
+        let result = runtime.eval("let negate = (x) => -x; 42 |> negate").unwrap();
+        assert_eq!(result, crate::Value::Number(-42.0));
     }
 }
