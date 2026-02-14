@@ -169,6 +169,12 @@ pub enum TokenKind {
     // Arrow
     /// `=>`
     Arrow,
+    /// `->`
+    ThinArrow,
+
+    // Pipeline
+    /// `|>` pipeline operator
+    PipelineRight,
 
     // End of file
     /// End of input
@@ -375,6 +381,7 @@ impl TokenKind {
                 | TokenKind::Keyword(Keyword::Delete)
                 | TokenKind::Keyword(Keyword::Await)
                 | TokenKind::Keyword(Keyword::Yield)
+                | TokenKind::Keyword(Keyword::Match)
         )
     }
 }

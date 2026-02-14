@@ -570,6 +570,9 @@ impl<'src> Lexer<'src> {
                 } else if self.peek() == Some('=') {
                     self.advance();
                     TokenKind::MinusEquals
+                } else if self.peek() == Some('>') {
+                    self.advance();
+                    TokenKind::ThinArrow
                 } else {
                     TokenKind::Minus
                 }
@@ -692,7 +695,10 @@ impl<'src> Lexer<'src> {
                 }
             }
             '|' => {
-                if self.peek() == Some('|') {
+                if self.peek() == Some('>') {
+                    self.advance();
+                    TokenKind::PipelineRight
+                } else if self.peek() == Some('|') {
                     self.advance();
                     if self.peek() == Some('=') {
                         self.advance();
@@ -908,5 +914,21 @@ mod tests {
         assert_eq!(lexer.next_token().unwrap().text, "foo");
         assert_eq!(lexer.next_token().unwrap().text, "bar");
         assert_eq!(lexer.next_token().unwrap().text, "baz");
+    }
+
+    #[test]
+    fn test_pipeline_operator_token() {
+        let mut lexer = Lexer::new("|>");
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::PipelineRight);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Eof);
+    }
+
+    #[test]
+    fn test_pipeline_distinguished_from_pipe_and_pipepipe() {
+        let mut lexer = Lexer::new("| || |>");
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Pipe);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::PipePipe);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::PipelineRight);
+        assert_eq!(lexer.next_token().unwrap().kind, TokenKind::Eof);
     }
 }
