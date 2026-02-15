@@ -2930,6 +2930,32 @@ impl VM {
                     }
                 }
 
+                Some(Opcode::MatchPattern) => {
+                    // Test if value matches pattern (strict equality)
+                    let pattern_val = self.stack.pop().unwrap_or(Value::Undefined);
+                    let value = self.stack.pop().unwrap_or(Value::Undefined);
+                    let matches = value.strict_equals(&pattern_val);
+                    self.push(Value::Boolean(matches))?;
+                }
+
+                Some(Opcode::MatchBind) => {
+                    // Bind TOS to a local variable (dup + set local)
+                    let local_index = self.read_u8()?;
+                    let value = self.stack.last().cloned().unwrap_or(Value::Undefined);
+                    let frame = self.frames.last().unwrap();
+                    let base = frame.bp;
+                    let target = base + local_index as usize;
+                    while self.stack.len() <= target {
+                        self.stack.push(Value::Undefined);
+                    }
+                    self.stack[target] = value;
+                }
+
+                Some(Opcode::MatchEnd) => {
+                    // Clean up discriminant from stack
+                    self.stack.pop();
+                }
+
                 None => {
                     return Err(Error::InternalError(format!(
                         "Unknown opcode at position {}",
@@ -6811,6 +6837,190 @@ mod tests {
 
         let result = runtime.eval("Number.POSITIVE_INFINITY === Infinity").unwrap();
         assert_eq!(result, Value::Boolean(true));
+    }
+
+    // ========== Pattern Matching Tests ==========
+
+    #[test]
+    fn test_match_literal_number() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            let x = 2;
+            match(x) {
+                when 1 => "one",
+                when 2 => "two",
+                when 3 => "three",
+                when _ => "other"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("two".to_string()));
+    }
+
+    #[test]
+    fn test_match_literal_string() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            let color = "red";
+            match(color) {
+                when "red" => 1,
+                when "green" => 2,
+                when "blue" => 3,
+                when _ => 0
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::Number(1.0));
+    }
+
+    #[test]
+    fn test_match_literal_boolean() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(false) {
+                when true => "yes",
+                when false => "no",
+                when _ => "unknown"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("no".to_string()));
+    }
+
+    #[test]
+    fn test_match_wildcard() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(42) {
+                when 1 => "one",
+                when _ => "default"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("default".to_string()));
+    }
+
+    #[test]
+    fn test_match_variable_binding() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(99) {
+                when x => x
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::Number(99.0));
+    }
+
+    #[test]
+    fn test_match_no_match_returns_undefined() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(5) {
+                when 1 => "one",
+                when 2 => "two"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::Undefined);
+    }
+
+    #[test]
+    fn test_match_guard_clause() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            let val = 15;
+            match(val) {
+                when x if (x > 10) => "big",
+                when x => "small"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("big".to_string()));
+    }
+
+    #[test]
+    fn test_match_guard_clause_false() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            let val = 5;
+            match(val) {
+                when x if (x > 10) => "big",
+                when _ => "small"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("small".to_string()));
+    }
+
+    #[test]
+    fn test_match_or_pattern() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(2) {
+                when 1 | 2 | 3 => "low",
+                when _ => "high"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("low".to_string()));
+    }
+
+    #[test]
+    fn test_match_null_pattern() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(null) {
+                when null => "null value",
+                when _ => "other"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("null value".to_string()));
+    }
+
+    #[test]
+    fn test_match_thin_arrow_syntax() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(1) {
+                when 1 -> "one",
+                when 2 -> "two",
+                when _ -> "other"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("one".to_string()));
+    }
+
+    #[test]
+    fn test_match_parenthesized_pattern() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            match(42) {
+                when (42) -> "found",
+                when (_) -> "other"
+            }
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("found".to_string()));
+    }
+
+    #[test]
+    fn test_match_integration_with_function() {
+        let mut vm = VM::new();
+        let chunk = compile(r#"
+            function classify(n) {
+                return match(n) {
+                    when 0 => "zero",
+                    when 1 => "one",
+                    when _ => "many"
+                };
+            }
+            classify(0) + " " + classify(1) + " " + classify(5)
+        "#).unwrap();
+        let result = vm.run(&chunk).unwrap();
+        assert_eq!(result, Value::String("zero one many".to_string()));
     }
 
     #[test]
