@@ -895,3 +895,945 @@ mod tests {
         assert_eq!(restored_chunk.code.len(), chunk.code.len());
     }
 }
+
+// ============================================================================
+// Complete Value Serialization System
+// ============================================================================
+
+use std::collections::HashMap as StdHashMap;
+
+/// Extended snapshot errors
+#[derive(Debug, Clone)]
+pub enum SnapshotError {
+    /// The snapshot data has an invalid format
+    InvalidFormat(String),
+    /// Version mismatch between snapshot and runtime
+    VersionMismatch { expected: u32, found: u32 },
+    /// Checksum verification failed
+    ChecksumMismatch { expected: u32, found: u32 },
+    /// Unknown tag byte encountered during deserialization
+    UnknownTag(u8),
+    /// Attempted to read past end of buffer
+    BufferUnderflow,
+    /// Circular reference detected (used internally)
+    CircularReference,
+    /// Serialization failed with a message
+    SerializationFailed(String),
+    /// Deserialization failed with a message
+    DeserializationFailed(String),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotError::InvalidFormat(msg) => write!(f, "invalid snapshot format: {}", msg),
+            SnapshotError::VersionMismatch { expected, found } => {
+                write!(f, "version mismatch: expected {}, found {}", expected, found)
+            }
+            SnapshotError::ChecksumMismatch { expected, found } => {
+                write!(f, "checksum mismatch: expected {:#x}, found {:#x}", expected, found)
+            }
+            SnapshotError::UnknownTag(tag) => write!(f, "unknown tag: {}", tag),
+            SnapshotError::BufferUnderflow => write!(f, "buffer underflow"),
+            SnapshotError::CircularReference => write!(f, "circular reference detected"),
+            SnapshotError::SerializationFailed(msg) => {
+                write!(f, "serialization failed: {}", msg)
+            }
+            SnapshotError::DeserializationFailed(msg) => {
+                write!(f, "deserialization failed: {}", msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+/// Tag bytes for value types in the serialized format
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueTag {
+    Undefined = 0,
+    Null = 1,
+    Boolean = 2,
+    Number = 3,
+    String = 4,
+    Object = 5,
+    Array = 6,
+    Date = 7,
+    Map = 8,
+    Set = 9,
+    Error = 10,
+    Symbol = 11,
+    BigInt = 12,
+    /// Back-reference for circular objects
+    Reference = 13,
+    /// Stored as name only (re-bound on restore)
+    Function = 14,
+}
+
+/// Complete Value serializer that handles all Value variants
+pub struct ValueSerializer {
+    /// Object identity table for circular reference detection
+    object_table: StdHashMap<usize, u32>,
+    /// Next object ID
+    next_id: u32,
+    /// Serialized bytes
+    buffer: Vec<u8>,
+}
+
+impl ValueSerializer {
+    /// Create a new ValueSerializer
+    pub fn new() -> Self {
+        Self {
+            object_table: StdHashMap::new(),
+            next_id: 0,
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Write a single byte
+    pub fn write_u8(&mut self, b: u8) {
+        self.buffer.push(b);
+    }
+
+    /// Write a u32 in little-endian
+    pub fn write_u32(&mut self, n: u32) {
+        self.buffer.extend_from_slice(&n.to_le_bytes());
+    }
+
+    /// Write an f64 in little-endian
+    pub fn write_f64(&mut self, f: f64) {
+        self.buffer.extend_from_slice(&f.to_le_bytes());
+    }
+
+    /// Write a length-prefixed string
+    pub fn write_string(&mut self, s: &str) {
+        let bytes = s.as_bytes();
+        self.write_u32(bytes.len() as u32);
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Serialize any Value into the internal buffer
+    pub fn serialize_value(&mut self, value: &Value) -> Result<(), SnapshotError> {
+        match value {
+            Value::Undefined => {
+                self.write_u8(ValueTag::Undefined as u8);
+            }
+            Value::Null => {
+                self.write_u8(ValueTag::Null as u8);
+            }
+            Value::Boolean(b) => {
+                self.write_u8(ValueTag::Boolean as u8);
+                self.write_u8(*b as u8);
+            }
+            Value::Number(n) => {
+                self.write_u8(ValueTag::Number as u8);
+                self.write_f64(*n);
+            }
+            Value::String(s) => {
+                self.write_u8(ValueTag::String as u8);
+                self.write_string(s);
+            }
+            Value::Symbol(id) => {
+                self.write_u8(ValueTag::Symbol as u8);
+                self.write_u32(*id as u32);
+            }
+            Value::BigInt(n) => {
+                self.write_u8(ValueTag::BigInt as u8);
+                self.write_string(&n.to_string());
+            }
+            Value::Object(obj_rc) => {
+                // Check for circular reference using Rc pointer identity
+                let ptr = std::rc::Rc::as_ptr(obj_rc) as usize;
+                if let Some(&id) = self.object_table.get(&ptr) {
+                    self.write_u8(ValueTag::Reference as u8);
+                    self.write_u32(id);
+                    return Ok(());
+                }
+
+                // Register this object before serializing its contents
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                self.object_table.insert(ptr, obj_id);
+
+                let obj = obj_rc.borrow();
+                match &obj.kind {
+                    ObjectKind::Array(elements) => {
+                        self.write_u8(ValueTag::Array as u8);
+                        self.write_u32(elements.len() as u32);
+                        for elem in elements {
+                            self.serialize_value(elem)?;
+                        }
+                    }
+                    ObjectKind::Date(timestamp) => {
+                        self.write_u8(ValueTag::Date as u8);
+                        self.write_f64(*timestamp);
+                    }
+                    ObjectKind::Map(entries) => {
+                        self.write_u8(ValueTag::Map as u8);
+                        self.write_u32(entries.len() as u32);
+                        for (k, v) in entries {
+                            self.serialize_value(k)?;
+                            self.serialize_value(v)?;
+                        }
+                    }
+                    ObjectKind::Set(values) => {
+                        self.write_u8(ValueTag::Set as u8);
+                        self.write_u32(values.len() as u32);
+                        for v in values {
+                            self.serialize_value(v)?;
+                        }
+                    }
+                    ObjectKind::Error { name, message } => {
+                        self.write_u8(ValueTag::Error as u8);
+                        self.write_string(name);
+                        self.write_string(message);
+                    }
+                    ObjectKind::Function(func) => {
+                        self.write_u8(ValueTag::Function as u8);
+                        let name = func.name.as_deref().unwrap_or("<anonymous>");
+                        self.write_string(name);
+                    }
+                    ObjectKind::NativeFunction { name, .. } => {
+                        self.write_u8(ValueTag::Function as u8);
+                        self.write_string(name);
+                    }
+                    // Ordinary objects and any other kind: serialize properties
+                    _ => {
+                        self.write_u8(ValueTag::Object as u8);
+                        let prop_count = obj.properties.len() as u32;
+                        self.write_u32(prop_count);
+                        for (key, val) in &obj.properties {
+                            self.write_string(key);
+                            self.serialize_value(val)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the serializer and return the serialized bytes
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+}
+
+/// Deserializes Values from snapshot bytes
+pub struct ValueDeserializer {
+    buffer: Vec<u8>,
+    position: usize,
+    /// Object table for resolving back-references
+    object_table: StdHashMap<u32, Value>,
+    next_id: u32,
+}
+
+impl ValueDeserializer {
+    /// Create a new deserializer from raw bytes
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            buffer: data,
+            position: 0,
+            object_table: StdHashMap::new(),
+            next_id: 0,
+        }
+    }
+
+    /// Number of remaining bytes in the buffer
+    pub fn remaining(&self) -> usize {
+        self.buffer.len().saturating_sub(self.position)
+    }
+
+    /// Read a single byte
+    pub fn read_u8(&mut self) -> Result<u8, SnapshotError> {
+        if self.position >= self.buffer.len() {
+            return Err(SnapshotError::BufferUnderflow);
+        }
+        let b = self.buffer[self.position];
+        self.position += 1;
+        Ok(b)
+    }
+
+    /// Read a u32 in little-endian
+    pub fn read_u32(&mut self) -> Result<u32, SnapshotError> {
+        if self.position + 4 > self.buffer.len() {
+            return Err(SnapshotError::BufferUnderflow);
+        }
+        let bytes = &self.buffer[self.position..self.position + 4];
+        self.position += 4;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Read an f64 in little-endian
+    pub fn read_f64(&mut self) -> Result<f64, SnapshotError> {
+        if self.position + 8 > self.buffer.len() {
+            return Err(SnapshotError::BufferUnderflow);
+        }
+        let bytes = &self.buffer[self.position..self.position + 8];
+        self.position += 8;
+        Ok(f64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+
+    /// Read a length-prefixed string
+    pub fn read_string(&mut self) -> Result<String, SnapshotError> {
+        let len = self.read_u32()? as usize;
+        if self.position + len > self.buffer.len() {
+            return Err(SnapshotError::BufferUnderflow);
+        }
+        let bytes = &self.buffer[self.position..self.position + len];
+        self.position += len;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|e| SnapshotError::DeserializationFailed(format!("invalid UTF-8: {}", e)))
+    }
+
+    /// Deserialize a Value from the buffer
+    pub fn deserialize_value(&mut self) -> Result<Value, SnapshotError> {
+        let tag = self.read_u8()?;
+        match tag {
+            t if t == ValueTag::Undefined as u8 => Ok(Value::Undefined),
+            t if t == ValueTag::Null as u8 => Ok(Value::Null),
+            t if t == ValueTag::Boolean as u8 => {
+                let b = self.read_u8()?;
+                Ok(Value::Boolean(b != 0))
+            }
+            t if t == ValueTag::Number as u8 => {
+                let n = self.read_f64()?;
+                Ok(Value::Number(n))
+            }
+            t if t == ValueTag::String as u8 => {
+                let s = self.read_string()?;
+                Ok(Value::String(s))
+            }
+            t if t == ValueTag::Symbol as u8 => {
+                let id = self.read_u32()?;
+                Ok(Value::Symbol(id as u64))
+            }
+            t if t == ValueTag::BigInt as u8 => {
+                let s = self.read_string()?;
+                Value::new_bigint(&s).ok_or_else(|| {
+                    SnapshotError::DeserializationFailed(format!("invalid BigInt: {}", s))
+                })
+            }
+            t if t == ValueTag::Object as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let prop_count = self.read_u32()? as usize;
+                let obj = Value::new_object();
+                // Register early so nested references can find it
+                self.object_table.insert(obj_id, obj.clone());
+                for _ in 0..prop_count {
+                    let key = self.read_string()?;
+                    let val = self.deserialize_value()?;
+                    obj.set_property(&key, val);
+                }
+                Ok(obj)
+            }
+            t if t == ValueTag::Array as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let len = self.read_u32()? as usize;
+                let mut elements = Vec::with_capacity(len);
+                for _ in 0..len {
+                    elements.push(self.deserialize_value()?);
+                }
+                let arr = Value::new_array(elements);
+                self.object_table.insert(obj_id, arr.clone());
+                Ok(arr)
+            }
+            t if t == ValueTag::Date as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let ts = self.read_f64()?;
+                let val = Value::new_date(ts);
+                self.object_table.insert(obj_id, val.clone());
+                Ok(val)
+            }
+            t if t == ValueTag::Map as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let len = self.read_u32()? as usize;
+                let mut entries = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let k = self.deserialize_value()?;
+                    let v = self.deserialize_value()?;
+                    entries.push((k, v));
+                }
+                let val = Value::new_map(entries);
+                self.object_table.insert(obj_id, val.clone());
+                Ok(val)
+            }
+            t if t == ValueTag::Set as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let len = self.read_u32()? as usize;
+                let mut values = Vec::with_capacity(len);
+                for _ in 0..len {
+                    values.push(self.deserialize_value()?);
+                }
+                let val = Value::new_set(values);
+                self.object_table.insert(obj_id, val.clone());
+                Ok(val)
+            }
+            t if t == ValueTag::Error as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let name = self.read_string()?;
+                let message = self.read_string()?;
+                let val = Value::new_error(&name, &message);
+                self.object_table.insert(obj_id, val.clone());
+                Ok(val)
+            }
+            t if t == ValueTag::Reference as u8 => {
+                let id = self.read_u32()?;
+                self.object_table.get(&id).cloned().ok_or_else(|| {
+                    SnapshotError::DeserializationFailed(format!(
+                        "back-reference to unknown object id {}",
+                        id
+                    ))
+                })
+            }
+            t if t == ValueTag::Function as u8 => {
+                let obj_id = self.next_id;
+                self.next_id += 1;
+                let name = self.read_string()?;
+                // Functions are restored as named stubs; re-bind at load time
+                let val = Value::new_object();
+                val.set_property("__function_name__", Value::String(name));
+                self.object_table.insert(obj_id, val.clone());
+                Ok(val)
+            }
+            _ => Err(SnapshotError::UnknownTag(tag)),
+        }
+    }
+}
+
+/// Metadata for a V2 snapshot
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotMetadataV2 {
+    /// Snapshot format version
+    pub version: u32,
+    /// Runtime version string
+    pub runtime_version: String,
+    /// Creation timestamp (seconds since epoch)
+    pub created_at: u64,
+    /// Number of global variables stored
+    pub global_count: usize,
+    /// Number of bytecode cache entries
+    pub bytecode_entries: usize,
+    /// Total serialized size in bytes
+    pub total_size: usize,
+}
+
+/// Creates a complete runtime snapshot
+pub struct SnapshotCreator {
+    /// Serialized global variables
+    globals: Vec<(String, Vec<u8>)>,
+    /// Metadata
+    metadata: SnapshotMetadataV2,
+    /// Compiled bytecode cache
+    bytecode_cache: Vec<(String, Vec<u8>)>,
+}
+
+/// Magic bytes for the V2 snapshot format
+const SNAPSHOT_V2_MAGIC: &[u8; 4] = b"QS2\x01";
+
+impl SnapshotCreator {
+    /// Create a new SnapshotCreator
+    pub fn new() -> Self {
+        Self {
+            globals: Vec::new(),
+            metadata: SnapshotMetadataV2 {
+                version: SNAPSHOT_VERSION,
+                runtime_version: crate::VERSION.to_string(),
+                created_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                global_count: 0,
+                bytecode_entries: 0,
+                total_size: 0,
+            },
+            bytecode_cache: Vec::new(),
+        }
+    }
+
+    /// Add a global variable to the snapshot
+    pub fn add_global(&mut self, name: &str, value: &Value) -> Result<(), SnapshotError> {
+        let mut serializer = ValueSerializer::new();
+        serializer.serialize_value(value)?;
+        self.globals.push((name.to_string(), serializer.into_bytes()));
+        self.metadata.global_count = self.globals.len();
+        Ok(())
+    }
+
+    /// Add compiled bytecode to the snapshot
+    pub fn add_bytecode(&mut self, name: &str, bytecode: &[u8]) {
+        self.bytecode_cache.push((name.to_string(), bytecode.to_vec()));
+        self.metadata.bytecode_entries = self.bytecode_cache.len();
+    }
+
+    /// Get a reference to the snapshot metadata
+    pub fn metadata(&self) -> &SnapshotMetadataV2 {
+        &self.metadata
+    }
+
+    /// Create the final snapshot blob
+    pub fn create(&self) -> Result<Vec<u8>, SnapshotError> {
+        let mut buf = Vec::new();
+
+        // Header: magic + version
+        buf.extend_from_slice(SNAPSHOT_V2_MAGIC);
+        buf.extend_from_slice(&self.metadata.version.to_le_bytes());
+
+        // Metadata (JSON for forward compat)
+        let meta_json = serde_json::to_vec(&self.metadata)
+            .map_err(|e| SnapshotError::SerializationFailed(format!("metadata: {}", e)))?;
+        buf.extend_from_slice(&(meta_json.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&meta_json);
+
+        // Globals section
+        buf.extend_from_slice(&(self.globals.len() as u32).to_le_bytes());
+        for (name, data) in &self.globals {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+
+        // Bytecode section
+        buf.extend_from_slice(&(self.bytecode_cache.len() as u32).to_le_bytes());
+        for (name, data) in &self.bytecode_cache {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            buf.extend_from_slice(data);
+        }
+
+        // Checksum at end
+        let checksum = compute_checksum(&buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+
+        Ok(buf)
+    }
+}
+
+/// State restored from a snapshot
+#[derive(Debug)]
+pub struct RestoredState {
+    /// Snapshot metadata
+    pub metadata: SnapshotMetadataV2,
+    /// Restored global variables
+    pub globals: Vec<(String, Value)>,
+    /// Restored bytecode cache entries
+    pub bytecode: Vec<(String, Vec<u8>)>,
+}
+
+/// Restores runtime state from a snapshot
+pub struct SnapshotRestorer {
+    data: Vec<u8>,
+    position: usize,
+}
+
+impl SnapshotRestorer {
+    /// Create a new restorer from raw snapshot bytes
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data, position: 0 }
+    }
+
+    fn read_bytes(&mut self, n: usize) -> Result<&[u8], SnapshotError> {
+        if self.position + n > self.data.len() {
+            return Err(SnapshotError::BufferUnderflow);
+        }
+        let slice = &self.data[self.position..self.position + n];
+        self.position += n;
+        Ok(slice)
+    }
+
+    fn read_u32(&mut self) -> Result<u32, SnapshotError> {
+        let b = self.read_bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    /// Restore runtime state from the snapshot
+    pub fn restore(&mut self) -> Result<RestoredState, SnapshotError> {
+        // Verify magic
+        let magic = self.read_bytes(4)?;
+        if magic != SNAPSHOT_V2_MAGIC {
+            return Err(SnapshotError::InvalidFormat("bad magic bytes".to_string()));
+        }
+
+        // Version
+        let version = self.read_u32()?;
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::VersionMismatch {
+                expected: SNAPSHOT_VERSION,
+                found: version,
+            });
+        }
+
+        // Metadata
+        let meta_len = self.read_u32()? as usize;
+        let meta_bytes = self.read_bytes(meta_len)?;
+        let metadata: SnapshotMetadataV2 = serde_json::from_slice(meta_bytes)
+            .map_err(|e| SnapshotError::DeserializationFailed(format!("metadata: {}", e)))?;
+
+        // Globals
+        let globals_count = self.read_u32()? as usize;
+        let mut globals = Vec::with_capacity(globals_count);
+        for _ in 0..globals_count {
+            let name_len = self.read_u32()? as usize;
+            let name_bytes = self.read_bytes(name_len)?;
+            let name = String::from_utf8(name_bytes.to_vec())
+                .map_err(|e| SnapshotError::DeserializationFailed(format!("global name: {}", e)))?;
+            let data_len = self.read_u32()? as usize;
+            let data = self.read_bytes(data_len)?.to_vec();
+            let mut deser = ValueDeserializer::new(data);
+            let value = deser.deserialize_value()?;
+            globals.push((name, value));
+        }
+
+        // Bytecode
+        let bc_count = self.read_u32()? as usize;
+        let mut bytecode = Vec::with_capacity(bc_count);
+        for _ in 0..bc_count {
+            let name_len = self.read_u32()? as usize;
+            let name_bytes = self.read_bytes(name_len)?;
+            let name = String::from_utf8(name_bytes.to_vec())
+                .map_err(|e| SnapshotError::DeserializationFailed(format!("bytecode name: {}", e)))?;
+            let data_len = self.read_u32()? as usize;
+            let data = self.read_bytes(data_len)?.to_vec();
+            bytecode.push((name, data));
+        }
+
+        // Verify checksum (everything before the last 4 bytes)
+        let checksum_data = &self.data[..self.data.len() - 4];
+        let stored_checksum = {
+            let end = &self.data[self.data.len() - 4..];
+            u32::from_le_bytes([end[0], end[1], end[2], end[3]])
+        };
+        let computed = compute_checksum(checksum_data);
+        if computed != stored_checksum {
+            return Err(SnapshotError::ChecksumMismatch {
+                expected: stored_checksum,
+                found: computed,
+            });
+        }
+
+        Ok(RestoredState {
+            metadata,
+            globals,
+            bytecode,
+        })
+    }
+}
+
+// ============================================================================
+// Tests for complete Value serialization
+// ============================================================================
+
+#[cfg(test)]
+#[allow(clippy::approx_constant)]
+mod value_serializer_tests {
+    use super::*;
+
+    /// Helper: serialize then deserialize a value
+    fn roundtrip(value: &Value) -> Value {
+        let mut ser = ValueSerializer::new();
+        ser.serialize_value(value).unwrap();
+        let bytes = ser.into_bytes();
+        let mut deser = ValueDeserializer::new(bytes);
+        deser.deserialize_value().unwrap()
+    }
+
+    #[test]
+    fn test_serialize_undefined() {
+        let v = roundtrip(&Value::Undefined);
+        assert!(v.is_undefined());
+    }
+
+    #[test]
+    fn test_serialize_null() {
+        let v = roundtrip(&Value::Null);
+        assert!(v.is_null());
+    }
+
+    #[test]
+    fn test_serialize_boolean_true() {
+        let v = roundtrip(&Value::Boolean(true));
+        assert_eq!(v.to_boolean(), true);
+    }
+
+    #[test]
+    fn test_serialize_boolean_false() {
+        let v = roundtrip(&Value::Boolean(false));
+        assert_eq!(v.to_boolean(), false);
+    }
+
+    #[test]
+    fn test_serialize_number() {
+        let v = roundtrip(&Value::Number(42.5));
+        if let Value::Number(n) = v {
+            assert_eq!(n, 42.5);
+        } else {
+            panic!("expected Number");
+        }
+    }
+
+    #[test]
+    fn test_serialize_number_nan_infinity() {
+        let nan = roundtrip(&Value::Number(f64::NAN));
+        if let Value::Number(n) = nan {
+            assert!(n.is_nan());
+        } else {
+            panic!("expected Number");
+        }
+
+        let inf = roundtrip(&Value::Number(f64::INFINITY));
+        if let Value::Number(n) = inf {
+            assert!(n.is_infinite() && n > 0.0);
+        } else {
+            panic!("expected Number");
+        }
+
+        let neg_inf = roundtrip(&Value::Number(f64::NEG_INFINITY));
+        if let Value::Number(n) = neg_inf {
+            assert!(n.is_infinite() && n < 0.0);
+        } else {
+            panic!("expected Number");
+        }
+    }
+
+    #[test]
+    fn test_serialize_string_empty() {
+        let v = roundtrip(&Value::String(String::new()));
+        if let Value::String(s) = v {
+            assert_eq!(s, "");
+        } else {
+            panic!("expected String");
+        }
+    }
+
+    #[test]
+    fn test_serialize_string_nonempty() {
+        let v = roundtrip(&Value::String("hello world".to_string()));
+        if let Value::String(s) = v {
+            assert_eq!(s, "hello world");
+        } else {
+            panic!("expected String");
+        }
+    }
+
+    #[test]
+    fn test_serialize_object_with_properties() {
+        let obj = Value::new_object();
+        obj.set_property("x", Value::Number(1.0));
+        obj.set_property("y", Value::String("two".to_string()));
+        let restored = roundtrip(&obj);
+        assert_eq!(
+            restored.get_property("x").unwrap().to_js_string(),
+            "1"
+        );
+        assert_eq!(
+            restored.get_property("y").unwrap().to_js_string(),
+            "two"
+        );
+    }
+
+    #[test]
+    fn test_serialize_array() {
+        let arr = Value::new_array(vec![
+            Value::Number(1.0),
+            Value::String("two".to_string()),
+            Value::Boolean(true),
+        ]);
+        let restored = roundtrip(&arr);
+        assert_eq!(restored.to_js_string(), "1,two,true");
+    }
+
+    #[test]
+    fn test_serialize_nested_objects() {
+        let inner = Value::new_object();
+        inner.set_property("a", Value::Number(99.0));
+        let outer = Value::new_object();
+        outer.set_property("inner", inner);
+        outer.set_property("b", Value::Boolean(false));
+
+        let restored = roundtrip(&outer);
+        let inner_restored = restored.get_property("inner").unwrap();
+        assert_eq!(
+            inner_restored.get_property("a").unwrap().to_js_string(),
+            "99"
+        );
+    }
+
+    #[test]
+    fn test_circular_reference() {
+        let obj = Value::new_object();
+        obj.set_property("name", Value::String("self-ref".to_string()));
+        // Create circular reference: obj.self = obj
+        obj.set_property("self", obj.clone());
+
+        let mut ser = ValueSerializer::new();
+        ser.serialize_value(&obj).unwrap();
+        let bytes = ser.into_bytes();
+
+        // Deserialize should succeed (circular ref becomes back-ref)
+        let mut deser = ValueDeserializer::new(bytes);
+        let restored = deser.deserialize_value().unwrap();
+        assert_eq!(
+            restored.get_property("name").unwrap().to_js_string(),
+            "self-ref"
+        );
+        // The self-reference should resolve to the same object
+        assert!(restored.get_property("self").is_some());
+    }
+
+    #[test]
+    fn test_value_tag_values() {
+        assert_eq!(ValueTag::Undefined as u8, 0);
+        assert_eq!(ValueTag::Null as u8, 1);
+        assert_eq!(ValueTag::Boolean as u8, 2);
+        assert_eq!(ValueTag::Number as u8, 3);
+        assert_eq!(ValueTag::String as u8, 4);
+        assert_eq!(ValueTag::Object as u8, 5);
+        assert_eq!(ValueTag::Array as u8, 6);
+        assert_eq!(ValueTag::Date as u8, 7);
+        assert_eq!(ValueTag::Map as u8, 8);
+        assert_eq!(ValueTag::Set as u8, 9);
+        assert_eq!(ValueTag::Error as u8, 10);
+        assert_eq!(ValueTag::Symbol as u8, 11);
+        assert_eq!(ValueTag::BigInt as u8, 12);
+        assert_eq!(ValueTag::Reference as u8, 13);
+        assert_eq!(ValueTag::Function as u8, 14);
+    }
+
+    #[test]
+    fn test_snapshot_error_display() {
+        let e = SnapshotError::InvalidFormat("bad".to_string());
+        assert_eq!(format!("{}", e), "invalid snapshot format: bad");
+
+        let e = SnapshotError::VersionMismatch { expected: 2, found: 3 };
+        assert!(format!("{}", e).contains("version mismatch"));
+
+        let e = SnapshotError::ChecksumMismatch { expected: 0xAB, found: 0xCD };
+        assert!(format!("{}", e).contains("checksum mismatch"));
+
+        let e = SnapshotError::UnknownTag(255);
+        assert_eq!(format!("{}", e), "unknown tag: 255");
+
+        let e = SnapshotError::BufferUnderflow;
+        assert_eq!(format!("{}", e), "buffer underflow");
+
+        let e = SnapshotError::CircularReference;
+        assert!(format!("{}", e).contains("circular"));
+
+        let e = SnapshotError::SerializationFailed("oops".to_string());
+        assert!(format!("{}", e).contains("oops"));
+
+        let e = SnapshotError::DeserializationFailed("bad data".to_string());
+        assert!(format!("{}", e).contains("bad data"));
+    }
+
+    #[test]
+    fn test_snapshot_creator_and_create() {
+        let mut creator = SnapshotCreator::new();
+        creator.add_global("x", &Value::Number(42.0)).unwrap();
+        creator.add_global("name", &Value::String("test".to_string())).unwrap();
+        creator.add_bytecode("main", &[0x01, 0x02, 0x03]);
+
+        assert_eq!(creator.metadata().global_count, 2);
+        assert_eq!(creator.metadata().bytecode_entries, 1);
+
+        let blob = creator.create().unwrap();
+        assert!(!blob.is_empty());
+        // Verify magic bytes
+        assert_eq!(&blob[0..4], SNAPSHOT_V2_MAGIC);
+    }
+
+    #[test]
+    fn test_snapshot_metadata_v2_fields() {
+        let meta = SnapshotMetadataV2 {
+            version: 2,
+            runtime_version: "0.1.0".to_string(),
+            created_at: 1700000000,
+            global_count: 5,
+            bytecode_entries: 3,
+            total_size: 1024,
+        };
+        assert_eq!(meta.version, 2);
+        assert_eq!(meta.runtime_version, "0.1.0");
+        assert_eq!(meta.created_at, 1700000000);
+        assert_eq!(meta.global_count, 5);
+        assert_eq!(meta.bytecode_entries, 3);
+        assert_eq!(meta.total_size, 1024);
+    }
+
+    #[test]
+    fn test_buffer_underflow() {
+        // Empty buffer should fail immediately
+        let mut deser = ValueDeserializer::new(vec![]);
+        let result = deser.deserialize_value();
+        assert!(result.is_err());
+        if let Err(SnapshotError::BufferUnderflow) = result {
+            // expected
+        } else {
+            panic!("expected BufferUnderflow");
+        }
+    }
+
+    #[test]
+    fn test_unknown_tag() {
+        let mut deser = ValueDeserializer::new(vec![200]);
+        let result = deser.deserialize_value();
+        assert!(result.is_err());
+        if let Err(SnapshotError::UnknownTag(200)) = result {
+            // expected
+        } else {
+            panic!("expected UnknownTag(200)");
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_preserves_values() {
+        let values = vec![
+            Value::Undefined,
+            Value::Null,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Number(0.0),
+            Value::Number(-3.14),
+            Value::String("quicksilver".to_string()),
+        ];
+
+        for original in &values {
+            let restored = roundtrip(original);
+            assert_eq!(original.to_js_string(), restored.to_js_string());
+        }
+    }
+
+    #[test]
+    fn test_snapshot_creator_restorer_roundtrip() {
+        let mut creator = SnapshotCreator::new();
+        creator.add_global("count", &Value::Number(7.0)).unwrap();
+        creator.add_global("msg", &Value::String("hello".to_string())).unwrap();
+        creator.add_bytecode("main", &[0xDE, 0xAD]);
+
+        let blob = creator.create().unwrap();
+
+        let mut restorer = SnapshotRestorer::new(blob);
+        let state = restorer.restore().unwrap();
+
+        assert_eq!(state.globals.len(), 2);
+        assert_eq!(state.globals[0].0, "count");
+        assert_eq!(state.globals[1].0, "msg");
+        assert_eq!(state.bytecode.len(), 1);
+        assert_eq!(state.bytecode[0].0, "main");
+        assert_eq!(state.bytecode[0].1, vec![0xDE, 0xAD]);
+    }
+}
