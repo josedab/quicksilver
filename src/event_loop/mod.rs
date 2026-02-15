@@ -7,9 +7,11 @@
 //! **Status:** ⚠️ Partial — Promise/A+ microtask queue, basic timers
 
 use crate::Value;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::time::Instant;
 
 /// A microtask to be executed (Promise reactions, queueMicrotask, etc.)
 #[derive(Clone)]
@@ -44,7 +46,7 @@ pub struct Macrotask {
 }
 
 /// Internal Promise state for proper Promise/A+ compliance
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PromiseInternal {
     /// Current state of the promise
     pub state: PromiseInternalState,
@@ -68,7 +70,7 @@ pub enum PromiseInternalState {
 }
 
 /// A Promise reaction (then/catch/finally callback)
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PromiseReaction {
     /// The callback to execute (onFulfilled or onRejected)
     pub handler: Option<Value>,
@@ -98,6 +100,25 @@ pub struct RunResult {
     pub final_time: u64,
 }
 
+/// Runtime statistics for the event loop
+#[derive(Clone, Debug, Default)]
+pub struct EventLoopStats {
+    /// Total microtasks processed across all ticks
+    pub total_microtasks: u64,
+    /// Total macrotasks processed across all ticks
+    pub total_macrotasks: u64,
+    /// Total number of event loop ticks
+    pub total_ticks: u64,
+    /// Maximum microtasks drained in a single tick
+    pub max_microtasks_per_tick: u64,
+    /// Longest tick duration in milliseconds (wall-clock)
+    pub longest_tick_ms: u64,
+    /// Total promises created
+    pub total_promises_created: u64,
+    /// Total promises settled (fulfilled or rejected)
+    pub total_promises_settled: u64,
+}
+
 /// The event loop manages task queues and execution order
 pub struct EventLoop {
     /// Microtask queue (high priority - runs between macrotasks)
@@ -118,6 +139,12 @@ pub struct EventLoop {
     pending_async_tasks: Vec<AsyncTask>,
     /// Next async task ID (reserved for future use)
     _next_async_task_id: u64,
+    /// Maximum microtasks to drain per tick (starvation protection)
+    max_microtasks_per_tick: usize,
+    /// Runtime statistics
+    stats: EventLoopStats,
+    /// Pending async generator tasks
+    pending_async_generator_tasks: Vec<AsyncGeneratorTask>,
 }
 
 impl Default for EventLoop {
@@ -139,6 +166,9 @@ impl EventLoop {
             pending_promises: Vec::new(),
             pending_async_tasks: Vec::new(),
             _next_async_task_id: 1,
+            max_microtasks_per_tick: 10_000,
+            stats: EventLoopStats::default(),
+            pending_async_generator_tasks: Vec::new(),
         }
     }
 
@@ -290,6 +320,7 @@ impl EventLoop {
         self.macrotask_queue.clear();
         self.unhandled_rejections.clear();
         self.pending_promises.clear();
+        self.pending_async_generator_tasks.clear();
     }
 
     /// Create a new pending promise
@@ -301,6 +332,7 @@ impl EventLoop {
             handled: false,
         }));
         self.pending_promises.push(promise.clone());
+        self.stats.total_promises_created += 1;
         promise
     }
 
@@ -313,6 +345,7 @@ impl EventLoop {
 
         p.state = PromiseInternalState::Fulfilled;
         p.result = Some(value.clone());
+        self.stats.total_promises_settled += 1;
 
         // Trigger fulfill reactions
         let reactions = std::mem::take(&mut p.reactions);
@@ -334,6 +367,7 @@ impl EventLoop {
 
         p.state = PromiseInternalState::Rejected;
         p.result = Some(reason.clone());
+        self.stats.total_promises_settled += 1;
 
         // Trigger reject reactions
         let reactions = std::mem::take(&mut p.reactions);
@@ -631,21 +665,29 @@ impl EventLoop {
         });
     }
 
-    /// Drain all microtasks from the queue, including any that are enqueued during
-    /// processing (as required by the HTML spec). Returns the (callback, args) pairs
-    /// that were dequeued, in order of execution.
-    pub fn drain_microtasks(&mut self) -> Vec<(Value, Vec<Value>)> {
+    /// Drain microtasks from the queue up to the budget limit.
+    /// Returns the (callback, args) pairs that were dequeued and the count
+    /// of microtasks remaining in the queue (due to budget enforcement).
+    pub fn drain_microtasks(&mut self) -> (Vec<(Value, Vec<Value>)>, usize) {
         self._draining_microtasks = true;
         let mut drained = Vec::new();
+        let mut count: usize = 0;
 
-        // Keep draining until empty — new microtasks added during processing
-        // are picked up in subsequent iterations of this loop.
         while let Some(task) = self.microtask_queue.pop_front() {
             drained.push((task.callback, task.args));
+            count += 1;
+            if count >= self.max_microtasks_per_tick {
+                break;
+            }
         }
 
         self._draining_microtasks = false;
-        drained
+        self.stats.total_microtasks += count as u64;
+        if (count as u64) > self.stats.max_microtasks_per_tick {
+            self.stats.max_microtasks_per_tick = count as u64;
+        }
+        let remaining = self.microtask_queue.len();
+        (drained, remaining)
     }
 
     /// Schedule a macrotask with 0ms delay (equivalent to `setImmediate`).
@@ -665,8 +707,10 @@ impl EventLoop {
         let mut result = RunResult::default();
 
         loop {
-            // Step 1: drain all microtasks
-            let drained = self.drain_microtasks();
+            let tick_start = Instant::now();
+
+            // Step 1: drain all microtasks (budget-limited)
+            let (drained, _remaining) = self.drain_microtasks();
             result.microtasks_processed += drained.len();
 
             // Step 2: try to process one macrotask
@@ -681,9 +725,16 @@ impl EventLoop {
                 None
             };
 
+            let tick_elapsed = tick_start.elapsed().as_millis() as u64;
+            if tick_elapsed > self.stats.longest_tick_ms {
+                self.stats.longest_tick_ms = tick_elapsed;
+            }
+            self.stats.total_ticks += 1;
+
             if let Some(_task) = macrotask {
                 result.macrotasks_processed += 1;
                 result.iterations += 1;
+                self.stats.total_macrotasks += 1;
                 // After processing a macrotask, loop back to drain microtasks again
                 continue;
             }
@@ -747,6 +798,54 @@ impl EventLoop {
         self.microtask_queue.clear();
         count
     }
+
+    /// Set the maximum number of microtasks to drain per tick (starvation protection).
+    pub fn set_microtask_budget(&mut self, limit: usize) {
+        self.max_microtasks_per_tick = limit;
+    }
+
+    /// Get the current microtask budget limit.
+    pub fn microtask_budget(&self) -> usize {
+        self.max_microtasks_per_tick
+    }
+
+    /// Get a snapshot of the current event loop statistics.
+    pub fn stats(&self) -> EventLoopStats {
+        self.stats.clone()
+    }
+
+    /// Reset all event loop statistics to zero.
+    pub fn reset_stats(&mut self) {
+        self.stats = EventLoopStats::default();
+    }
+
+    /// Submit an async generator task that is waiting for a promise to settle.
+    pub fn submit_async_generator_task(&mut self, task: AsyncGeneratorTask) {
+        self.pending_async_generator_tasks.push(task);
+    }
+
+    /// Return all async generator tasks whose awaited promise has settled,
+    /// removing them from the pending list.
+    pub fn get_ready_async_generator_tasks(&mut self) -> Vec<AsyncGeneratorTask> {
+        let mut ready = Vec::new();
+        let mut still_pending = Vec::new();
+
+        for task in self.pending_async_generator_tasks.drain(..) {
+            if task.awaiting.borrow().state != PromiseInternalState::Pending {
+                ready.push(task);
+            } else {
+                still_pending.push(task);
+            }
+        }
+
+        self.pending_async_generator_tasks = still_pending;
+        ready
+    }
+
+    /// Return the number of pending async generator tasks.
+    pub fn pending_async_generator_count(&self) -> usize {
+        self.pending_async_generator_tasks.len()
+    }
 }
 
 /// Result of Promise.withResolvers() — ES2024
@@ -801,6 +900,147 @@ pub fn create_aggregate_error(errors: Vec<Value>, message: &str) -> Value {
     Value::new_object_with_properties(props)
 }
 
+/// AbortSignal for cancellation support (Web API compatible).
+///
+/// Represents a signal object that can communicate whether an operation
+/// has been aborted, and allows registering abort event listeners.
+#[derive(Clone)]
+pub struct AbortSignal {
+    /// Whether the signal has been aborted
+    pub aborted: bool,
+    /// The abort reason (if aborted)
+    pub reason: Option<Value>,
+    /// Registered on_abort callbacks
+    on_abort_callbacks: Vec<Value>,
+    /// Optional timeout in milliseconds for auto-abort
+    timeout_ms: Option<u64>,
+}
+
+impl Default for AbortSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AbortSignal {
+    /// Create a new AbortSignal in the non-aborted state.
+    pub fn new() -> Self {
+        Self {
+            aborted: false,
+            reason: None,
+            on_abort_callbacks: Vec::new(),
+            timeout_ms: None,
+        }
+    }
+
+    /// Create an AbortSignal that will auto-abort after `ms` milliseconds.
+    /// Call `check_timeout` with elapsed time to trigger the abort.
+    pub fn timeout(ms: u64) -> Self {
+        Self {
+            aborted: false,
+            reason: None,
+            on_abort_callbacks: Vec::new(),
+            timeout_ms: Some(ms),
+        }
+    }
+
+    /// Create a composite AbortSignal that is aborted if any of the given signals is aborted.
+    pub fn any(signals: &[&AbortSignal]) -> Self {
+        let mut signal = Self::new();
+        for s in signals {
+            if s.aborted {
+                signal.aborted = true;
+                signal.reason = s.reason.clone();
+                break;
+            }
+        }
+        signal
+    }
+
+    /// Register a callback to be invoked when the signal is aborted.
+    pub fn add_on_abort(&mut self, callback: Value) {
+        if self.aborted {
+            // Signal already aborted — callback is recorded but caller
+            // should check `aborted` to fire it synchronously.
+            self.on_abort_callbacks.push(callback);
+        } else {
+            self.on_abort_callbacks.push(callback);
+        }
+    }
+
+    /// Get the list of registered on_abort callbacks.
+    pub fn on_abort_callbacks(&self) -> &[Value] {
+        &self.on_abort_callbacks
+    }
+
+    /// Get the configured timeout in milliseconds (if any).
+    pub fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+
+    /// Abort the signal with a reason, invoking all registered callbacks.
+    /// Returns the list of callbacks that should be invoked by the caller.
+    pub fn abort(&mut self, reason: Value) -> Vec<Value> {
+        if self.aborted {
+            return Vec::new();
+        }
+        self.aborted = true;
+        self.reason = Some(reason);
+        std::mem::take(&mut self.on_abort_callbacks)
+    }
+
+    /// Check if the signal should auto-abort based on elapsed virtual time.
+    /// Returns `true` if the signal was aborted by this check.
+    pub fn check_timeout(&mut self, elapsed_ms: u64) -> bool {
+        if let Some(timeout) = self.timeout_ms {
+            if elapsed_ms >= timeout && !self.aborted {
+                self.abort(Value::String("TimeoutError".to_string()));
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// AbortController for cancellation support (Web API compatible).
+///
+/// Provides an `AbortSignal` and the ability to abort it.
+pub struct AbortController {
+    /// The associated abort signal
+    pub signal: AbortSignal,
+}
+
+impl Default for AbortController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AbortController {
+    /// Create a new AbortController with a fresh signal.
+    pub fn new() -> Self {
+        Self {
+            signal: AbortSignal::new(),
+        }
+    }
+
+    /// Get a reference to the associated signal.
+    pub fn signal(&self) -> &AbortSignal {
+        &self.signal
+    }
+
+    /// Get a mutable reference to the associated signal.
+    pub fn signal_mut(&mut self) -> &mut AbortSignal {
+        &mut self.signal
+    }
+
+    /// Abort the associated signal with a reason.
+    /// Returns the list of on_abort callbacks that should be invoked.
+    pub fn abort(&mut self, reason: Value) -> Vec<Value> {
+        self.signal.abort(reason)
+    }
+}
+
 /// Async function state for suspension/resumption
 #[derive(Clone)]
 pub struct AsyncFunctionState {
@@ -849,6 +1089,347 @@ pub struct AsyncTask {
     pub result_promise: Rc<RefCell<PromiseInternal>>,
     /// Base pointer for frame restoration
     pub saved_bp: usize,
+}
+
+/// An async generator task represents a suspended async generator that
+/// yields values asynchronously and can be resumed when its awaited
+/// promise settles.
+#[derive(Clone)]
+pub struct AsyncGeneratorTask {
+    /// Unique task ID
+    pub id: u64,
+    /// The generator function bytecode
+    pub function: Value,
+    /// Saved instruction pointer (suspension point)
+    pub saved_ip: usize,
+    /// Saved local variables
+    pub saved_locals: Vec<Value>,
+    /// Saved stack snapshot
+    pub saved_stack: Vec<Value>,
+    /// The promise this generator is currently awaiting
+    pub awaiting: Rc<RefCell<PromiseInternal>>,
+    /// Queue of yielded values
+    pub result_queue: Vec<Value>,
+    /// Whether the generator has completed
+    pub done: bool,
+}
+
+// ─── Suspension Point ──────────────────────────────────────────────────────
+
+/// Complete capture of VM state at an `await` suspension point.
+/// This allows the VM to be suspended and later resumed with the resolved value.
+#[derive(Debug, Clone)]
+pub struct SuspensionPoint {
+    /// Unique suspension ID
+    pub id: u64,
+    /// The function being executed
+    pub function_name: String,
+    /// Instruction pointer at the point of suspension
+    pub ip: usize,
+    /// Base pointer for the current frame
+    pub bp: usize,
+    /// All local variables at suspension
+    pub locals: Vec<Value>,
+    /// Operand stack at suspension (values below the current frame)
+    pub stack: Vec<Value>,
+    /// The promise being awaited
+    pub awaiting_promise: Rc<RefCell<PromiseInternal>>,
+    /// The result promise for this async function
+    pub result_promise: Rc<RefCell<PromiseInternal>>,
+    /// Exception handler stack at suspension
+    pub exception_handlers: Vec<ExceptionHandlerState>,
+    /// Scope depth at suspension
+    pub scope_depth: u32,
+    /// Timestamp of suspension
+    pub suspended_at: u64,
+}
+
+/// Saved exception handler state
+#[derive(Debug, Clone)]
+pub struct ExceptionHandlerState {
+    pub catch_ip: usize,
+    pub finally_ip: Option<usize>,
+    pub stack_depth: usize,
+}
+
+/// Manager for async function suspensions and resumptions
+pub struct SuspensionManager {
+    /// Currently suspended points
+    suspensions: HashMap<u64, SuspensionPoint>,
+    /// Next suspension ID
+    next_id: u64,
+    /// Total suspensions created
+    total_suspensions: u64,
+    /// Total resumptions completed
+    total_resumptions: u64,
+    /// Maximum concurrent suspensions observed
+    max_concurrent: usize,
+}
+
+impl SuspensionManager {
+    /// Create a new suspension manager
+    pub fn new() -> Self {
+        Self {
+            suspensions: HashMap::new(),
+            next_id: 1,
+            total_suspensions: 0,
+            total_resumptions: 0,
+            max_concurrent: 0,
+        }
+    }
+
+    /// Store a suspension point, return its ID
+    pub fn suspend(&mut self, mut point: SuspensionPoint) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        point.id = id;
+        self.suspensions.insert(id, point);
+        self.total_suspensions += 1;
+        if self.suspensions.len() > self.max_concurrent {
+            self.max_concurrent = self.suspensions.len();
+        }
+        id
+    }
+
+    /// Remove and return a suspension by ID for resumption
+    pub fn resume(&mut self, id: u64) -> Option<SuspensionPoint> {
+        let point = self.suspensions.remove(&id);
+        if point.is_some() {
+            self.total_resumptions += 1;
+        }
+        point
+    }
+
+    /// Get a reference to a suspension without removing it
+    pub fn get(&self, id: u64) -> Option<&SuspensionPoint> {
+        self.suspensions.get(&id)
+    }
+
+    /// Check if a suspension exists
+    pub fn is_suspended(&self, id: u64) -> bool {
+        self.suspensions.contains_key(&id)
+    }
+
+    /// Number of currently pending suspensions
+    pub fn pending_count(&self) -> usize {
+        self.suspensions.len()
+    }
+
+    /// Cancel a suspension (reject its result promise)
+    pub fn cancel(&mut self, id: u64) -> bool {
+        if let Some(point) = self.suspensions.remove(&id) {
+            let mut promise = point.result_promise.borrow_mut();
+            if promise.state == PromiseInternalState::Pending {
+                promise.state = PromiseInternalState::Rejected;
+                promise.result = Some(Value::String("Cancelled".to_string()));
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Cancel all suspensions, return count cancelled
+    pub fn cancel_all(&mut self) -> usize {
+        let count = self.suspensions.len();
+        let ids: Vec<u64> = self.suspensions.keys().copied().collect();
+        for id in ids {
+            self.cancel(id);
+        }
+        count
+    }
+
+    /// Get statistics about suspension activity
+    pub fn stats(&self) -> SuspensionStats {
+        SuspensionStats {
+            total_suspensions: self.total_suspensions,
+            total_resumptions: self.total_resumptions,
+            currently_suspended: self.suspensions.len(),
+            max_concurrent_suspensions: self.max_concurrent,
+        }
+    }
+}
+
+impl Default for SuspensionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SuspensionStats {
+    pub total_suspensions: u64,
+    pub total_resumptions: u64,
+    pub currently_suspended: usize,
+    pub max_concurrent_suspensions: usize,
+}
+
+// ─── Async Generator Protocol ──────────────────────────────────────────────
+
+/// State of an async generator function
+#[derive(Debug, Clone)]
+pub struct AsyncGeneratorState {
+    /// Generator state
+    pub state: AsyncGenState,
+    /// Queue of pending requests (next/return/throw)
+    pub queue: VecDeque<AsyncGenRequest>,
+    /// The generator's saved execution context
+    pub suspension: Option<SuspensionPoint>,
+    /// Accumulated yielded values
+    pub yielded_values: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGenState {
+    /// Created but not started
+    SuspendedStart,
+    /// Suspended at a yield point
+    SuspendedYield,
+    /// Currently executing
+    Executing,
+    /// Awaiting a promise
+    AwaitingReturn,
+    /// Completed
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncGenRequest {
+    pub kind: AsyncGenRequestKind,
+    pub value: Value,
+    pub promise: Rc<RefCell<PromiseInternal>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncGenRequestKind {
+    Next,
+    Return,
+    Throw,
+}
+
+impl AsyncGeneratorState {
+    /// Create a new async generator state
+    pub fn new() -> Self {
+        Self {
+            state: AsyncGenState::SuspendedStart,
+            queue: VecDeque::new(),
+            suspension: None,
+            yielded_values: Vec::new(),
+        }
+    }
+
+    /// Enqueue a request (next/return/throw)
+    pub fn enqueue(&mut self, request: AsyncGenRequest) {
+        self.queue.push_back(request);
+    }
+
+    /// Dequeue the next pending request
+    pub fn dequeue(&mut self) -> Option<AsyncGenRequest> {
+        self.queue.pop_front()
+    }
+
+    /// Check if the generator has completed
+    pub fn is_completed(&self) -> bool {
+        self.state == AsyncGenState::Completed
+    }
+
+    /// Mark the generator as completed
+    pub fn complete(&mut self) {
+        self.state = AsyncGenState::Completed;
+    }
+}
+
+impl Default for AsyncGeneratorState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Promise Executor Integration ──────────────────────────────────────────
+
+/// Integrates promise execution with the VM event loop.
+/// This handles the "last mile" of connecting Promise.then() callbacks
+/// back to VM execution.
+pub struct PromiseExecutor {
+    /// Queue of callbacks to execute through the VM
+    pending_callbacks: VecDeque<PendingCallback>,
+    /// Completed callback results
+    completed_results: Vec<CallbackResult>,
+    /// Next callback ID
+    next_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingCallback {
+    pub id: u64,
+    pub callback: Value,
+    pub args: Vec<Value>,
+    pub resolve_promise: Option<Rc<RefCell<PromiseInternal>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallbackResult {
+    pub id: u64,
+    pub value: Value,
+    pub is_error: bool,
+}
+
+impl PromiseExecutor {
+    /// Create a new promise executor
+    pub fn new() -> Self {
+        Self {
+            pending_callbacks: VecDeque::new(),
+            completed_results: Vec::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Enqueue a callback for execution
+    pub fn enqueue(&mut self, mut callback: PendingCallback) {
+        callback.id = self.next_id;
+        self.next_id += 1;
+        self.pending_callbacks.push_back(callback);
+    }
+
+    /// Dequeue the next pending callback
+    pub fn dequeue(&mut self) -> Option<PendingCallback> {
+        self.pending_callbacks.pop_front()
+    }
+
+    /// Record a completed callback result
+    pub fn complete(&mut self, result: CallbackResult) {
+        self.completed_results.push(result);
+    }
+
+    /// Number of pending callbacks
+    pub fn pending_count(&self) -> usize {
+        self.pending_callbacks.len()
+    }
+
+    /// Drain all completed results
+    pub fn drain_completed(&mut self) -> Vec<CallbackResult> {
+        std::mem::take(&mut self.completed_results)
+    }
+}
+
+impl Default for PromiseExecutor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Enhanced Event Loop Integration ───────────────────────────────────────
+
+/// Statistics for async/await operations
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AsyncStats {
+    pub total_awaits: u64,
+    pub total_resumes: u64,
+    pub total_async_functions: u64,
+    pub total_async_generators: u64,
+    pub current_suspended: usize,
+    pub max_suspension_depth: usize,
+    pub avg_suspension_time_us: u64,
 }
 
 #[cfg(test)]
@@ -1111,8 +1692,9 @@ mod tests {
     #[test]
     fn test_drain_microtasks_empty() {
         let mut el = EventLoop::new();
-        let drained = el.drain_microtasks();
+        let (drained, remaining) = el.drain_microtasks();
         assert!(drained.is_empty());
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -1122,8 +1704,9 @@ mod tests {
         el.queue_microtask(Value::Number(2.0), vec![]);
         el.queue_microtask(Value::Number(3.0), vec![Value::Boolean(true)]);
 
-        let drained = el.drain_microtasks();
+        let (drained, remaining) = el.drain_microtasks();
         assert_eq!(drained.len(), 3);
+        assert_eq!(remaining, 0);
         assert!(matches!(drained[0].0, Value::Number(n) if n == 1.0));
         assert_eq!(drained[0].1.len(), 1);
         assert!(matches!(drained[1].0, Value::Number(n) if n == 2.0));
@@ -1138,13 +1721,15 @@ mod tests {
         el.queue_microtask_fn(Value::Undefined);
         el.queue_microtask_fn(Value::Undefined);
 
-        let drained = el.drain_microtasks();
+        let (drained, remaining) = el.drain_microtasks();
         assert_eq!(drained.len(), 2);
+        assert_eq!(remaining, 0);
         assert!(!el.has_pending_microtasks());
 
         // Draining again should return empty
-        let drained2 = el.drain_microtasks();
+        let (drained2, remaining2) = el.drain_microtasks();
         assert!(drained2.is_empty());
+        assert_eq!(remaining2, 0);
     }
 
     // ── run_to_completion tests ───────────────────────────────────────
@@ -1401,5 +1986,839 @@ mod tests {
         let ready = el.get_ready_async_tasks();
         assert_eq!(ready.len(), 1);
         assert_eq!(el.pending_async_task_count(), 2);
+    }
+
+    // ── AbortController/AbortSignal tests ─────────────────────────────
+
+    #[test]
+    fn test_abort_signal_new() {
+        let signal = AbortSignal::new();
+        assert!(!signal.aborted);
+        assert!(signal.reason.is_none());
+        assert!(signal.on_abort_callbacks().is_empty());
+    }
+
+    #[test]
+    fn test_abort_signal_abort() {
+        let mut signal = AbortSignal::new();
+        let callbacks = signal.abort(Value::String("cancelled".to_string()));
+        assert!(signal.aborted);
+        assert!(matches!(signal.reason, Some(Value::String(ref s)) if s == "cancelled"));
+        assert!(callbacks.is_empty());
+    }
+
+    #[test]
+    fn test_abort_signal_abort_with_callbacks() {
+        let mut signal = AbortSignal::new();
+        signal.add_on_abort(Value::String("cb1".to_string()));
+        signal.add_on_abort(Value::String("cb2".to_string()));
+
+        let callbacks = signal.abort(Value::String("reason".to_string()));
+        assert!(signal.aborted);
+        assert_eq!(callbacks.len(), 2);
+        assert!(matches!(&callbacks[0], Value::String(s) if s == "cb1"));
+        assert!(matches!(&callbacks[1], Value::String(s) if s == "cb2"));
+    }
+
+    #[test]
+    fn test_abort_signal_abort_idempotent() {
+        let mut signal = AbortSignal::new();
+        signal.add_on_abort(Value::String("cb".to_string()));
+
+        let first = signal.abort(Value::String("first".to_string()));
+        assert_eq!(first.len(), 1);
+
+        // Second abort should be a no-op
+        let second = signal.abort(Value::String("second".to_string()));
+        assert!(second.is_empty());
+        assert!(matches!(signal.reason, Some(Value::String(ref s)) if s == "first"));
+    }
+
+    #[test]
+    fn test_abort_signal_timeout() {
+        let signal = AbortSignal::timeout(5000);
+        assert!(!signal.aborted);
+        assert_eq!(signal.timeout_ms(), Some(5000));
+    }
+
+    #[test]
+    fn test_abort_signal_check_timeout_not_elapsed() {
+        let mut signal = AbortSignal::timeout(5000);
+        assert!(!signal.check_timeout(3000));
+        assert!(!signal.aborted);
+    }
+
+    #[test]
+    fn test_abort_signal_check_timeout_elapsed() {
+        let mut signal = AbortSignal::timeout(5000);
+        assert!(signal.check_timeout(5000));
+        assert!(signal.aborted);
+        assert!(matches!(signal.reason, Some(Value::String(ref s)) if s == "TimeoutError"));
+    }
+
+    #[test]
+    fn test_abort_signal_check_timeout_already_aborted() {
+        let mut signal = AbortSignal::timeout(5000);
+        signal.abort(Value::String("manual".to_string()));
+        // Should not re-abort
+        assert!(!signal.check_timeout(6000));
+        assert!(matches!(signal.reason, Some(Value::String(ref s)) if s == "manual"));
+    }
+
+    #[test]
+    fn test_abort_signal_any_none_aborted() {
+        let s1 = AbortSignal::new();
+        let s2 = AbortSignal::new();
+        let combined = AbortSignal::any(&[&s1, &s2]);
+        assert!(!combined.aborted);
+        assert!(combined.reason.is_none());
+    }
+
+    #[test]
+    fn test_abort_signal_any_one_aborted() {
+        let s1 = AbortSignal::new();
+        let mut s2 = AbortSignal::new();
+        s2.abort(Value::String("aborted".to_string()));
+
+        let combined = AbortSignal::any(&[&s1, &s2]);
+        assert!(combined.aborted);
+        assert!(matches!(combined.reason, Some(Value::String(ref s)) if s == "aborted"));
+    }
+
+    #[test]
+    fn test_abort_signal_any_first_aborted_wins() {
+        let mut s1 = AbortSignal::new();
+        s1.abort(Value::String("first".to_string()));
+        let mut s2 = AbortSignal::new();
+        s2.abort(Value::String("second".to_string()));
+
+        let combined = AbortSignal::any(&[&s1, &s2]);
+        assert!(combined.aborted);
+        assert!(matches!(combined.reason, Some(Value::String(ref s)) if s == "first"));
+    }
+
+    #[test]
+    fn test_abort_signal_any_empty() {
+        let combined = AbortSignal::any(&[]);
+        assert!(!combined.aborted);
+    }
+
+    #[test]
+    fn test_abort_controller_new() {
+        let controller = AbortController::new();
+        assert!(!controller.signal().aborted);
+    }
+
+    #[test]
+    fn test_abort_controller_abort() {
+        let mut controller = AbortController::new();
+        let callbacks = controller.abort(Value::String("cancelled".to_string()));
+        assert!(callbacks.is_empty());
+        assert!(controller.signal().aborted);
+        assert!(matches!(controller.signal().reason, Some(Value::String(ref s)) if s == "cancelled"));
+    }
+
+    #[test]
+    fn test_abort_controller_abort_fires_callbacks() {
+        let mut controller = AbortController::new();
+        controller.signal_mut().add_on_abort(Value::Number(1.0));
+        controller.signal_mut().add_on_abort(Value::Number(2.0));
+
+        let callbacks = controller.abort(Value::String("abort".to_string()));
+        assert_eq!(callbacks.len(), 2);
+        assert!(controller.signal().aborted);
+    }
+
+    #[test]
+    fn test_abort_controller_default() {
+        let controller = AbortController::default();
+        assert!(!controller.signal().aborted);
+    }
+
+    // ── Microtask budget tests ────────────────────────────────────────
+
+    #[test]
+    fn test_default_microtask_budget() {
+        let el = EventLoop::new();
+        assert_eq!(el.microtask_budget(), 10_000);
+    }
+
+    #[test]
+    fn test_set_microtask_budget() {
+        let mut el = EventLoop::new();
+        el.set_microtask_budget(100);
+        assert_eq!(el.microtask_budget(), 100);
+    }
+
+    #[test]
+    fn test_drain_microtasks_respects_budget() {
+        let mut el = EventLoop::new();
+        el.set_microtask_budget(3);
+
+        for i in 0..10 {
+            el.queue_microtask_fn(Value::Number(i as f64));
+        }
+
+        let (drained, remaining) = el.drain_microtasks();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(remaining, 7);
+        assert!(el.has_pending_microtasks());
+
+        // Drain again — should get next 3
+        let (drained2, remaining2) = el.drain_microtasks();
+        assert_eq!(drained2.len(), 3);
+        assert_eq!(remaining2, 4);
+
+        // Drain remaining
+        let (drained3, remaining3) = el.drain_microtasks();
+        assert_eq!(drained3.len(), 3);
+        assert_eq!(remaining3, 1);
+
+        let (drained4, remaining4) = el.drain_microtasks();
+        assert_eq!(drained4.len(), 1);
+        assert_eq!(remaining4, 0);
+        assert!(!el.has_pending_microtasks());
+    }
+
+    #[test]
+    fn test_drain_microtasks_budget_larger_than_queue() {
+        let mut el = EventLoop::new();
+        el.set_microtask_budget(100);
+        el.queue_microtask_fn(Value::Number(1.0));
+        el.queue_microtask_fn(Value::Number(2.0));
+
+        let (drained, remaining) = el.drain_microtasks();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(remaining, 0);
+    }
+
+    // ── Event loop stats tests ────────────────────────────────────────
+
+    #[test]
+    fn test_stats_initial() {
+        let el = EventLoop::new();
+        let stats = el.stats();
+        assert_eq!(stats.total_microtasks, 0);
+        assert_eq!(stats.total_macrotasks, 0);
+        assert_eq!(stats.total_ticks, 0);
+        assert_eq!(stats.max_microtasks_per_tick, 0);
+        assert_eq!(stats.longest_tick_ms, 0);
+        assert_eq!(stats.total_promises_created, 0);
+        assert_eq!(stats.total_promises_settled, 0);
+    }
+
+    #[test]
+    fn test_stats_promise_tracking() {
+        let mut el = EventLoop::new();
+        let p1 = el.create_promise();
+        let _p2 = el.create_promise();
+        assert_eq!(el.stats().total_promises_created, 2);
+        assert_eq!(el.stats().total_promises_settled, 0);
+
+        el.fulfill_promise(&p1, Value::Number(1.0));
+        assert_eq!(el.stats().total_promises_settled, 1);
+    }
+
+    #[test]
+    fn test_stats_promise_reject_tracking() {
+        let mut el = EventLoop::new();
+        let p = el.create_promise();
+        el.reject_promise(&p, Value::String("err".to_string()));
+        assert_eq!(el.stats().total_promises_created, 1);
+        assert_eq!(el.stats().total_promises_settled, 1);
+    }
+
+    #[test]
+    fn test_stats_double_settle_not_counted() {
+        let mut el = EventLoop::new();
+        let p = el.create_promise();
+        el.fulfill_promise(&p, Value::Number(1.0));
+        el.fulfill_promise(&p, Value::Number(2.0)); // no-op
+        assert_eq!(el.stats().total_promises_settled, 1);
+    }
+
+    #[test]
+    fn test_stats_microtask_tracking() {
+        let mut el = EventLoop::new();
+        el.queue_microtask_fn(Value::Undefined);
+        el.queue_microtask_fn(Value::Undefined);
+        el.queue_microtask_fn(Value::Undefined);
+
+        let (drained, _) = el.drain_microtasks();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(el.stats().total_microtasks, 3);
+        assert_eq!(el.stats().max_microtasks_per_tick, 3);
+    }
+
+    #[test]
+    fn test_stats_max_microtasks_per_tick() {
+        let mut el = EventLoop::new();
+
+        // First tick: 2 microtasks
+        el.queue_microtask_fn(Value::Undefined);
+        el.queue_microtask_fn(Value::Undefined);
+        el.drain_microtasks();
+        assert_eq!(el.stats().max_microtasks_per_tick, 2);
+
+        // Second tick: 5 microtasks
+        for _ in 0..5 {
+            el.queue_microtask_fn(Value::Undefined);
+        }
+        el.drain_microtasks();
+        assert_eq!(el.stats().max_microtasks_per_tick, 5);
+
+        // Third tick: 1 microtask — max should remain 5
+        el.queue_microtask_fn(Value::Undefined);
+        el.drain_microtasks();
+        assert_eq!(el.stats().max_microtasks_per_tick, 5);
+        assert_eq!(el.stats().total_microtasks, 8);
+    }
+
+    #[test]
+    fn test_stats_run_to_completion() {
+        let mut el = EventLoop::new();
+        el.queue_microtask_fn(Value::Undefined);
+        el.schedule_timer(Value::Undefined, 100, vec![], false);
+        el.schedule_timer(Value::Undefined, 200, vec![], false);
+
+        el.run_to_completion();
+
+        let stats = el.stats();
+        assert_eq!(stats.total_microtasks, 1);
+        assert_eq!(stats.total_macrotasks, 2);
+        assert!(stats.total_ticks >= 1);
+    }
+
+    #[test]
+    fn test_reset_stats() {
+        let mut el = EventLoop::new();
+        el.create_promise();
+        el.queue_microtask_fn(Value::Undefined);
+        el.drain_microtasks();
+
+        assert!(el.stats().total_microtasks > 0);
+        assert!(el.stats().total_promises_created > 0);
+
+        el.reset_stats();
+        let stats = el.stats();
+        assert_eq!(stats.total_microtasks, 0);
+        assert_eq!(stats.total_macrotasks, 0);
+        assert_eq!(stats.total_ticks, 0);
+        assert_eq!(stats.total_promises_created, 0);
+        assert_eq!(stats.total_promises_settled, 0);
+    }
+
+    // ── Async generator task tests ────────────────────────────────────
+
+    #[test]
+    fn test_async_generator_task_submission() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting,
+            result_queue: vec![],
+            done: false,
+        };
+
+        el.submit_async_generator_task(task);
+        assert_eq!(el.pending_async_generator_count(), 1);
+    }
+
+    #[test]
+    fn test_async_generator_task_not_ready_when_pending() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting,
+            result_queue: vec![],
+            done: false,
+        };
+
+        el.submit_async_generator_task(task);
+        let ready = el.get_ready_async_generator_tasks();
+        assert_eq!(ready.len(), 0);
+        assert_eq!(el.pending_async_generator_count(), 1);
+    }
+
+    #[test]
+    fn test_async_generator_task_ready_when_fulfilled() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 42,
+            saved_locals: vec![Value::Number(10.0)],
+            saved_stack: vec![],
+            awaiting: awaiting.clone(),
+            result_queue: vec![Value::Number(1.0), Value::Number(2.0)],
+            done: false,
+        };
+
+        el.submit_async_generator_task(task);
+        el.fulfill_promise(&awaiting, Value::Number(99.0));
+
+        let ready = el.get_ready_async_generator_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(ready[0].saved_ip, 42);
+        assert_eq!(ready[0].result_queue.len(), 2);
+        assert!(!ready[0].done);
+        assert_eq!(el.pending_async_generator_count(), 0);
+    }
+
+    #[test]
+    fn test_async_generator_task_ready_when_rejected() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 5,
+            saved_locals: vec![],
+            saved_stack: vec![Value::Boolean(true)],
+            awaiting: awaiting.clone(),
+            result_queue: vec![],
+            done: false,
+        };
+
+        el.submit_async_generator_task(task);
+        el.reject_promise(&awaiting, Value::String("error".to_string()));
+
+        let ready = el.get_ready_async_generator_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(el.pending_async_generator_count(), 0);
+    }
+
+    #[test]
+    fn test_async_generator_task_done_flag() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting: awaiting.clone(),
+            result_queue: vec![Value::String("final".to_string())],
+            done: true,
+        };
+
+        el.submit_async_generator_task(task);
+        el.fulfill_promise(&awaiting, Value::Undefined);
+
+        let ready = el.get_ready_async_generator_tasks();
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].done);
+    }
+
+    #[test]
+    fn test_async_generator_task_multiple() {
+        let mut el = EventLoop::new();
+
+        for i in 0..3 {
+            let awaiting = el.create_promise();
+            let task = AsyncGeneratorTask {
+                id: i,
+                function: Value::Undefined,
+                saved_ip: i as usize,
+                saved_locals: vec![],
+                saved_stack: vec![],
+                awaiting,
+                result_queue: vec![],
+                done: false,
+            };
+            el.submit_async_generator_task(task);
+        }
+
+        assert_eq!(el.pending_async_generator_count(), 3);
+
+        // Fulfill only the second task's awaited promise
+        let second_awaiting = el.pending_async_generator_tasks[1].awaiting.clone();
+        el.fulfill_promise(&second_awaiting, Value::Undefined);
+
+        let ready = el.get_ready_async_generator_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, 1);
+        assert_eq!(el.pending_async_generator_count(), 2);
+    }
+
+    #[test]
+    fn test_async_generator_task_clear() {
+        let mut el = EventLoop::new();
+        let awaiting = el.create_promise();
+
+        let task = AsyncGeneratorTask {
+            id: 1,
+            function: Value::Undefined,
+            saved_ip: 0,
+            saved_locals: vec![],
+            saved_stack: vec![],
+            awaiting,
+            result_queue: vec![],
+            done: false,
+        };
+
+        el.submit_async_generator_task(task);
+        assert_eq!(el.pending_async_generator_count(), 1);
+
+        el.clear();
+        assert_eq!(el.pending_async_generator_count(), 0);
+    }
+
+    // ── SuspensionPoint & SuspensionManager tests ─────────────────────
+
+    fn make_test_suspension(el: &mut EventLoop, name: &str) -> SuspensionPoint {
+        SuspensionPoint {
+            id: 0,
+            function_name: name.to_string(),
+            ip: 42,
+            bp: 10,
+            locals: vec![Value::Number(1.0), Value::String("x".to_string())],
+            stack: vec![Value::Boolean(true)],
+            awaiting_promise: el.create_promise(),
+            result_promise: el.create_promise(),
+            exception_handlers: vec![],
+            scope_depth: 2,
+            suspended_at: 1000,
+        }
+    }
+
+    #[test]
+    fn test_suspension_point_creation() {
+        let mut el = EventLoop::new();
+        let sp = make_test_suspension(&mut el, "myFunc");
+        assert_eq!(sp.function_name, "myFunc");
+        assert_eq!(sp.ip, 42);
+        assert_eq!(sp.bp, 10);
+        assert_eq!(sp.locals.len(), 2);
+        assert_eq!(sp.scope_depth, 2);
+        assert_eq!(sp.suspended_at, 1000);
+    }
+
+    #[test]
+    fn test_suspension_manager_suspend_and_resume() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+        let sp = make_test_suspension(&mut el, "asyncFn");
+        let id = mgr.suspend(sp);
+        assert!(id > 0);
+        assert_eq!(mgr.pending_count(), 1);
+
+        let resumed = mgr.resume(id);
+        assert!(resumed.is_some());
+        let resumed = resumed.unwrap();
+        assert_eq!(resumed.function_name, "asyncFn");
+        assert_eq!(resumed.ip, 42);
+        assert_eq!(mgr.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_suspension_manager_cancel() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+        let sp = make_test_suspension(&mut el, "cancelMe");
+        let result_promise = sp.result_promise.clone();
+        let id = mgr.suspend(sp);
+
+        assert!(mgr.cancel(id));
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(result_promise.borrow().state, PromiseInternalState::Rejected);
+        // Cancelling again returns false
+        assert!(!mgr.cancel(id));
+    }
+
+    #[test]
+    fn test_suspension_manager_cancel_all() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+        let sp1 = make_test_suspension(&mut el, "f1");
+        let sp2 = make_test_suspension(&mut el, "f2");
+        // Use the promises from the actual suspensions
+        let sp1_rp = sp1.result_promise.clone();
+        let sp2_rp = sp2.result_promise.clone();
+        mgr.suspend(sp1);
+        mgr.suspend(sp2);
+
+        let count = mgr.cancel_all();
+        assert_eq!(count, 2);
+        assert_eq!(mgr.pending_count(), 0);
+        assert_eq!(sp1_rp.borrow().state, PromiseInternalState::Rejected);
+        assert_eq!(sp2_rp.borrow().state, PromiseInternalState::Rejected);
+    }
+
+    #[test]
+    fn test_suspension_manager_stats() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+        let sp1 = make_test_suspension(&mut el, "a");
+        let sp2 = make_test_suspension(&mut el, "b");
+        let id1 = mgr.suspend(sp1);
+        let _id2 = mgr.suspend(sp2);
+
+        let stats = mgr.stats();
+        assert_eq!(stats.total_suspensions, 2);
+        assert_eq!(stats.currently_suspended, 2);
+        assert_eq!(stats.max_concurrent_suspensions, 2);
+        assert_eq!(stats.total_resumptions, 0);
+
+        mgr.resume(id1);
+        let stats = mgr.stats();
+        assert_eq!(stats.total_resumptions, 1);
+        assert_eq!(stats.currently_suspended, 1);
+        assert_eq!(stats.max_concurrent_suspensions, 2);
+    }
+
+    #[test]
+    fn test_suspension_manager_pending_count() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+        assert_eq!(mgr.pending_count(), 0);
+
+        let sp = make_test_suspension(&mut el, "fn1");
+        mgr.suspend(sp);
+        assert_eq!(mgr.pending_count(), 1);
+
+        let sp = make_test_suspension(&mut el, "fn2");
+        mgr.suspend(sp);
+        assert_eq!(mgr.pending_count(), 2);
+    }
+
+    #[test]
+    fn test_exception_handler_state_creation() {
+        let handler = ExceptionHandlerState {
+            catch_ip: 100,
+            finally_ip: Some(200),
+            stack_depth: 5,
+        };
+        assert_eq!(handler.catch_ip, 100);
+        assert_eq!(handler.finally_ip, Some(200));
+        assert_eq!(handler.stack_depth, 5);
+
+        let handler_no_finally = ExceptionHandlerState {
+            catch_ip: 50,
+            finally_ip: None,
+            stack_depth: 3,
+        };
+        assert!(handler_no_finally.finally_ip.is_none());
+    }
+
+    #[test]
+    fn test_async_generator_state_creation() {
+        let gen = AsyncGeneratorState::new();
+        assert_eq!(gen.state, AsyncGenState::SuspendedStart);
+        assert!(gen.queue.is_empty());
+        assert!(gen.suspension.is_none());
+        assert!(gen.yielded_values.is_empty());
+        assert!(!gen.is_completed());
+    }
+
+    #[test]
+    fn test_async_generator_state_enqueue_dequeue() {
+        let mut el = EventLoop::new();
+        let mut gen = AsyncGeneratorState::new();
+        let promise = el.create_promise();
+
+        gen.enqueue(AsyncGenRequest {
+            kind: AsyncGenRequestKind::Next,
+            value: Value::Number(1.0),
+            promise: promise.clone(),
+        });
+        gen.enqueue(AsyncGenRequest {
+            kind: AsyncGenRequestKind::Return,
+            value: Value::Number(2.0),
+            promise: el.create_promise(),
+        });
+
+        assert_eq!(gen.queue.len(), 2);
+
+        let req = gen.dequeue().unwrap();
+        assert_eq!(req.kind, AsyncGenRequestKind::Next);
+        assert!(matches!(req.value, Value::Number(n) if n == 1.0));
+
+        let req = gen.dequeue().unwrap();
+        assert_eq!(req.kind, AsyncGenRequestKind::Return);
+
+        assert!(gen.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_async_generator_state_transitions() {
+        let mut gen = AsyncGeneratorState::new();
+        assert_eq!(gen.state, AsyncGenState::SuspendedStart);
+        assert!(!gen.is_completed());
+
+        gen.state = AsyncGenState::Executing;
+        assert_eq!(gen.state, AsyncGenState::Executing);
+        assert!(!gen.is_completed());
+
+        gen.state = AsyncGenState::SuspendedYield;
+        assert_eq!(gen.state, AsyncGenState::SuspendedYield);
+
+        gen.state = AsyncGenState::AwaitingReturn;
+        assert_eq!(gen.state, AsyncGenState::AwaitingReturn);
+
+        gen.complete();
+        assert!(gen.is_completed());
+        assert_eq!(gen.state, AsyncGenState::Completed);
+    }
+
+    #[test]
+    fn test_async_gen_request_kinds() {
+        assert_ne!(AsyncGenRequestKind::Next, AsyncGenRequestKind::Return);
+        assert_ne!(AsyncGenRequestKind::Return, AsyncGenRequestKind::Throw);
+        assert_ne!(AsyncGenRequestKind::Next, AsyncGenRequestKind::Throw);
+        assert_eq!(AsyncGenRequestKind::Next, AsyncGenRequestKind::Next);
+    }
+
+    #[test]
+    fn test_promise_executor_enqueue_dequeue() {
+        let mut executor = PromiseExecutor::new();
+        assert_eq!(executor.pending_count(), 0);
+
+        executor.enqueue(PendingCallback {
+            id: 0,
+            callback: Value::Number(1.0),
+            args: vec![Value::Boolean(true)],
+            resolve_promise: None,
+        });
+        executor.enqueue(PendingCallback {
+            id: 0,
+            callback: Value::Number(2.0),
+            args: vec![],
+            resolve_promise: None,
+        });
+
+        assert_eq!(executor.pending_count(), 2);
+
+        let cb = executor.dequeue().unwrap();
+        assert!(matches!(cb.callback, Value::Number(n) if n == 1.0));
+        assert_eq!(cb.args.len(), 1);
+        assert_eq!(executor.pending_count(), 1);
+
+        let cb = executor.dequeue().unwrap();
+        assert!(matches!(cb.callback, Value::Number(n) if n == 2.0));
+        assert_eq!(executor.pending_count(), 0);
+
+        assert!(executor.dequeue().is_none());
+    }
+
+    #[test]
+    fn test_promise_executor_complete_and_drain() {
+        let mut executor = PromiseExecutor::new();
+
+        executor.complete(CallbackResult {
+            id: 1,
+            value: Value::Number(42.0),
+            is_error: false,
+        });
+        executor.complete(CallbackResult {
+            id: 2,
+            value: Value::String("err".to_string()),
+            is_error: true,
+        });
+
+        let results = executor.drain_completed();
+        assert_eq!(results.len(), 2);
+        assert!(!results[0].is_error);
+        assert_eq!(results[0].id, 1);
+        assert!(results[1].is_error);
+
+        // Drain again should be empty
+        let results = executor.drain_completed();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_async_stats_defaults() {
+        let stats = AsyncStats::default();
+        assert_eq!(stats.total_awaits, 0);
+        assert_eq!(stats.total_resumes, 0);
+        assert_eq!(stats.total_async_functions, 0);
+        assert_eq!(stats.total_async_generators, 0);
+        assert_eq!(stats.current_suspended, 0);
+        assert_eq!(stats.max_suspension_depth, 0);
+        assert_eq!(stats.avg_suspension_time_us, 0);
+    }
+
+    #[test]
+    fn test_multiple_suspensions_concurrently() {
+        let mut el = EventLoop::new();
+        let mut mgr = SuspensionManager::new();
+
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let mut sp = make_test_suspension(&mut el, &format!("fn{}", i));
+            sp.ip = i * 10;
+            ids.push(mgr.suspend(sp));
+        }
+
+        assert_eq!(mgr.pending_count(), 5);
+        assert_eq!(mgr.stats().max_concurrent_suspensions, 5);
+
+        // Resume middle one
+        let point = mgr.resume(ids[2]).unwrap();
+        assert_eq!(point.ip, 20);
+        assert_eq!(mgr.pending_count(), 4);
+
+        // Others still accessible
+        assert!(mgr.is_suspended(ids[0]));
+        assert!(mgr.is_suspended(ids[1]));
+        assert!(!mgr.is_suspended(ids[2]));
+        assert!(mgr.is_suspended(ids[3]));
+        assert!(mgr.is_suspended(ids[4]));
+    }
+
+    #[test]
+    fn test_resume_nonexistent_suspension() {
+        let mut mgr = SuspensionManager::new();
+        assert!(mgr.resume(999).is_none());
+        assert!(mgr.get(999).is_none());
+        assert!(!mgr.is_suspended(999));
+    }
+
+    #[test]
+    fn test_suspension_with_exception_handlers() {
+        let mut el = EventLoop::new();
+        let mut sp = make_test_suspension(&mut el, "tryCatchAsync");
+        sp.exception_handlers = vec![
+            ExceptionHandlerState {
+                catch_ip: 50,
+                finally_ip: Some(80),
+                stack_depth: 3,
+            },
+            ExceptionHandlerState {
+                catch_ip: 120,
+                finally_ip: None,
+                stack_depth: 5,
+            },
+        ];
+
+        let mut mgr = SuspensionManager::new();
+        let id = mgr.suspend(sp);
+
+        let resumed = mgr.resume(id).unwrap();
+        assert_eq!(resumed.exception_handlers.len(), 2);
+        assert_eq!(resumed.exception_handlers[0].catch_ip, 50);
+        assert_eq!(resumed.exception_handlers[0].finally_ip, Some(80));
+        assert_eq!(resumed.exception_handlers[1].catch_ip, 120);
+        assert!(resumed.exception_handlers[1].finally_ip.is_none());
     }
 }
