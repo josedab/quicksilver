@@ -52,7 +52,10 @@ pub use ui::{DebuggerUI, CallStack, CallFrame, VariableDiff, ChangeType, Timelin
 use crate::bytecode::Opcode;
 use crate::Value;
 use rustc_hash::FxHashMap as HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
@@ -101,6 +104,90 @@ pub struct Breakpoint {
     pub hit_count: u64,
 }
 
+/// Enhanced breakpoint with conditions and logging
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalBreakpoint {
+    pub line: usize,
+    pub condition: Option<String>,
+    pub hit_condition: Option<HitCondition>,
+    pub log_message: Option<String>,
+    pub enabled: bool,
+    pub hit_count: u64,
+}
+
+/// Hit condition for conditional breakpoints
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HitCondition {
+    /// Break when hit count equals N
+    Equal(u64),
+    /// Break when hit count is multiple of N
+    Multiple(u64),
+    /// Break when hit count >= N
+    GreaterEqual(u64),
+}
+
+/// Watch expression that tracks a variable or expression over time
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchExpression {
+    pub id: usize,
+    pub expression: String,
+    pub current_value: Option<String>,
+    pub history: Vec<WatchHistoryEntry>,
+}
+
+/// A single entry in a watch expression's history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchHistoryEntry {
+    pub step: usize,
+    pub value: String,
+    pub changed: bool,
+}
+
+/// Recording metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordingMetadata {
+    pub format_version: u32,
+    pub source_file: Option<String>,
+    pub total_steps: usize,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub breakpoint_count: usize,
+    pub watch_count: usize,
+    pub checksum: u64,
+}
+
+/// Delta-based execution record (stores only changes from previous step)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaRecord {
+    pub step: usize,
+    pub opcode: String,
+    pub ip: usize,
+    pub line: Option<usize>,
+    /// Only variables that changed from previous step
+    pub changed_locals: Vec<(String, String)>,
+    pub changed_globals: Vec<(String, String)>,
+    /// Stack changes (push/pop operations)
+    pub stack_delta: StackDelta,
+}
+
+/// Represents changes to the stack between steps
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StackDelta {
+    Push(Vec<String>),
+    Pop(usize),
+    Replace(Vec<String>),
+    NoChange,
+}
+
+/// Full state reconstructed from delta records
+#[derive(Debug, Clone)]
+pub struct ReconstructedState {
+    pub step: usize,
+    pub locals: std::collections::HashMap<String, String>,
+    pub globals: std::collections::HashMap<String, String>,
+    pub stack: Vec<String>,
+}
+
 /// The Time-Travel Debugger
 #[derive(Clone)]
 pub struct TimeTravelDebugger {
@@ -124,6 +211,16 @@ pub struct TimeTravelDebugger {
     source_lines: Vec<String>,
     /// Current file being debugged
     current_file: String,
+    /// Conditional breakpoints (by id)
+    conditional_breakpoints: Vec<ConditionalBreakpoint>,
+    /// Next conditional breakpoint ID
+    next_cond_bp_id: usize,
+    /// Structured watch expressions
+    watch_expressions: Vec<WatchExpression>,
+    /// Next watch expression ID
+    next_watch_id: usize,
+    /// Delta-based execution records
+    delta_history: Vec<DeltaRecord>,
 }
 
 impl TimeTravelDebugger {
@@ -140,6 +237,11 @@ impl TimeTravelDebugger {
             paused: false,
             source_lines: Vec::new(),
             current_file: String::new(),
+            conditional_breakpoints: Vec::new(),
+            next_cond_bp_id: 1,
+            watch_expressions: Vec::new(),
+            next_watch_id: 1,
+            delta_history: Vec::new(),
         }
     }
 
@@ -681,6 +783,11 @@ impl TimeTravelDebugger {
             paused: true,
             source_lines,
             current_file,
+            conditional_breakpoints: Vec::new(),
+            next_cond_bp_id: 1,
+            watch_expressions: Vec::new(),
+            next_watch_id: 1,
+            delta_history: Vec::new(),
         })
     }
 
@@ -727,9 +834,305 @@ impl TimeTravelDebugger {
             current_position: self.current_position,
         }
     }
-}
 
-/// Recording error types
+    // ============================================================
+    // Conditional Breakpoints
+    // ============================================================
+
+    /// Add a conditional breakpoint, returns its id
+    pub fn add_conditional_breakpoint(&mut self, bp: ConditionalBreakpoint) -> usize {
+        let id = self.next_cond_bp_id;
+        self.next_cond_bp_id += 1;
+        self.conditional_breakpoints.push(bp);
+        id
+    }
+
+    /// Check if execution should break at the given line
+    pub fn should_break_at_line(&self, line: usize, variables: &std::collections::HashMap<String, String>) -> bool {
+        for bp in &self.conditional_breakpoints {
+            if bp.line != line || !bp.enabled {
+                continue;
+            }
+
+            // Evaluate condition if present
+            if let Some(ref cond) = bp.condition {
+                if !evaluate_simple_condition(cond, variables) {
+                    continue;
+                }
+            }
+
+            // Evaluate hit condition if present
+            if let Some(ref hc) = bp.hit_condition {
+                let count = bp.hit_count;
+                match hc {
+                    HitCondition::Equal(n) => {
+                        if count != *n {
+                            continue;
+                        }
+                    }
+                    HitCondition::Multiple(n) => {
+                        if *n == 0 || count % *n != 0 {
+                            continue;
+                        }
+                    }
+                    HitCondition::GreaterEqual(n) => {
+                        if count < *n {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+        false
+    }
+
+    /// Update a conditional breakpoint by id (1-based)
+    pub fn update_breakpoint(&mut self, id: usize, bp: ConditionalBreakpoint) {
+        // IDs are 1-based, issued sequentially
+        if let Some(existing) = self.conditional_breakpoints.iter_mut().find(|_| {
+            false // placeholder
+        }) {
+            let _ = existing;
+        }
+        // Find by position: id maps to index (id - 1) if within range, else search
+        for (i, existing) in self.conditional_breakpoints.iter_mut().enumerate() {
+            if i + 1 == id {
+                *existing = bp;
+                return;
+            }
+        }
+    }
+
+    // ============================================================
+    // Watch Expressions
+    // ============================================================
+
+    /// Add a watch expression, returns its id
+    pub fn add_watch_expression(&mut self, expr: &str) -> usize {
+        let id = self.next_watch_id;
+        self.next_watch_id += 1;
+        self.watch_expressions.push(WatchExpression {
+            id,
+            expression: expr.to_string(),
+            current_value: None,
+            history: Vec::new(),
+        });
+        id
+    }
+
+    /// Remove a watch expression by id
+    pub fn remove_watch_expression(&mut self, id: usize) -> bool {
+        let len_before = self.watch_expressions.len();
+        self.watch_expressions.retain(|w| w.id != id);
+        self.watch_expressions.len() < len_before
+    }
+
+    /// Update all watches with current variable state
+    pub fn update_watches(&mut self, step: usize, variables: &std::collections::HashMap<String, String>) {
+        for watch in &mut self.watch_expressions {
+            let new_value = variables.get(&watch.expression).cloned();
+            let value_str = new_value.clone().unwrap_or_else(|| "undefined".to_string());
+
+            let changed = watch.current_value.as_ref() != Some(&value_str);
+            watch.history.push(WatchHistoryEntry {
+                step,
+                value: value_str.clone(),
+                changed,
+            });
+            watch.current_value = Some(value_str);
+        }
+    }
+
+    /// Get the history for a specific watch expression
+    pub fn get_watch_history(&self, id: usize) -> Option<&[WatchHistoryEntry]> {
+        self.watch_expressions
+            .iter()
+            .find(|w| w.id == id)
+            .map(|w| w.history.as_slice())
+    }
+
+    /// Get all watch expressions
+    pub fn watches(&self) -> &[WatchExpression] {
+        &self.watch_expressions
+    }
+
+    // ============================================================
+    // Recording Metadata & Export
+    // ============================================================
+
+    /// Generate recording metadata
+    pub fn recording_metadata(&self) -> RecordingMetadata {
+        let start_time = self.history.first().map(|r| r.step).unwrap_or(0);
+        let end_time = self.history.last().map(|r| r.step).unwrap_or(0);
+
+        // Compute a simple checksum over step numbers
+        let mut hasher = DefaultHasher::new();
+        for record in &self.history {
+            record.step.hash(&mut hasher);
+            record.line.hash(&mut hasher);
+        }
+        let checksum = hasher.finish();
+
+        RecordingMetadata {
+            format_version: RECORDING_VERSION,
+            source_file: if self.current_file.is_empty() {
+                None
+            } else {
+                Some(self.current_file.clone())
+            },
+            total_steps: self.history.len(),
+            start_time,
+            end_time,
+            breakpoint_count: self.breakpoints.len() + self.conditional_breakpoints.len(),
+            watch_count: self.watch_expressions.len(),
+            checksum,
+        }
+    }
+
+    /// Export recording as JSON for web viewers
+    pub fn export_recording_json(&self) -> String {
+        let metadata = self.recording_metadata();
+        let mut steps = Vec::new();
+        for record in &self.history {
+            let locals: serde_json::Map<String, serde_json::Value> = record
+                .locals
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.to_js_string())))
+                .collect();
+            steps.push(serde_json::json!({
+                "step": record.step,
+                "ip": record.ip,
+                "line": record.line,
+                "stack_size": record.stack_size,
+                "description": record.description,
+                "locals": locals,
+            }));
+        }
+
+        let json = serde_json::json!({
+            "format_version": metadata.format_version,
+            "source_file": metadata.source_file,
+            "total_steps": metadata.total_steps,
+            "checksum": metadata.checksum,
+            "steps": steps,
+        });
+
+        serde_json::to_string_pretty(&json).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Search history for steps where query matches variable names or values
+    pub fn search_history(&self, query: &str) -> Vec<usize> {
+        let mut results = Vec::new();
+        let query_lower = query.to_lowercase();
+        for (i, record) in self.history.iter().enumerate() {
+            for (name, value) in &record.locals {
+                if name.to_lowercase().contains(&query_lower)
+                    || value.to_js_string().to_lowercase().contains(&query_lower)
+                {
+                    results.push(i);
+                    break;
+                }
+            }
+        }
+        results
+    }
+
+    // ============================================================
+    // Delta Recording
+    // ============================================================
+
+    /// Record a delta-based execution step
+    pub fn record_delta(&mut self, record: DeltaRecord) {
+        self.delta_history.push(record);
+    }
+
+    /// Get the delta history
+    pub fn delta_history(&self) -> &[DeltaRecord] {
+        &self.delta_history
+    }
+
+    /// Reconstruct full state at a given step by replaying deltas from the start
+    pub fn reconstruct_state_at(&self, step: usize) -> Option<ReconstructedState> {
+        if self.delta_history.is_empty() {
+            return None;
+        }
+
+        let mut locals = std::collections::HashMap::new();
+        let mut globals = std::collections::HashMap::new();
+        let mut stack: Vec<String> = Vec::new();
+
+        for delta in &self.delta_history {
+            if delta.step > step {
+                break;
+            }
+
+            for (k, v) in &delta.changed_locals {
+                locals.insert(k.clone(), v.clone());
+            }
+            for (k, v) in &delta.changed_globals {
+                globals.insert(k.clone(), v.clone());
+            }
+
+            match &delta.stack_delta {
+                StackDelta::Push(values) => {
+                    stack.extend(values.iter().cloned());
+                }
+                StackDelta::Pop(n) => {
+                    let new_len = stack.len().saturating_sub(*n);
+                    stack.truncate(new_len);
+                }
+                StackDelta::Replace(values) => {
+                    stack = values.clone();
+                }
+                StackDelta::NoChange => {}
+            }
+        }
+
+        // Check that we actually had data for the requested step
+        let found = self.delta_history.iter().any(|d| d.step == step);
+        if !found && step > 0 {
+            // Return state up to the closest step <= requested step
+            if let Some(last) = self.delta_history.last() {
+                if step > last.step {
+                    return None;
+                }
+            }
+        }
+
+        Some(ReconstructedState {
+            step,
+            locals,
+            globals,
+            stack,
+        })
+    }
+
+    /// Calculate approximate memory usage of delta history in bytes
+    pub fn delta_memory_usage(&self) -> usize {
+        let mut total = std::mem::size_of::<Vec<DeltaRecord>>(); // Vec overhead
+        for delta in &self.delta_history {
+            total += std::mem::size_of::<DeltaRecord>();
+            total += delta.opcode.len();
+            for (k, v) in &delta.changed_locals {
+                total += k.len() + v.len();
+            }
+            for (k, v) in &delta.changed_globals {
+                total += k.len() + v.len();
+            }
+            match &delta.stack_delta {
+                StackDelta::Push(values) | StackDelta::Replace(values) => {
+                    for v in values {
+                        total += v.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+        total
+    }
+}
 #[derive(Debug, Clone)]
 pub enum RecordingError {
     IoError(String),
@@ -873,6 +1276,55 @@ fn read_record<R: Read>(reader: &mut R) -> Result<ExecutionRecord, RecordingErro
         globals_changed: Vec::new(),
         description,
     })
+}
+
+/// Evaluate a simple condition string against variables.
+/// Supports basic comparisons like "x == 5", "name == hello", "x > 3", "x < 10", "x != 0".
+fn evaluate_simple_condition(condition: &str, variables: &std::collections::HashMap<String, String>) -> bool {
+    let condition = condition.trim();
+
+    // Try operators: ==, !=, >=, <=, >, <
+    let ops: &[(&str, fn(&str, &str) -> bool)] = &[
+        ("==", |a, b| a == b),
+        ("!=", |a, b| a != b),
+        (">=", |a, b| {
+            a.parse::<f64>()
+                .and_then(|av| b.parse::<f64>().map(|bv| av >= bv))
+                .unwrap_or(false)
+        }),
+        ("<=", |a, b| {
+            a.parse::<f64>()
+                .and_then(|av| b.parse::<f64>().map(|bv| av <= bv))
+                .unwrap_or(false)
+        }),
+        (">", |a, b| {
+            a.parse::<f64>()
+                .and_then(|av| b.parse::<f64>().map(|bv| av > bv))
+                .unwrap_or(false)
+        }),
+        ("<", |a, b| {
+            a.parse::<f64>()
+                .and_then(|av| b.parse::<f64>().map(|bv| av < bv))
+                .unwrap_or(false)
+        }),
+    ];
+
+    for (op, cmp) in ops {
+        if let Some(idx) = condition.find(op) {
+            let var_name = condition[..idx].trim();
+            let expected = condition[idx + op.len()..].trim();
+            if let Some(actual) = variables.get(var_name) {
+                return cmp(actual, expected);
+            }
+            return false;
+        }
+    }
+
+    // If no operator, check if the variable is truthy (exists and non-empty/non-zero)
+    if let Some(val) = variables.get(condition) {
+        return !val.is_empty() && val != "0" && val != "false" && val != "undefined" && val != "null";
+    }
+    false
 }
 
 impl Default for TimeTravelDebugger {
@@ -1181,5 +1633,444 @@ mod tests {
         let debugger = TimeTravelDebugger::new();
         let dashboard = debugger.render_dashboard();
         assert!(dashboard.contains("not started"));
+    }
+
+    // ============================================================
+    // Conditional Breakpoint Tests
+    // ============================================================
+
+    #[test]
+    fn test_conditional_breakpoint_creation() {
+        let mut debugger = TimeTravelDebugger::new();
+        let bp = ConditionalBreakpoint {
+            line: 10,
+            condition: Some("x == 5".to_string()),
+            hit_condition: None,
+            log_message: Some("Hit line 10".to_string()),
+            enabled: true,
+            hit_count: 0,
+        };
+        let id = debugger.add_conditional_breakpoint(bp);
+        assert_eq!(id, 1);
+        let id2 = debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 20,
+            condition: None,
+            hit_condition: None,
+            log_message: None,
+            enabled: true,
+            hit_count: 0,
+        });
+        assert_eq!(id2, 2);
+    }
+
+    #[test]
+    fn test_conditional_breakpoint_condition_eval() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 10,
+            condition: Some("x == 5".to_string()),
+            hit_condition: None,
+            log_message: None,
+            enabled: true,
+            hit_count: 0,
+        });
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("x".to_string(), "5".to_string());
+        assert!(debugger.should_break_at_line(10, &vars));
+
+        vars.insert("x".to_string(), "3".to_string());
+        assert!(!debugger.should_break_at_line(10, &vars));
+    }
+
+    #[test]
+    fn test_conditional_breakpoint_disabled() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 10,
+            condition: None,
+            hit_condition: None,
+            log_message: None,
+            enabled: false,
+            hit_count: 0,
+        });
+        let vars = std::collections::HashMap::new();
+        assert!(!debugger.should_break_at_line(10, &vars));
+    }
+
+    #[test]
+    fn test_hit_condition_equal() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 5,
+            condition: None,
+            hit_condition: Some(HitCondition::Equal(3)),
+            log_message: None,
+            enabled: true,
+            hit_count: 3,
+        });
+        let vars = std::collections::HashMap::new();
+        assert!(debugger.should_break_at_line(5, &vars));
+
+        // Change hit count so it no longer matches
+        debugger.conditional_breakpoints[0].hit_count = 2;
+        assert!(!debugger.should_break_at_line(5, &vars));
+    }
+
+    #[test]
+    fn test_hit_condition_multiple() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 5,
+            condition: None,
+            hit_condition: Some(HitCondition::Multiple(4)),
+            log_message: None,
+            enabled: true,
+            hit_count: 8,
+        });
+        let vars = std::collections::HashMap::new();
+        assert!(debugger.should_break_at_line(5, &vars));
+
+        debugger.conditional_breakpoints[0].hit_count = 7;
+        assert!(!debugger.should_break_at_line(5, &vars));
+    }
+
+    #[test]
+    fn test_hit_condition_greater_equal() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 5,
+            condition: None,
+            hit_condition: Some(HitCondition::GreaterEqual(5)),
+            log_message: None,
+            enabled: true,
+            hit_count: 5,
+        });
+        let vars = std::collections::HashMap::new();
+        assert!(debugger.should_break_at_line(5, &vars));
+
+        debugger.conditional_breakpoints[0].hit_count = 4;
+        assert!(!debugger.should_break_at_line(5, &vars));
+
+        debugger.conditional_breakpoints[0].hit_count = 10;
+        assert!(debugger.should_break_at_line(5, &vars));
+    }
+
+    #[test]
+    fn test_update_conditional_breakpoint() {
+        let mut debugger = TimeTravelDebugger::new();
+        let id = debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 10,
+            condition: None,
+            hit_condition: None,
+            log_message: None,
+            enabled: true,
+            hit_count: 0,
+        });
+        debugger.update_breakpoint(id, ConditionalBreakpoint {
+            line: 20,
+            condition: Some("y > 3".to_string()),
+            hit_condition: None,
+            log_message: None,
+            enabled: true,
+            hit_count: 0,
+        });
+        assert_eq!(debugger.conditional_breakpoints[0].line, 20);
+        assert_eq!(debugger.conditional_breakpoints[0].condition, Some("y > 3".to_string()));
+    }
+
+    // ============================================================
+    // Watch Expression Tests
+    // ============================================================
+
+    #[test]
+    fn test_watch_expression_add_remove() {
+        let mut debugger = TimeTravelDebugger::new();
+        let id1 = debugger.add_watch_expression("x");
+        let id2 = debugger.add_watch_expression("y");
+        assert_eq!(debugger.watches().len(), 2);
+
+        assert!(debugger.remove_watch_expression(id1));
+        assert_eq!(debugger.watches().len(), 1);
+        assert_eq!(debugger.watches()[0].expression, "y");
+
+        assert!(!debugger.remove_watch_expression(id1)); // already removed
+        assert!(debugger.remove_watch_expression(id2));
+        assert!(debugger.watches().is_empty());
+    }
+
+    #[test]
+    fn test_watch_expression_update() {
+        let mut debugger = TimeTravelDebugger::new();
+        let id = debugger.add_watch_expression("counter");
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("counter".to_string(), "0".to_string());
+        debugger.update_watches(1, &vars);
+
+        vars.insert("counter".to_string(), "1".to_string());
+        debugger.update_watches(2, &vars);
+
+        vars.insert("counter".to_string(), "1".to_string());
+        debugger.update_watches(3, &vars); // no change
+
+        let history = debugger.get_watch_history(id).unwrap();
+        assert_eq!(history.len(), 3);
+        assert!(history[0].changed); // initial is always a change from None
+        assert!(history[1].changed);
+        assert!(!history[2].changed); // same value
+    }
+
+    #[test]
+    fn test_watch_expression_history_undefined() {
+        let mut debugger = TimeTravelDebugger::new();
+        let id = debugger.add_watch_expression("missing_var");
+
+        let vars = std::collections::HashMap::new();
+        debugger.update_watches(1, &vars);
+
+        let history = debugger.get_watch_history(id).unwrap();
+        assert_eq!(history[0].value, "undefined");
+    }
+
+    #[test]
+    fn test_get_watch_history_invalid_id() {
+        let debugger = TimeTravelDebugger::new();
+        assert!(debugger.get_watch_history(999).is_none());
+    }
+
+    // ============================================================
+    // Recording Metadata & Export Tests
+    // ============================================================
+
+    #[test]
+    fn test_recording_metadata() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.load_source("test.js", "let x = 1;\n");
+        debugger.record_step(None, 0, 1, &[], &HashMap::default(), "init");
+        debugger.record_step(None, 1, 2, &[], &HashMap::default(), "step");
+        debugger.add_breakpoint(10, None);
+
+        let meta = debugger.recording_metadata();
+        assert_eq!(meta.format_version, RECORDING_VERSION);
+        assert_eq!(meta.source_file, Some("test.js".to_string()));
+        assert_eq!(meta.total_steps, 2);
+        assert_eq!(meta.breakpoint_count, 1);
+        assert_eq!(meta.watch_count, 0);
+        assert!(meta.checksum != 0);
+    }
+
+    #[test]
+    fn test_export_recording_json() {
+        let mut debugger = TimeTravelDebugger::new();
+        let mut locals = HashMap::default();
+        locals.insert("x".to_string(), Value::Number(42.0));
+        debugger.record_step(None, 0, 1, &[], &locals, "set x");
+
+        let json = debugger.export_recording_json();
+        assert!(json.contains("\"format_version\""));
+        assert!(json.contains("\"steps\""));
+        assert!(json.contains("set x"));
+        // Verify it's valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["total_steps"], 1);
+    }
+
+    #[test]
+    fn test_search_history() {
+        let mut debugger = TimeTravelDebugger::new();
+
+        let mut locals1 = HashMap::default();
+        locals1.insert("name".to_string(), Value::String("Alice".to_string()));
+        debugger.record_step(None, 0, 1, &[], &locals1, "");
+
+        let mut locals2 = HashMap::default();
+        locals2.insert("count".to_string(), Value::Number(42.0));
+        debugger.record_step(None, 1, 2, &[], &locals2, "");
+
+        let mut locals3 = HashMap::default();
+        locals3.insert("name".to_string(), Value::String("Bob".to_string()));
+        debugger.record_step(None, 2, 3, &[], &locals3, "");
+
+        // Search by variable name
+        let results = debugger.search_history("name");
+        assert_eq!(results.len(), 2);
+
+        // Search by value
+        let results = debugger.search_history("Alice");
+        assert_eq!(results.len(), 1);
+
+        // No match
+        let results = debugger.search_history("nonexistent");
+        assert!(results.is_empty());
+    }
+
+    // ============================================================
+    // Delta Recording Tests
+    // ============================================================
+
+    #[test]
+    fn test_delta_record_and_retrieve() {
+        let mut debugger = TimeTravelDebugger::new();
+        let delta = DeltaRecord {
+            step: 1,
+            opcode: "Push".to_string(),
+            ip: 0,
+            line: Some(1),
+            changed_locals: vec![("x".to_string(), "1".to_string())],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Push(vec!["1".to_string()]),
+        };
+        debugger.record_delta(delta);
+        assert_eq!(debugger.delta_history().len(), 1);
+        assert_eq!(debugger.delta_history()[0].step, 1);
+    }
+
+    #[test]
+    fn test_reconstruct_state_at() {
+        let mut debugger = TimeTravelDebugger::new();
+
+        debugger.record_delta(DeltaRecord {
+            step: 0,
+            opcode: "Push".to_string(),
+            ip: 0,
+            line: Some(1),
+            changed_locals: vec![("x".to_string(), "1".to_string())],
+            changed_globals: vec![("global_a".to_string(), "true".to_string())],
+            stack_delta: StackDelta::Push(vec!["1".to_string()]),
+        });
+        debugger.record_delta(DeltaRecord {
+            step: 1,
+            opcode: "SetLocal".to_string(),
+            ip: 1,
+            line: Some(2),
+            changed_locals: vec![("x".to_string(), "2".to_string()), ("y".to_string(), "10".to_string())],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Push(vec!["2".to_string()]),
+        });
+        debugger.record_delta(DeltaRecord {
+            step: 2,
+            opcode: "Pop".to_string(),
+            ip: 2,
+            line: Some(3),
+            changed_locals: vec![],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Pop(1),
+        });
+
+        // At step 0: x=1, stack=[1]
+        let state = debugger.reconstruct_state_at(0).unwrap();
+        assert_eq!(state.locals.get("x"), Some(&"1".to_string()));
+        assert_eq!(state.stack, vec!["1".to_string()]);
+        assert_eq!(state.globals.get("global_a"), Some(&"true".to_string()));
+
+        // At step 1: x=2, y=10, stack=[1, 2]
+        let state = debugger.reconstruct_state_at(1).unwrap();
+        assert_eq!(state.locals.get("x"), Some(&"2".to_string()));
+        assert_eq!(state.locals.get("y"), Some(&"10".to_string()));
+        assert_eq!(state.stack, vec!["1".to_string(), "2".to_string()]);
+
+        // At step 2: stack=[1] (popped one)
+        let state = debugger.reconstruct_state_at(2).unwrap();
+        assert_eq!(state.stack, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn test_reconstruct_state_empty_history() {
+        let debugger = TimeTravelDebugger::new();
+        assert!(debugger.reconstruct_state_at(0).is_none());
+    }
+
+    #[test]
+    fn test_delta_memory_usage() {
+        let mut debugger = TimeTravelDebugger::new();
+        let base_usage = debugger.delta_memory_usage();
+
+        debugger.record_delta(DeltaRecord {
+            step: 0,
+            opcode: "Push".to_string(),
+            ip: 0,
+            line: Some(1),
+            changed_locals: vec![("x".to_string(), "1".to_string())],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Push(vec!["hello".to_string()]),
+        });
+
+        let usage_after = debugger.delta_memory_usage();
+        assert!(usage_after > base_usage);
+    }
+
+    #[test]
+    fn test_stack_delta_replace() {
+        let mut debugger = TimeTravelDebugger::new();
+
+        debugger.record_delta(DeltaRecord {
+            step: 0,
+            opcode: "Push".to_string(),
+            ip: 0,
+            line: Some(1),
+            changed_locals: vec![],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Push(vec!["a".to_string(), "b".to_string()]),
+        });
+        debugger.record_delta(DeltaRecord {
+            step: 1,
+            opcode: "Replace".to_string(),
+            ip: 1,
+            line: Some(2),
+            changed_locals: vec![],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Replace(vec!["x".to_string(), "y".to_string(), "z".to_string()]),
+        });
+
+        let state = debugger.reconstruct_state_at(1).unwrap();
+        assert_eq!(state.stack, vec!["x".to_string(), "y".to_string(), "z".to_string()]);
+    }
+
+    #[test]
+    fn test_stack_delta_no_change() {
+        let mut debugger = TimeTravelDebugger::new();
+
+        debugger.record_delta(DeltaRecord {
+            step: 0,
+            opcode: "Push".to_string(),
+            ip: 0,
+            line: Some(1),
+            changed_locals: vec![],
+            changed_globals: vec![],
+            stack_delta: StackDelta::Push(vec!["42".to_string()]),
+        });
+        debugger.record_delta(DeltaRecord {
+            step: 1,
+            opcode: "Nop".to_string(),
+            ip: 1,
+            line: Some(2),
+            changed_locals: vec![],
+            changed_globals: vec![],
+            stack_delta: StackDelta::NoChange,
+        });
+
+        let state = debugger.reconstruct_state_at(1).unwrap();
+        assert_eq!(state.stack, vec!["42".to_string()]);
+    }
+
+    #[test]
+    fn test_condition_eval_greater_than() {
+        let mut debugger = TimeTravelDebugger::new();
+        debugger.add_conditional_breakpoint(ConditionalBreakpoint {
+            line: 5,
+            condition: Some("x > 3".to_string()),
+            hit_condition: None,
+            log_message: None,
+            enabled: true,
+            hit_count: 0,
+        });
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("x".to_string(), "5".to_string());
+        assert!(debugger.should_break_at_line(5, &vars));
+
+        vars.insert("x".to_string(), "2".to_string());
+        assert!(!debugger.should_break_at_line(5, &vars));
     }
 }
