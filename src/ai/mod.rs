@@ -32,6 +32,8 @@
 
 //! **Status:** ✅ Complete — JSDoc to LLM tool schema generation (OpenAI/Anthropic)
 
+pub mod execution;
+
 use rustc_hash::FxHashMap as HashMap;
 
 /// JSON Schema types
