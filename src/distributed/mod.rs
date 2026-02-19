@@ -23,6 +23,8 @@
 //! );
 //! ```
 
+pub mod actors;
+
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
 use std::time::{Duration, Instant};
