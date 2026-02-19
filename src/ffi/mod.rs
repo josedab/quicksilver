@@ -20,6 +20,8 @@
 
 //! **Status:** ⚠️ Partial — Foreign function interface
 
+pub mod native_bridge;
+
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
