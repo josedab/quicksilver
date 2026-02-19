@@ -5,6 +5,8 @@
 
 //! **Status:** 🧪 Experimental — Durable objects framework
 
+pub mod sqlite_backend;
+
 use crate::error::{Error, Result};
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
