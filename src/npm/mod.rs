@@ -5,6 +5,12 @@
 
 //! **Status:** ⚠️ Partial — CommonJS require(), core modules (path, util, process, os)
 
+pub mod lockfile;
+pub mod package_json;
+pub mod registry;
+pub mod resolver;
+pub mod installer;
+
 use crate::error::{Error, Result};
 use crate::runtime::Value;
 use rustc_hash::FxHashMap as HashMap;
