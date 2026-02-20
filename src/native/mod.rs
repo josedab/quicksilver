@@ -8,7 +8,11 @@
 pub mod fs;
 pub mod http;
 pub mod process;
+pub mod server;
+pub mod websocket;
 
 pub use fs::FileSystem;
 pub use http::HttpClient;
 pub use process::Process;
+pub use server::HttpServer;
+pub use websocket::WebSocketServer;
