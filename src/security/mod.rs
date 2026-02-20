@@ -16,6 +16,14 @@
 
 //! **Status:** ✅ Complete — Capability-based permission model
 
+pub mod audit;
+pub mod manifest;
+pub mod prompt;
+
+pub use audit::{AuditEntry, AuditLogger};
+pub use manifest::{ManifestLimits, ManifestPermissions, PermissionManifest};
+pub use prompt::{PermissionPrompt, PromptDecision, PromptMode};
+
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
