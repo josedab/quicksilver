@@ -707,6 +707,7 @@ bool qs_api_compatible(uint32_t expected_major, uint32_t expected_minor);
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

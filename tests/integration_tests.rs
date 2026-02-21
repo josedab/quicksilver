@@ -10,6 +10,7 @@
 //!   - collections_types_tests.rs (WeakMap/Set, Proxy)
 //!   - async_modules_tests.rs (promises, async/await, ES modules, generators)
 //!   - modern_features_tests.rs (structuredClone, advanced features)
+#![allow(clippy::approx_constant)]
 
 use quicksilver::{Runtime, Value};
 

@@ -1069,6 +1069,7 @@ impl Default for JsWasmBridge {
 }
 
 #[cfg(test)]
+#[allow(clippy::approx_constant)]
 mod tests {
     use super::*;
 

@@ -1,4 +1,5 @@
 //! Integration tests for Quicksilver JavaScript runtime
+#![allow(clippy::approx_constant)]
 
 mod common;
 use common::run_js;
