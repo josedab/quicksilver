@@ -40,6 +40,8 @@
 mod parser;
 mod transpiler;
 mod types;
+pub mod tsconfig;
+pub mod declarations;
 
 pub use parser::TypeScriptParser;
 pub use transpiler::TypeScriptTranspiler;
@@ -186,5 +188,125 @@ mod tests {
         assert!(is_typescript("interface Foo { bar: string }"));
         assert!(!is_typescript("let x = 5;"));
         assert!(!is_typescript("function foo() {}"));
+    }
+
+    #[test]
+    fn test_namespace_simple() {
+        let ns = RichNamespaceDeclaration {
+            name: "MyNS".to_string(),
+            members: vec![
+                NamespaceMember::Variable {
+                    name: "x".to_string(),
+                    value: "42".to_string(),
+                    is_exported: true,
+                },
+                NamespaceMember::Function {
+                    name: "greet".to_string(),
+                    params: vec!["name".to_string()],
+                    body: "return \"Hello, \" + name;".to_string(),
+                    is_exported: true,
+                },
+            ],
+            is_exported: false,
+        };
+        let output = transpile_namespace(&ns);
+        assert!(output.contains("var MyNS;"), "Got: {}", output);
+        assert!(output.contains("(function (MyNS)"), "Got: {}", output);
+        assert!(output.contains("MyNS.x = 42;"), "Got: {}", output);
+        assert!(output.contains("function greet(name)"), "Got: {}", output);
+        assert!(output.contains("MyNS.greet = greet;"), "Got: {}", output);
+        assert!(output.contains("(MyNS || (MyNS = {}));"), "Got: {}", output);
+    }
+
+    #[test]
+    fn test_namespace_nested() {
+        let inner = RichNamespaceDeclaration {
+            name: "Inner".to_string(),
+            members: vec![NamespaceMember::Variable {
+                name: "val".to_string(),
+                value: "10".to_string(),
+                is_exported: true,
+            }],
+            is_exported: true,
+        };
+        let outer = RichNamespaceDeclaration {
+            name: "Outer".to_string(),
+            members: vec![NamespaceMember::Namespace(inner)],
+            is_exported: false,
+        };
+        let output = transpile_namespace(&outer);
+        assert!(output.contains("var Outer;"), "Got: {}", output);
+        assert!(output.contains("var Inner;"), "Got: {}", output);
+        assert!(output.contains("Inner.val = 10;"), "Got: {}", output);
+    }
+
+    #[test]
+    fn test_namespace_private_member() {
+        let ns = RichNamespaceDeclaration {
+            name: "NS".to_string(),
+            members: vec![NamespaceMember::Variable {
+                name: "secret".to_string(),
+                value: "\"hidden\"".to_string(),
+                is_exported: false,
+            }],
+            is_exported: false,
+        };
+        let output = transpile_namespace(&ns);
+        assert!(output.contains("var secret = \"hidden\";"), "Got: {}", output);
+        assert!(!output.contains("NS.secret"), "Got: {}", output);
+    }
+
+    #[test]
+    fn test_namespace_type_only_members_stripped() {
+        let ns = RichNamespaceDeclaration {
+            name: "Types".to_string(),
+            members: vec![
+                NamespaceMember::TypeAlias { name: "ID".to_string() },
+                NamespaceMember::Interface { name: "Foo".to_string() },
+                NamespaceMember::Variable {
+                    name: "x".to_string(),
+                    value: "1".to_string(),
+                    is_exported: true,
+                },
+            ],
+            is_exported: false,
+        };
+        let output = transpile_namespace(&ns);
+        assert!(!output.contains("ID"), "Type alias should be stripped, got: {}", output);
+        assert!(!output.contains("Foo"), "Interface should be stripped, got: {}", output);
+        assert!(output.contains("Types.x = 1;"), "Got: {}", output);
+    }
+
+    #[test]
+    fn test_utility_type_names() {
+        assert_eq!(UtilityType::Partial("T".to_string()).name(), "Partial");
+        assert_eq!(UtilityType::Required("T".to_string()).name(), "Required");
+        assert_eq!(UtilityType::Readonly("T".to_string()).name(), "Readonly");
+        assert_eq!(UtilityType::Pick("T".to_string(), vec![]).name(), "Pick");
+        assert_eq!(UtilityType::Omit("T".to_string(), vec![]).name(), "Omit");
+        assert_eq!(UtilityType::Record("K".to_string(), "V".to_string()).name(), "Record");
+        assert_eq!(UtilityType::Extract("T".to_string(), "U".to_string()).name(), "Extract");
+        assert_eq!(UtilityType::Exclude("T".to_string(), "U".to_string()).name(), "Exclude");
+        assert_eq!(UtilityType::ReturnType("F".to_string()).name(), "ReturnType");
+        assert_eq!(UtilityType::Parameters("F".to_string()).name(), "Parameters");
+        assert_eq!(UtilityType::NonNullable("T".to_string()).name(), "NonNullable");
+    }
+
+    #[test]
+    fn test_utility_type_descriptions() {
+        let partial = UtilityType::Partial("User".to_string());
+        assert!(partial.description().contains("optional"));
+
+        let required = UtilityType::Required("User".to_string());
+        assert!(required.description().contains("required"));
+
+        let readonly = UtilityType::Readonly("Config".to_string());
+        assert!(readonly.description().contains("readonly"));
+
+        let non_null = UtilityType::NonNullable("T".to_string());
+        assert!(non_null.description().contains("null"));
+
+        let return_type = UtilityType::ReturnType("F".to_string());
+        assert!(return_type.description().contains("return type"));
     }
 }

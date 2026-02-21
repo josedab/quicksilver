@@ -295,6 +295,171 @@ pub enum DeclareKind {
     Global,
 }
 
+/// Represents a TypeScript namespace declaration for transpilation
+#[derive(Debug, Clone)]
+pub struct RichNamespaceDeclaration {
+    pub name: String,
+    pub members: Vec<NamespaceMember>,
+    pub is_exported: bool,
+}
+
+/// A member within a namespace
+#[derive(Debug, Clone)]
+pub enum NamespaceMember {
+    Variable {
+        name: String,
+        value: String,
+        is_exported: bool,
+    },
+    Function {
+        name: String,
+        params: Vec<String>,
+        body: String,
+        is_exported: bool,
+    },
+    Namespace(RichNamespaceDeclaration),
+    TypeAlias {
+        name: String,
+    },
+    Interface {
+        name: String,
+    },
+}
+
+/// Transpile a namespace declaration to an IIFE pattern
+pub fn transpile_namespace(ns: &RichNamespaceDeclaration) -> String {
+    let mut output = String::new();
+    transpile_namespace_inner(ns, &mut output);
+    output
+}
+
+fn transpile_namespace_inner(ns: &RichNamespaceDeclaration, output: &mut String) {
+    output.push_str("var ");
+    output.push_str(&ns.name);
+    output.push_str(";\n(function (");
+    output.push_str(&ns.name);
+    output.push_str(") {\n");
+
+    for member in &ns.members {
+        match member {
+            NamespaceMember::Variable {
+                name,
+                value,
+                is_exported,
+            } => {
+                if *is_exported {
+                    output.push_str("    ");
+                    output.push_str(&ns.name);
+                    output.push('.');
+                    output.push_str(name);
+                    output.push_str(" = ");
+                    output.push_str(value);
+                    output.push_str(";\n");
+                } else {
+                    output.push_str("    var ");
+                    output.push_str(name);
+                    output.push_str(" = ");
+                    output.push_str(value);
+                    output.push_str(";\n");
+                }
+            }
+            NamespaceMember::Function {
+                name,
+                params,
+                body,
+                is_exported,
+            } => {
+                output.push_str("    function ");
+                output.push_str(name);
+                output.push('(');
+                output.push_str(&params.join(", "));
+                output.push_str(") {\n        ");
+                output.push_str(body);
+                output.push_str("\n    }\n");
+                if *is_exported {
+                    output.push_str("    ");
+                    output.push_str(&ns.name);
+                    output.push('.');
+                    output.push_str(name);
+                    output.push_str(" = ");
+                    output.push_str(name);
+                    output.push_str(";\n");
+                }
+            }
+            NamespaceMember::Namespace(inner_ns) => {
+                // Nested namespace: recurse, indenting the output
+                let inner = transpile_namespace(inner_ns);
+                for line in inner.lines() {
+                    output.push_str("    ");
+                    output.push_str(line);
+                    output.push('\n');
+                }
+            }
+            NamespaceMember::TypeAlias { .. } | NamespaceMember::Interface { .. } => {
+                // Type-only members are removed during transpilation
+            }
+        }
+    }
+
+    output.push_str("})(");
+    output.push_str(&ns.name);
+    output.push_str(" || (");
+    output.push_str(&ns.name);
+    output.push_str(" = {}));");
+}
+
+/// Built-in TypeScript utility type representations
+#[derive(Debug, Clone)]
+pub enum UtilityType {
+    Partial(String),
+    Required(String),
+    Readonly(String),
+    Pick(String, Vec<String>),
+    Omit(String, Vec<String>),
+    Record(String, String),
+    Extract(String, String),
+    Exclude(String, String),
+    ReturnType(String),
+    Parameters(String),
+    NonNullable(String),
+}
+
+impl UtilityType {
+    /// Get the name of this utility type
+    pub fn name(&self) -> &str {
+        match self {
+            UtilityType::Partial(_) => "Partial",
+            UtilityType::Required(_) => "Required",
+            UtilityType::Readonly(_) => "Readonly",
+            UtilityType::Pick(_, _) => "Pick",
+            UtilityType::Omit(_, _) => "Omit",
+            UtilityType::Record(_, _) => "Record",
+            UtilityType::Extract(_, _) => "Extract",
+            UtilityType::Exclude(_, _) => "Exclude",
+            UtilityType::ReturnType(_) => "ReturnType",
+            UtilityType::Parameters(_) => "Parameters",
+            UtilityType::NonNullable(_) => "NonNullable",
+        }
+    }
+
+    /// Describe what this utility type does
+    pub fn description(&self) -> &str {
+        match self {
+            UtilityType::Partial(_) => "Makes all properties in T optional",
+            UtilityType::Required(_) => "Makes all properties in T required",
+            UtilityType::Readonly(_) => "Makes all properties in T readonly",
+            UtilityType::Pick(_, _) => "Picks a set of properties from T",
+            UtilityType::Omit(_, _) => "Omits a set of properties from T",
+            UtilityType::Record(_, _) => "Constructs a type with keys K and values T",
+            UtilityType::Extract(_, _) => "Extracts from T those types assignable to U",
+            UtilityType::Exclude(_, _) => "Excludes from T those types assignable to U",
+            UtilityType::ReturnType(_) => "Obtains the return type of a function type",
+            UtilityType::Parameters(_) => "Obtains the parameter types of a function type",
+            UtilityType::NonNullable(_) => "Excludes null and undefined from T",
+        }
+    }
+}
+
 impl std::fmt::Display for PrimitiveType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
