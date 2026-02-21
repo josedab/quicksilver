@@ -10,6 +10,7 @@ mod builtins;
 pub mod generator;
 pub mod intern;
 pub mod promise;
+pub mod structured_clone;
 mod value;
 mod vm;
 
