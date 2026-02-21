@@ -5,6 +5,8 @@
 
 //! **Status:** ⚠️ Partial — Conformance micro-tests and reporting
 
+pub mod dashboard;
+
 use crate::runtime::Runtime;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -1291,5 +1293,1019 @@ var 123abc = 1;
         });
         let ci = curr.compare(&prev).format_ci();
         assert!(ci.contains("Pass rate:"));
+    }
+}
+
+// ============================================================================
+// Enhanced Test262 Conformance Module
+// ============================================================================
+
+/// Enhanced Test262 conformance infrastructure with structured metadata,
+/// serde support, conformance tracking, and a built-in harness.
+pub mod enhanced {
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    // -- Test262 Metadata Parser ------------------------------------------------
+
+    /// Parsed Test262 test metadata from YAML front matter
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct TestMetadata {
+        /// Test description
+        pub description: String,
+        /// ES version info
+        pub esid: Option<String>,
+        /// Expected behavior
+        pub info: Option<String>,
+        /// Features required (e.g., ["let", "const", "arrow-function"])
+        pub features: Vec<String>,
+        /// Test flags
+        pub flags: Vec<TestFlag>,
+        /// Negative test expectation
+        pub negative: Option<NegativeExpectation>,
+        /// Includes required (harness files)
+        pub includes: Vec<String>,
+        /// Locale requirements
+        pub locale: Vec<String>,
+    }
+
+    impl TestMetadata {
+        /// Parse YAML front matter between `/*---` and `---*/` markers.
+        pub fn parse(source: &str) -> Option<TestMetadata> {
+            let start = source.find("/*---")?;
+            let end = source.find("---*/")?;
+            if start >= end {
+                return None;
+            }
+            let yaml = &source[start + 5..end];
+
+            let mut md = TestMetadata::default();
+            let mut context: Option<&str> = None; // tracks multi-line list context
+
+            for line in yaml.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                // Multi-line list items (- value)
+                if let Some(item) = trimmed.strip_prefix("- ") {
+                    let item = item.trim().to_string();
+                    match context {
+                        Some("features") => md.features.push(item),
+                        Some("flags") => {
+                            if let Some(f) = TestFlag::from_str(&item) {
+                                md.flags.push(f);
+                            }
+                        }
+                        Some("includes") => md.includes.push(item),
+                        Some("locale") => md.locale.push(item),
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                // Top-level keys reset context
+                if let Some(desc) = trimmed.strip_prefix("description:") {
+                    md.description = desc
+                        .trim()
+                        .trim_matches(|c| c == '\'' || c == '"' || c == '>')
+                        .trim()
+                        .to_string();
+                    context = None;
+                } else if let Some(esid) = trimmed.strip_prefix("esid:") {
+                    md.esid = Some(esid.trim().to_string());
+                    context = None;
+                } else if let Some(info) = trimmed.strip_prefix("info:") {
+                    md.info = Some(
+                        info.trim()
+                            .trim_matches(|c| c == '\'' || c == '"' || c == '>' || c == '|')
+                            .trim()
+                            .to_string(),
+                    );
+                    context = None;
+                } else if trimmed.starts_with("features:") {
+                    let after = trimmed.strip_prefix("features:").unwrap().trim();
+                    if after.starts_with('[') {
+                        md.features = parse_inline_list(after);
+                        context = None;
+                    } else {
+                        context = Some("features");
+                    }
+                } else if trimmed.starts_with("flags:") {
+                    let after = trimmed.strip_prefix("flags:").unwrap().trim();
+                    if after.starts_with('[') {
+                        md.flags = parse_inline_list(after)
+                            .into_iter()
+                            .filter_map(|s| TestFlag::from_str(&s))
+                            .collect();
+                        context = None;
+                    } else {
+                        context = Some("flags");
+                    }
+                } else if trimmed.starts_with("includes:") {
+                    let after = trimmed.strip_prefix("includes:").unwrap().trim();
+                    if after.starts_with('[') {
+                        md.includes = parse_inline_list(after);
+                        context = None;
+                    } else {
+                        context = Some("includes");
+                    }
+                } else if trimmed.starts_with("locale:") {
+                    let after = trimmed.strip_prefix("locale:").unwrap().trim();
+                    if after.starts_with('[') {
+                        md.locale = parse_inline_list(after);
+                        context = None;
+                    } else {
+                        context = Some("locale");
+                    }
+                } else if trimmed == "negative:" {
+                    md.negative = Some(NegativeExpectation {
+                        phase: NegativePhase::Runtime,
+                        error_type: String::new(),
+                    });
+                    context = Some("negative");
+                } else if context == Some("negative") {
+                    if let Some(phase_str) = trimmed.strip_prefix("phase:") {
+                        let phase = match phase_str.trim() {
+                            "parse" => NegativePhase::Parse,
+                            "resolution" => NegativePhase::Resolution,
+                            _ => NegativePhase::Runtime,
+                        };
+                        if let Some(ref mut neg) = md.negative {
+                            neg.phase = phase;
+                        }
+                    } else if let Some(etype) = trimmed.strip_prefix("type:") {
+                        if let Some(ref mut neg) = md.negative {
+                            neg.error_type = etype.trim().to_string();
+                        }
+                    }
+                }
+            }
+
+            Some(md)
+        }
+    }
+
+    /// Parse an inline YAML list like `[a, b, c]`.
+    fn parse_inline_list(s: &str) -> Vec<String> {
+        s.trim_matches(|c| c == '[' || c == ']')
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum TestFlag {
+        OnlyStrict,
+        NoStrict,
+        Module,
+        Raw,
+        Async,
+        Generated,
+        CanBlockIsFalse,
+        CanBlockIsTrue,
+        NonDeterministic,
+    }
+
+    impl TestFlag {
+        pub fn from_str(s: &str) -> Option<TestFlag> {
+            match s.trim() {
+                "onlyStrict" => Some(TestFlag::OnlyStrict),
+                "noStrict" => Some(TestFlag::NoStrict),
+                "module" => Some(TestFlag::Module),
+                "raw" => Some(TestFlag::Raw),
+                "async" => Some(TestFlag::Async),
+                "generated" => Some(TestFlag::Generated),
+                "CanBlockIsFalse" => Some(TestFlag::CanBlockIsFalse),
+                "CanBlockIsTrue" => Some(TestFlag::CanBlockIsTrue),
+                "non-deterministic" => Some(TestFlag::NonDeterministic),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NegativeExpectation {
+        pub phase: NegativePhase,
+        #[serde(rename = "type")]
+        pub error_type: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum NegativePhase {
+        Parse,
+        Resolution,
+        Runtime,
+    }
+
+    // -- Test Runner -------------------------------------------------------------
+
+    /// Outcome of running a single Test262 test
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TestOutcome {
+        Pass,
+        Fail(String),
+        Skip(String),
+        Timeout,
+        Error(String),
+    }
+
+    /// Result of running a single test
+    #[derive(Debug, Clone)]
+    pub struct SingleTestResult {
+        pub path: String,
+        pub outcome: TestOutcome,
+        pub duration_ms: u64,
+        pub metadata: Option<TestMetadata>,
+    }
+
+    /// Runs Test262 tests against the Quicksilver runtime
+    pub struct TestRunner {
+        /// Harness source code (assert.js, sta.js equivalents)
+        harness: String,
+        /// Test results
+        results: Vec<SingleTestResult>,
+        /// Features supported by this runtime
+        supported_features: Vec<String>,
+        /// Timeout per test in milliseconds
+        timeout_ms: u64,
+        /// Skip tests requiring unsupported features
+        skip_unsupported: bool,
+    }
+
+    impl TestRunner {
+        /// Create with default harness and 5000ms timeout
+        pub fn new() -> Self {
+            Self {
+                harness: generate_harness(),
+                results: Vec::new(),
+                supported_features: default_supported_features(),
+                timeout_ms: 5000,
+                skip_unsupported: true,
+            }
+        }
+
+        pub fn with_timeout(mut self, ms: u64) -> Self {
+            self.timeout_ms = ms;
+            self
+        }
+
+        pub fn with_supported_features(mut self, features: Vec<String>) -> Self {
+            self.supported_features = features;
+            self
+        }
+
+        /// Parse metadata, check features, execute with harness prepended, compare outcome.
+        pub fn run_test(&mut self, source: &str, path: &str) -> SingleTestResult {
+            let metadata = TestMetadata::parse(source);
+
+            // Check for unsupported features
+            if self.skip_unsupported {
+                if let Some(ref md) = metadata {
+                    for feat in &md.features {
+                        if !self.supported_features.contains(feat) {
+                            let result = SingleTestResult {
+                                path: path.to_string(),
+                                outcome: TestOutcome::Skip(format!(
+                                    "unsupported feature: {}",
+                                    feat
+                                )),
+                                duration_ms: 0,
+                                metadata: metadata.clone(),
+                            };
+                            self.results.push(result.clone());
+                            return result;
+                        }
+                    }
+                    // Skip async tests
+                    if md.flags.contains(&TestFlag::Async) {
+                        let result = SingleTestResult {
+                            path: path.to_string(),
+                            outcome: TestOutcome::Skip("async test not supported".to_string()),
+                            duration_ms: 0,
+                            metadata: metadata.clone(),
+                        };
+                        self.results.push(result.clone());
+                        return result;
+                    }
+                }
+            }
+
+            let full_source = format!("{}\n{}", self.harness, source);
+            let start = Instant::now();
+            let outcome = self.run_test_source(&full_source);
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            // Check timeout
+            let outcome = if duration_ms > self.timeout_ms {
+                TestOutcome::Timeout
+            } else {
+                // For negative tests, flip the expectation
+                if let Some(ref md) = metadata {
+                    if let Some(ref neg) = md.negative {
+                        match &outcome {
+                            TestOutcome::Pass => TestOutcome::Fail(format!(
+                                "expected {} but test passed",
+                                neg.error_type
+                            )),
+                            TestOutcome::Fail(msg) | TestOutcome::Error(msg) => {
+                                if msg.contains(&neg.error_type) {
+                                    TestOutcome::Pass
+                                } else {
+                                    TestOutcome::Fail(format!(
+                                        "expected {} but got: {}",
+                                        neg.error_type, msg
+                                    ))
+                                }
+                            }
+                            other => other.clone(),
+                        }
+                    } else {
+                        outcome
+                    }
+                } else {
+                    outcome
+                }
+            };
+
+            let result = SingleTestResult {
+                path: path.to_string(),
+                outcome,
+                duration_ms,
+                metadata,
+            };
+            self.results.push(result.clone());
+            result
+        }
+
+        /// Execute JS source using `crate::Runtime::new().eval(source)`.
+        pub fn run_test_source(&self, full_source: &str) -> TestOutcome {
+            let eval_result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut runtime = crate::Runtime::new();
+                    runtime.eval(full_source)
+                }));
+            match eval_result {
+                Ok(Ok(_)) => TestOutcome::Pass,
+                Ok(Err(e)) => TestOutcome::Fail(e.to_string()),
+                Err(_) => TestOutcome::Error("VM panic (internal error)".to_string()),
+            }
+        }
+
+        pub fn results(&self) -> &[SingleTestResult] {
+            &self.results
+        }
+
+        pub fn summary(&self) -> TestSummary {
+            let mut summary = TestSummary {
+                total: self.results.len(),
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 0.0,
+                by_feature: HashMap::new(),
+            };
+            for r in &self.results {
+                match &r.outcome {
+                    TestOutcome::Pass => summary.passed += 1,
+                    TestOutcome::Fail(_) => summary.failed += 1,
+                    TestOutcome::Skip(_) => summary.skipped += 1,
+                    TestOutcome::Timeout => summary.timeouts += 1,
+                    TestOutcome::Error(_) => summary.errors += 1,
+                }
+                // Track per-feature stats
+                if let Some(ref md) = r.metadata {
+                    for feat in &md.features {
+                        let entry = summary
+                            .by_feature
+                            .entry(feat.clone())
+                            .or_default();
+                        entry.total += 1;
+                        match &r.outcome {
+                            TestOutcome::Pass => entry.passed += 1,
+                            TestOutcome::Fail(_) | TestOutcome::Error(_) | TestOutcome::Timeout => {
+                                entry.failed += 1
+                            }
+                            TestOutcome::Skip(_) => {}
+                        }
+                    }
+                }
+            }
+            let runnable = summary.total - summary.skipped;
+            summary.pass_rate = if runnable == 0 {
+                0.0
+            } else {
+                summary.passed as f64 / runnable as f64 * 100.0
+            };
+            // Compute per-feature pass rates
+            for stats in summary.by_feature.values_mut() {
+                let runnable = stats.total - (stats.total - stats.passed - stats.failed);
+                stats.pass_rate = if runnable == 0 {
+                    0.0
+                } else {
+                    stats.passed as f64 / runnable as f64 * 100.0
+                };
+            }
+            summary
+        }
+
+        pub fn clear_results(&mut self) {
+            self.results.clear();
+        }
+    }
+
+    impl Default for TestRunner {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    fn default_supported_features() -> Vec<String> {
+        [
+            "let",
+            "const",
+            "arrow-function",
+            "default-parameters",
+            "rest-parameters",
+            "spread",
+            "destructuring-binding",
+            "destructuring-assignment",
+            "template",
+            "class",
+            "Symbol",
+            "Map",
+            "Set",
+            "for-of",
+            "optional-chaining",
+            "nullish-coalescing",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    // -- Conformance Dashboard ---------------------------------------------------
+
+    /// Aggregated conformance statistics
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct TestSummary {
+        pub total: usize,
+        pub passed: usize,
+        pub failed: usize,
+        pub skipped: usize,
+        pub errors: usize,
+        pub timeouts: usize,
+        pub pass_rate: f64,
+        pub by_feature: HashMap<String, FeatureStats>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct FeatureStats {
+        pub total: usize,
+        pub passed: usize,
+        pub failed: usize,
+        pub pass_rate: f64,
+    }
+
+    /// Tracks conformance over time
+    pub struct ConformanceTracker {
+        snapshots: Vec<ConformanceSnapshot>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ConformanceSnapshot {
+        pub timestamp: u64,
+        pub version: String,
+        pub summary: TestSummary,
+    }
+
+    impl ConformanceTracker {
+        pub fn new() -> Self {
+            Self {
+                snapshots: Vec::new(),
+            }
+        }
+
+        pub fn record(&mut self, version: &str, summary: TestSummary) {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.snapshots.push(ConformanceSnapshot {
+                timestamp,
+                version: version.to_string(),
+                summary,
+            });
+        }
+
+        pub fn latest(&self) -> Option<&ConformanceSnapshot> {
+            self.snapshots.last()
+        }
+
+        /// Features that got worse vs previous snapshot
+        pub fn regressions(&self) -> Vec<String> {
+            if self.snapshots.len() < 2 {
+                return Vec::new();
+            }
+            let prev = &self.snapshots[self.snapshots.len() - 2].summary;
+            let curr = &self.snapshots[self.snapshots.len() - 1].summary;
+
+            let mut regressions = Vec::new();
+            for (feat, prev_stats) in &prev.by_feature {
+                if let Some(curr_stats) = curr.by_feature.get(feat) {
+                    if curr_stats.pass_rate < prev_stats.pass_rate {
+                        regressions.push(feat.clone());
+                    }
+                } else {
+                    // Feature disappeared — treat as regression
+                    regressions.push(feat.clone());
+                }
+            }
+            regressions.sort();
+            regressions
+        }
+
+        /// Features that improved vs previous snapshot
+        pub fn improvements(&self) -> Vec<String> {
+            if self.snapshots.len() < 2 {
+                return Vec::new();
+            }
+            let prev = &self.snapshots[self.snapshots.len() - 2].summary;
+            let curr = &self.snapshots[self.snapshots.len() - 1].summary;
+
+            let mut improvements = Vec::new();
+            for (feat, curr_stats) in &curr.by_feature {
+                if let Some(prev_stats) = prev.by_feature.get(feat) {
+                    if curr_stats.pass_rate > prev_stats.pass_rate {
+                        improvements.push(feat.clone());
+                    }
+                } else {
+                    // New feature — treat as improvement
+                    improvements.push(feat.clone());
+                }
+            }
+            improvements.sort();
+            improvements
+        }
+
+        pub fn to_json(&self) -> String {
+            serde_json::to_string_pretty(&self.snapshots).unwrap_or_else(|_| "[]".to_string())
+        }
+    }
+
+    impl Default for ConformanceTracker {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    // -- Built-in Test262 Harness ------------------------------------------------
+
+    /// Generate the Test262 harness source code
+    pub fn generate_harness() -> String {
+        r#"
+var $ERROR = function(msg) { throw new Error("Test262Error: " + msg); };
+var assert = {
+    sameValue: function(actual, expected, message) {
+        if (actual !== expected) {
+            if (actual !== actual && expected !== expected) return;
+            $ERROR((message || "") + " Expected " + expected + " but got " + actual);
+        }
+    },
+    notSameValue: function(actual, expected, message) {
+        if (actual === expected) {
+            $ERROR((message || "") + " Expected not " + expected);
+        }
+    },
+    throws: function(expectedErrorConstructor, fn, message) {
+        var threw = false;
+        try { fn(); } catch(e) { threw = true; }
+        if (!threw) { $ERROR((message || "") + " Expected to throw"); }
+    },
+    _isSameValue: function(a, b) {
+        if (a === 0 && b === 0) return 1/a === 1/b;
+        if (a !== a && b !== b) return true;
+        return a === b;
+    }
+};
+var $DONE = function(arg) {
+    if (arg) {
+        $ERROR("async test failed: " + arg);
+    }
+};
+function $DONOTEVALUATE() { throw new Error("$DONOTEVALUATE was called"); }
+var print = function() {};
+var $262 = {};
+"#
+        .to_string()
+    }
+}
+
+// ============================================================================
+// Enhanced Test262 tests
+// ============================================================================
+
+#[cfg(test)]
+mod enhanced_tests {
+    use super::enhanced::*;
+
+    // -- TestMetadata parsing ---
+
+    #[test]
+    fn test_enhanced_metadata_parse_yaml_front_matter() {
+        let source = r#"/*---
+description: Testing basic addition
+esid: sec-addition
+features: [let, const]
+flags: [onlyStrict]
+includes: [assert.js]
+---*/
+assert.sameValue(1 + 1, 2);
+"#;
+        let md = TestMetadata::parse(source).unwrap();
+        assert_eq!(md.description, "Testing basic addition");
+        assert_eq!(md.esid, Some("sec-addition".to_string()));
+        assert_eq!(md.features, vec!["let", "const"]);
+        assert_eq!(md.flags, vec![TestFlag::OnlyStrict]);
+        assert_eq!(md.includes, vec!["assert.js"]);
+    }
+
+    #[test]
+    fn test_enhanced_metadata_with_negative() {
+        let source = r#"/*---
+description: Test syntax error
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+var 123abc = 1;
+"#;
+        let md = TestMetadata::parse(source).unwrap();
+        let neg = md.negative.unwrap();
+        assert_eq!(neg.phase, NegativePhase::Parse);
+        assert_eq!(neg.error_type, "SyntaxError");
+    }
+
+    #[test]
+    fn test_enhanced_metadata_with_flags() {
+        let source = r#"/*---
+description: Module test
+flags: [module, async, noStrict]
+---*/
+export default 42;
+"#;
+        let md = TestMetadata::parse(source).unwrap();
+        assert_eq!(md.flags.len(), 3);
+        assert!(md.flags.contains(&TestFlag::Module));
+        assert!(md.flags.contains(&TestFlag::Async));
+        assert!(md.flags.contains(&TestFlag::NoStrict));
+    }
+
+    #[test]
+    fn test_enhanced_metadata_default() {
+        let md = TestMetadata::default();
+        assert_eq!(md.description, "");
+        assert!(md.esid.is_none());
+        assert!(md.info.is_none());
+        assert!(md.features.is_empty());
+        assert!(md.flags.is_empty());
+        assert!(md.negative.is_none());
+        assert!(md.includes.is_empty());
+        assert!(md.locale.is_empty());
+    }
+
+    // -- TestFlag conversion ---
+
+    #[test]
+    fn test_flag_from_str() {
+        assert_eq!(TestFlag::from_str("onlyStrict"), Some(TestFlag::OnlyStrict));
+        assert_eq!(TestFlag::from_str("noStrict"), Some(TestFlag::NoStrict));
+        assert_eq!(TestFlag::from_str("module"), Some(TestFlag::Module));
+        assert_eq!(TestFlag::from_str("raw"), Some(TestFlag::Raw));
+        assert_eq!(TestFlag::from_str("async"), Some(TestFlag::Async));
+        assert_eq!(TestFlag::from_str("generated"), Some(TestFlag::Generated));
+        assert_eq!(
+            TestFlag::from_str("non-deterministic"),
+            Some(TestFlag::NonDeterministic)
+        );
+        assert_eq!(TestFlag::from_str("unknown"), None);
+    }
+
+    // -- TestRunner ---
+
+    #[test]
+    fn test_runner_creation() {
+        let runner = TestRunner::new();
+        assert!(runner.results().is_empty());
+        // Verify the runner works by running a simple test
+        let mut runner = runner.with_timeout(3000);
+        let result = runner.run_test(
+            "/*---\ndescription: trivial\n---*/\nvar x = 1;",
+            "trivial.js",
+        );
+        assert_eq!(result.outcome, TestOutcome::Pass);
+    }
+
+    #[test]
+    fn test_runner_run_test_passing() {
+        let mut runner = TestRunner::new();
+        let source = r#"/*---
+description: Basic addition
+---*/
+assert.sameValue(1 + 2, 3);
+"#;
+        let result = runner.run_test(source, "test/addition.js");
+        assert_eq!(result.outcome, TestOutcome::Pass);
+        assert_eq!(result.path, "test/addition.js");
+        assert!(result.metadata.is_some());
+    }
+
+    #[test]
+    fn test_runner_run_test_failing_syntax_error() {
+        let mut runner = TestRunner::new();
+        let source = r#"/*---
+description: Invalid syntax test
+---*/
+let @@@invalid = 1;
+"#;
+        let result = runner.run_test(source, "test/syntax_err.js");
+        match &result.outcome {
+            TestOutcome::Fail(_) | TestOutcome::Error(_) => {} // expected
+            other => panic!("Expected Fail or Error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_runner_run_test_negative_expected_error() {
+        let mut runner = TestRunner::new();
+        let source = r#"/*---
+description: Expects a SyntaxError
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+let @@@invalid = 1;
+"#;
+        let result = runner.run_test(source, "test/negative.js");
+        // The test expects a SyntaxError, and the runtime should produce one
+        assert_eq!(result.outcome, TestOutcome::Pass);
+    }
+
+    #[test]
+    fn test_runner_run_test_skip_unsupported() {
+        let mut runner = TestRunner::new().with_supported_features(vec!["let".to_string()]);
+        let source = r#"/*---
+description: Needs generators
+features: [generators]
+---*/
+function* gen() { yield 1; }
+"#;
+        let result = runner.run_test(source, "test/generators.js");
+        match &result.outcome {
+            TestOutcome::Skip(reason) => assert!(reason.contains("generators")),
+            other => panic!("Expected Skip, got {:?}", other),
+        }
+    }
+
+    // -- TestSummary ---
+
+    #[test]
+    fn test_summary_computation() {
+        let mut runner = TestRunner::new();
+        runner.run_test(
+            "/*---\ndescription: pass\n---*/\nassert.sameValue(1, 1);",
+            "a.js",
+        );
+        runner.run_test(
+            "/*---\ndescription: pass2\n---*/\nassert.sameValue(2, 2);",
+            "b.js",
+        );
+        let summary = runner.summary();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.pass_rate, 100.0);
+    }
+
+    #[test]
+    fn test_summary_pass_rate() {
+        let mut runner = TestRunner::new();
+        runner.run_test(
+            "/*---\ndescription: pass\n---*/\nassert.sameValue(1, 1);",
+            "a.js",
+        );
+        runner.run_test(
+            "/*---\ndescription: fail\n---*/\nassert.sameValue(1, 2);",
+            "b.js",
+        );
+        let summary = runner.summary();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.pass_rate, 50.0);
+    }
+
+    // -- FeatureStats ---
+
+    #[test]
+    fn test_feature_stats_tracking() {
+        let mut runner = TestRunner::new();
+        runner.run_test(
+            "/*---\ndescription: pass\nfeatures: [let]\n---*/\nassert.sameValue(1, 1);",
+            "a.js",
+        );
+        runner.run_test(
+            "/*---\ndescription: fail\nfeatures: [let]\n---*/\nassert.sameValue(1, 2);",
+            "b.js",
+        );
+        let summary = runner.summary();
+        let let_stats = summary.by_feature.get("let").unwrap();
+        assert_eq!(let_stats.total, 2);
+        assert_eq!(let_stats.passed, 1);
+        assert_eq!(let_stats.failed, 1);
+        assert_eq!(let_stats.pass_rate, 50.0);
+    }
+
+    // -- ConformanceTracker ---
+
+    #[test]
+    fn test_conformance_tracker_record_and_regressions() {
+        let mut tracker = ConformanceTracker::new();
+
+        let mut by_feature_v1 = std::collections::HashMap::new();
+        by_feature_v1.insert(
+            "let".to_string(),
+            FeatureStats {
+                total: 10,
+                passed: 8,
+                failed: 2,
+                pass_rate: 80.0,
+            },
+        );
+        tracker.record(
+            "0.1.0",
+            TestSummary {
+                total: 10,
+                passed: 8,
+                failed: 2,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 80.0,
+                by_feature: by_feature_v1,
+            },
+        );
+
+        let mut by_feature_v2 = std::collections::HashMap::new();
+        by_feature_v2.insert(
+            "let".to_string(),
+            FeatureStats {
+                total: 10,
+                passed: 6,
+                failed: 4,
+                pass_rate: 60.0,
+            },
+        );
+        tracker.record(
+            "0.2.0",
+            TestSummary {
+                total: 10,
+                passed: 6,
+                failed: 4,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 60.0,
+                by_feature: by_feature_v2,
+            },
+        );
+
+        let regressions = tracker.regressions();
+        assert_eq!(regressions, vec!["let".to_string()]);
+        assert!(tracker.improvements().is_empty());
+    }
+
+    #[test]
+    fn test_conformance_tracker_improvements() {
+        let mut tracker = ConformanceTracker::new();
+
+        let mut by_feature_v1 = std::collections::HashMap::new();
+        by_feature_v1.insert(
+            "arrow-function".to_string(),
+            FeatureStats {
+                total: 5,
+                passed: 2,
+                failed: 3,
+                pass_rate: 40.0,
+            },
+        );
+        tracker.record(
+            "0.1.0",
+            TestSummary {
+                total: 5,
+                passed: 2,
+                failed: 3,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 40.0,
+                by_feature: by_feature_v1,
+            },
+        );
+
+        let mut by_feature_v2 = std::collections::HashMap::new();
+        by_feature_v2.insert(
+            "arrow-function".to_string(),
+            FeatureStats {
+                total: 5,
+                passed: 4,
+                failed: 1,
+                pass_rate: 80.0,
+            },
+        );
+        tracker.record(
+            "0.2.0",
+            TestSummary {
+                total: 5,
+                passed: 4,
+                failed: 1,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 80.0,
+                by_feature: by_feature_v2,
+            },
+        );
+
+        let improvements = tracker.improvements();
+        assert_eq!(improvements, vec!["arrow-function".to_string()]);
+        assert!(tracker.regressions().is_empty());
+    }
+
+    // -- Harness ---
+
+    #[test]
+    fn test_harness_generation_nonempty() {
+        let harness = generate_harness();
+        assert!(!harness.is_empty());
+        assert!(harness.contains("assert"));
+        assert!(harness.contains("sameValue"));
+        assert!(harness.contains("notSameValue"));
+        assert!(harness.contains("throws"));
+        assert!(harness.contains("$DONE"));
+        assert!(harness.contains("$262"));
+    }
+
+    // -- TestOutcome equality ---
+
+    #[test]
+    fn test_outcome_equality() {
+        assert_eq!(TestOutcome::Pass, TestOutcome::Pass);
+        assert_eq!(TestOutcome::Timeout, TestOutcome::Timeout);
+        assert_eq!(
+            TestOutcome::Fail("err".to_string()),
+            TestOutcome::Fail("err".to_string())
+        );
+        assert_ne!(TestOutcome::Pass, TestOutcome::Timeout);
+        assert_ne!(
+            TestOutcome::Fail("a".to_string()),
+            TestOutcome::Fail("b".to_string())
+        );
+        assert_ne!(
+            TestOutcome::Skip("reason".to_string()),
+            TestOutcome::Error("reason".to_string())
+        );
+    }
+
+    // -- ConformanceTracker JSON & latest ---
+
+    #[test]
+    fn test_conformance_tracker_latest_and_json() {
+        let mut tracker = ConformanceTracker::new();
+        assert!(tracker.latest().is_none());
+
+        tracker.record(
+            "0.1.0",
+            TestSummary {
+                total: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                errors: 0,
+                timeouts: 0,
+                pass_rate: 100.0,
+                by_feature: std::collections::HashMap::new(),
+            },
+        );
+
+        assert!(tracker.latest().is_some());
+        assert_eq!(tracker.latest().unwrap().version, "0.1.0");
+        let json = tracker.to_json();
+        assert!(json.contains("0.1.0"));
     }
 }
