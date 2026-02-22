@@ -615,7 +615,8 @@ impl Repl {
 
     fn print_banner(&self) {
         println!("Quicksilver JavaScript Runtime v{}", crate::VERSION);
-        println!("Type .help for available commands\n");
+        println!("Commands: .help .exit .clear .load <file> .env .reset .timing");
+        println!("Press Tab for completion, Ctrl+D to exit\n");
     }
 
     fn read_input(&mut self) -> Result<String, ReplError> {

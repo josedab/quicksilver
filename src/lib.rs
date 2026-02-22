@@ -68,13 +68,16 @@ pub mod bytecode;
 pub mod debugger;
 pub mod event_loop;
 pub mod gc;
+pub mod gpu;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
 pub mod snapshot;
+pub mod source_map;
 pub mod security;
 pub mod sandbox;
 pub mod concurrency;
+pub mod coroutines;
 pub mod observability;
 pub mod ai;
 pub mod wasm;
@@ -102,7 +105,9 @@ pub mod reactive;
 pub mod prelude;
 pub mod typescript;
 pub mod playground;
+pub mod lsp;
 pub mod workers;
+pub mod async_runtime;
 
 mod error;
 
