@@ -31,17 +31,18 @@ src/
 ├── security/         # Capability-based security
 ├── sandbox/          # Sandbox configuration
 ├── concurrency/      # Channels, spawn, select
+├── coroutines/       # Stackful coroutines & green threads
 ├── observability/    # Tracing, metrics, profiling
-├── ai/               # AI-native runtime (JSDoc → tool schemas)
+├── ai/               # AI-native runtime (JSDoc → tool schemas, execution API)
 ├── agent/            # AI agent execution sandbox
 ├── wasm/             # WebAssembly module parsing and execution
 ├── effects/          # Algebraic effects system
-├── distributed/      # Distributed runtime primitives
+├── distributed/      # Distributed runtime & actor system
 ├── debugger/         # Time-travel debugger with record/replay
 ├── hmr/              # Hot module reloading
 ├── event_loop/       # Async/await event loop
 ├── modules/          # ES Module loader
-├── npm/              # CommonJS/npm compatibility
+├── npm/              # CommonJS/npm compatibility & package installer
 ├── typescript/       # TypeScript type stripping
 ├── native/           # Native APIs (HTTP, timers, etc.)
 ├── edge/             # Edge computing (Cloudflare Workers compat)
@@ -49,15 +50,17 @@ src/
 ├── playground/       # Web playground bridge
 ├── c_api/            # C FFI API
 ├── bindings/         # Multi-language SDK bindings
-├── ffi/              # Foreign function interface
-├── jit/              # JIT compilation (experimental)
+├── ffi/              # Foreign function interface & native bridge
+├── jit/              # JIT compilation with codegen pipeline
+├── gpu/              # WebGPU compute shader abstraction
+├── source_map/       # V3 source map generation & consumption
 ├── plugins/          # Plugin system
 ├── profiler/         # Performance profiler
 ├── reactive/         # Reactive state management
 ├── diagnostics/      # Language diagnostics
-├── durable/          # Durable objects
+├── durable/          # Durable objects with persistent storage
 ├── repl/             # Interactive REPL
-├── test262/          # Test262 conformance harness
+├── test262/          # Test262 conformance harness & dashboard
 └── test_runner/      # Built-in test runner
 ```
 

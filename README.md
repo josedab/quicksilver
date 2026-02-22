@@ -101,7 +101,7 @@ For contributors, install dev tools and pre-commit hooks:
 ./scripts/setup_dev_env.sh
 ```
 
-This installs `just`, `cargo-deny`, and sets up a pre-commit hook that runs `cargo fmt` and `cargo clippy` automatically. See [CONTRIBUTING.md](CONTRIBUTING.md) for full contributor guidelines.
+This installs `just`, `cargo-deny`, and sets up a pre-commit hook that runs `cargo fmt`, `cargo clippy`, and `cargo test` automatically. See [CONTRIBUTING.md](CONTRIBUTING.md) for full contributor guidelines.
 
 ## Usage
 
@@ -223,10 +223,19 @@ cargo run -- script.js        # Run a script
 cargo run -- -e "1+2"         # Evaluate expression
 cargo run -- repl             # Interactive REPL
 
+# Cargo aliases (defined in .cargo/config.toml)
+cargo check-all               # fmt + clippy + strict warnings
+cargo test-quick              # Unit tests only (fast)
+cargo dev                     # Start REPL
+
 # Run specific tests
 cargo test arrow_functions    # By name/module
 cargo test --lib              # Unit tests only
 cargo test --test '*'         # Integration tests only
+
+# With just (optional, install via: cargo install just)
+just check                    # fmt + clippy + test
+just run examples/hello_world.js
 
 # Release build (slow: ~80s, uses LTO)
 cargo build --release

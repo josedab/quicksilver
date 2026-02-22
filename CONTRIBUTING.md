@@ -37,7 +37,7 @@ Run the setup script to install dev tools and pre-commit hooks:
 This will:
 - Verify your Rust version
 - Install `just`, `cargo-deny`, and `cargo-watch` (optional)
-- Set up a pre-commit hook that runs `cargo fmt` and `cargo clippy`
+- Set up a pre-commit hook that runs `cargo fmt`, `cargo clippy`, and `cargo test`
 - Verify the build works
 
 ### Quick Reference
@@ -55,13 +55,18 @@ cargo run -- script.js        # Run a file
 cargo run -- -e "1 + 2"       # Evaluate expression
 cargo run -- repl             # Interactive REPL
 
+# Cargo aliases (defined in .cargo/config.toml)
+cargo check-all               # clippy with strict warnings
+cargo test-quick              # Unit tests only (fast)
+cargo dev                     # Start REPL
+
 # Targeted testing
 cargo test arrow_functions    # Run tests matching a name
 cargo test --lib              # Unit tests only
 cargo test --test core_language_tests  # Specific test file
 cargo test -- --nocapture     # Show stdout from tests
 
-# With just (if installed)
+# With just (optional, install via: cargo install just)
 just check                    # fmt + clippy + test
 just run examples/hello_world.js
 just bench                    # Run benchmarks

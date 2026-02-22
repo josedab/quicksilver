@@ -61,6 +61,12 @@ if ! cargo clippy --all-targets --quiet 2>/dev/null; then
     exit 1
 fi
 
+# Run tests
+if ! cargo test --quiet 2>/dev/null; then
+    echo "❌ Tests failed. Run 'cargo test' for details."
+    exit 1
+fi
+
 echo "✅ Pre-commit checks passed"
 HOOK
     chmod +x "$HOOK_PATH"
@@ -85,5 +91,9 @@ echo ""
 echo "Quick start:"
 echo "  cargo test          # Run tests"
 echo "  cargo run -- repl   # Start REPL"
+echo "  cargo check-all     # Clippy with strict warnings"
+echo "  cargo test-quick    # Unit tests only (fast)"
+echo ""
+echo "Optional tools (if installed):"
 echo "  just check          # Run fmt + clippy + test"
 echo "  cargo watch -x test # Watch mode"
